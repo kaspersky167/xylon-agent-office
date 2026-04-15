@@ -147,7 +147,8 @@ export class OfficeRoom extends Room<OfficeState> {
                 traits: Traits;
                 communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
             },
-            capabilities: Capability[]
+            capabilities: Capability[],
+            model: string = 'llama3.2:latest'
         ) => {
             this.state.createAgent(id, name);
             const state = this.state.agents.get(id);
@@ -157,7 +158,7 @@ export class OfficeRoom extends Room<OfficeState> {
                 id, name, role, avatar: 'sprite.png',
                 inference: {
                     provider: 'ollama',
-                    model: 'llama3.2:latest',
+                    model,
                     systemPrompt,
                 },
                 personality: {
@@ -341,7 +342,8 @@ Paired buddy: Sales Outreach.`,
             'ceo', 'Faz (CEO)', 'CEO', 32, 30,
             `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Be concise and direct.`,
             { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
-            COORDINATOR
+            COORDINATOR,
+            process.env.CEO_MODEL || 'llama3.1:70b'
         );
 
         this.rebuildRelationshipGraph();
