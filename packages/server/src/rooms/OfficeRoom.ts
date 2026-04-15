@@ -69,6 +69,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingActive = false;
     private meetingEndsAt = 0;
     private meetingTopic = '';
+    private taskProgress: Map<string, number> = new Map();
 
     // Furniture interaction points: named locations agents can walk to
     private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
@@ -444,6 +445,7 @@ Paired buddy: Sales Outreach.`,
                     task: title,
                     status: 'in_progress'
                 });
+                this.seedTaskProgress(targetId, title);
             }
         });
 
@@ -588,6 +590,7 @@ Paired buddy: Sales Outreach.`,
                                     task: title,
                                     status: 'in_progress'
                                 });
+                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -716,6 +719,8 @@ Paired buddy: Sales Outreach.`,
                         const recentMemories = coreAgent.memories.slice(-3);
                         await this.memoryStore.saveMemories(id, recentMemories, this.sessionId);
                     }
+
+                    await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
 
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
 
@@ -908,6 +913,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId, agentName: agent.config.name, task, status: 'in_progress'
             });
+            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -933,6 +939,63 @@ Paired buddy: Sales Outreach.`,
         };
         const key = handle.toLowerCase();
         return aliases[key] || (this.coreAgents.has(key) ? key : null);
+    }
+
+    private progressKey(agentId: string, taskTitle: string): string {
+        return `${agentId}:${taskTitle}`;
+    }
+
+    private seedTaskProgress(agentId: string, taskTitle: string) {
+        if (!taskTitle) return;
+        this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
+        const taskTitle = agent.currentTask;
+        if (!taskTitle) return;
+
+        const key = this.progressKey(agentId, taskTitle);
+        const current = this.taskProgress.get(key) ?? 0;
+        const delta = action === 'work'
+            ? 0.2
+            : action === 'use_tool'
+                ? 0.3
+                : action === 'talk'
+                    ? 0.08
+                    : 0;
+        if (delta <= 0) return;
+
+        const next = Math.min(1, current + delta);
+        this.taskProgress.set(key, next);
+
+        this.broadcast('task-update', {
+            agentId,
+            agentName: agent.config.name,
+            task: taskTitle,
+            status: next >= 1 ? 'completed' : 'in_progress',
+            progress: next
+        });
+
+        if (next < 1) return;
+
+        this.taskProgress.delete(key);
+        agent.currentTask = null;
+        agentState.currentTask = '';
+
+        try {
+            const tasks = await this.memoryStore.getTasks();
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
+            if (match?.id) await this.memoryStore.completeTask(match.id);
+        } catch {
+            // Best-effort persistence only; task completion is still reflected in broadcast updates.
+        }
+
+        this.emitHighlight(
+            'task',
+            `${agent.config.name} completed a task`,
+            `"${taskTitle}" is complete.`,
+            agentId
+        );
     }
 
     // ─── MEETINGS ───
@@ -1314,6 +1377,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
+            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)

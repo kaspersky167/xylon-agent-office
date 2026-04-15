@@ -1,0 +1,226 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { eventBus } from '../events';
+
+interface TaskItem {
+    id: number | string;
+    title: string;
+    assigned_to?: string;
+    status: string;
+    progress?: number;
+}
+
+interface ApprovalRequest {
+    id: string;
+    status: 'pending' | 'approved' | 'rejected';
+}
+
+interface HighlightEvent {
+    type?: string;
+    title?: string;
+    body?: string;
+    createdAt?: string;
+}
+
+interface ProjectMetrics {
+    total: number;
+    completed: number;
+    inProgress: number;
+    pending: number;
+}
+
+const priorityPattern = /\b(blocker|blocked|high[- ]?priority|urgent|risk|critical)\b/i;
+
+export function ProjectProgressPanel() {
+    const [tasks, setTasks] = useState<TaskItem[]>([]);
+    const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
+    const [priorityHighlights, setPriorityHighlights] = useState<HighlightEvent[]>([]);
+
+    useEffect(() => {
+        const onTaskUpdate = (event: Event) => {
+            const data = (event as CustomEvent).detail || {};
+            if (!data?.task) return;
+            setTasks((prev) => {
+                const existing = prev.find((t) => t.title === data.task);
+                if (existing) {
+                    return prev.map((t) => (
+                        t.title === data.task
+                            ? {
+                                ...t,
+                                status: data.status,
+                                assigned_to: data.agentId,
+                                progress: typeof data.progress === 'number' ? data.progress : t.progress
+                            }
+                            : t
+                    ));
+                }
+                return [...prev, {
+                    id: Date.now(),
+                    title: data.task,
+                    assigned_to: data.agentId,
+                    status: data.status || 'pending',
+                    progress: typeof data.progress === 'number' ? data.progress : undefined
+                }];
+            });
+        };
+
+        const onTasksSync = (event: Event) => {
+            const list = (event as CustomEvent).detail;
+            if (!Array.isArray(list)) return;
+            setTasks(list.map((task: any) => ({
+                id: task.id,
+                title: task.title,
+                assigned_to: task.assigned_to || '',
+                status: task.status || 'pending',
+                progress: typeof task.progress === 'number' ? task.progress : undefined
+            })));
+        };
+
+        const onApprovalsSync = (event: Event) => {
+            const list = (event as CustomEvent).detail;
+            setApprovals(Array.isArray(list) ? list : []);
+        };
+
+        const onHighlight = (event: Event) => {
+            const detail = ((event as CustomEvent).detail || {}) as HighlightEvent;
+            const haystack = `${detail.type || ''} ${detail.title || ''} ${detail.body || ''}`;
+            if (!priorityPattern.test(haystack)) return;
+            setPriorityHighlights((prev) => [detail, ...prev].slice(0, 5));
+        };
+
+        eventBus.addEventListener('task-update', onTaskUpdate);
+        eventBus.addEventListener('tasks-sync', onTasksSync);
+        eventBus.addEventListener('approvals-sync', onApprovalsSync);
+        eventBus.addEventListener('highlight-event', onHighlight);
+
+        return () => {
+            eventBus.removeEventListener('task-update', onTaskUpdate);
+            eventBus.removeEventListener('tasks-sync', onTasksSync);
+            eventBus.removeEventListener('approvals-sync', onApprovalsSync);
+            eventBus.removeEventListener('highlight-event', onHighlight);
+        };
+    }, []);
+
+    const metrics = useMemo<ProjectMetrics>(() => {
+        const total = tasks.length;
+        const completed = tasks.filter((task) => task.status === 'completed').length;
+        const inProgress = tasks.filter((task) => task.status === 'in_progress').length;
+        const pending = tasks.filter((task) => task.status !== 'completed' && task.status !== 'in_progress').length;
+        return { total, completed, inProgress, pending };
+    }, [tasks]);
+
+    const completionPct = metrics.total === 0 ? 0 : Math.round((metrics.completed / metrics.total) * 100);
+    const pendingApprovals = approvals.filter((approval) => approval.status === 'pending').length;
+    const activeTasks = tasks
+        .filter((task) => task.status === 'in_progress')
+        .slice(0, 3);
+
+    return (
+        <div style={{
+            position: 'absolute',
+            right: 20,
+            top: 350,
+            width: 320,
+            backgroundColor: 'rgba(9, 20, 38, 0.92)',
+            color: 'white',
+            padding: 14,
+            borderRadius: 12,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+            backdropFilter: 'blur(8px)',
+            border: '1px solid rgba(52, 152, 219, 0.4)',
+            zIndex: 10
+        }}>
+            <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>
+                📈 Project Progress
+            </h3>
+
+            <div style={{ fontSize: 12, marginBottom: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Total tasks</span>
+                    <strong>{metrics.total}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#55efc4' }}>
+                    <span>Completed</span>
+                    <strong>{metrics.completed}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#ffeaa7' }}>
+                    <span>In progress</span>
+                    <strong>{metrics.inProgress}</strong>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#dfe6e9' }}>
+                    <span>Pending</span>
+                    <strong>{metrics.pending}</strong>
+                </div>
+            </div>
+
+            <div style={{ marginBottom: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                    <span>Completion</span>
+                    <strong>{completionPct}%</strong>
+                </div>
+                <div style={{ height: 8, borderRadius: 999, background: 'rgba(255,255,255,0.12)', overflow: 'hidden' }}>
+                    <div style={{
+                        width: `${completionPct}%`,
+                        height: '100%',
+                        background: 'linear-gradient(90deg, #00b894, #55efc4)'
+                    }} />
+                </div>
+            </div>
+
+            <div style={{
+                fontSize: 12,
+                marginBottom: 10,
+                padding: '6px 8px',
+                borderRadius: 6,
+                background: 'rgba(231,76,60,0.12)',
+                border: '1px solid rgba(231,76,60,0.35)'
+            }}>
+                🛂 Pending CEO approvals: <strong>{pendingApprovals}</strong>
+            </div>
+
+            <div style={{ fontSize: 11, marginBottom: 10 }}>
+                <div style={{ marginBottom: 6, color: '#9cc8ff', fontWeight: 700 }}>
+                    Active task progress
+                </div>
+                {activeTasks.length === 0 && (
+                    <div style={{ color: '#8ca4d6' }}>No active tasks right now.</div>
+                )}
+                {activeTasks.map((task) => {
+                    const pct = Math.round(Math.max(0, Math.min(1, task.progress ?? 0)) * 100);
+                    return (
+                        <div key={`${task.id}-${task.title}`} style={{ marginBottom: 6 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                                <span style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {task.title}
+                                </span>
+                                <strong>{pct}%</strong>
+                            </div>
+                            <div style={{ height: 6, borderRadius: 999, background: 'rgba(255,255,255,0.12)', overflow: 'hidden' }}>
+                                <div style={{ width: `${pct}%`, height: '100%', background: '#74b9ff' }} />
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+
+            <div style={{ fontSize: 11 }}>
+                <div style={{ marginBottom: 6, color: '#9cc8ff', fontWeight: 700 }}>
+                    Recent blockers / high-priority highlights
+                </div>
+                {priorityHighlights.length === 0 && (
+                    <div style={{ color: '#8ca4d6' }}>No blockers or urgent highlights yet.</div>
+                )}
+                {priorityHighlights.map((item, idx) => (
+                    <div key={`${item.title || 'highlight'}-${idx}`} style={{
+                        marginBottom: 6,
+                        padding: '6px 8px',
+                        borderRadius: 6,
+                        background: 'rgba(255,255,255,0.06)'
+                    }}>
+                        <div style={{ fontWeight: 700, fontSize: 11 }}>{item.title || 'Priority event'}</div>
+                        <div style={{ color: '#d4def2', marginTop: 2 }}>{item.body || item.type || 'No details provided.'}</div>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
