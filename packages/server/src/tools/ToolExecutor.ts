@@ -1,5 +1,6 @@
 import { exec } from 'child_process';
 import { tavily, type TavilyClient, type TavilySearchResponse } from '@tavily/core';
+import * as pathModule from 'path';
 
 export interface ToolResult {
     success: boolean;
@@ -216,6 +217,20 @@ export class ToolExecutor {
         }
     }
 
+
+    private getWorkspaceRoot(): string {
+        return pathModule.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+    }
+
+    private resolveWorkspacePath(workspaceRoot: string, targetPath: string): string {
+        const resolvedTarget = pathModule.resolve(workspaceRoot, targetPath);
+        const relativePath = pathModule.relative(workspaceRoot, resolvedTarget);
+        if (relativePath.startsWith('..') || pathModule.isAbsolute(relativePath)) {
+            throw new Error('Path traversal not allowed.');
+        }
+        return resolvedTarget;
+    }
+
     private async writeNote(content: string): Promise<ToolResult> {
         // Simple in-memory note (could be extended to file I/O)
         console.log(`[ToolExecutor] Note: ${content}`);
@@ -235,15 +250,11 @@ export class ToolExecutor {
         }
     }
 
-    private async writeFile(path: string, content: string): Promise<ToolResult> {
+    private async writeFile(filePath: string, content: string): Promise<ToolResult> {
         const { writeFile, mkdir } = await import('fs/promises');
-        const pathModule = await import('path');
         try {
-            if (path.includes('..') || path.startsWith('/')) {
-                return { success: false, output: '', error: 'Path traversal not allowed.' };
-            }
-            // Only allow writes inside the workspace data directory
-            const safePath = pathModule.join('data', 'workspace', path);
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, filePath);
             await mkdir(pathModule.dirname(safePath), { recursive: true });
             await writeFile(safePath, content, 'utf-8');
             return { success: true, output: `Written to ${safePath}` };
@@ -267,7 +278,8 @@ export class ToolExecutor {
                 resolve({ success: false, output: '', error: `Command not in allowlist: "${command}"` });
                 return;
             }
-            exec(command, { timeout: 8000, cwd: 'data/workspace' }, (error, stdout, stderr) => {
+            const workspaceRoot = this.getWorkspaceRoot();
+            exec(command, { timeout: 8000, cwd: workspaceRoot }, (error, stdout, stderr) => {
                 if (error) {
                     resolve({ success: false, output: stderr || error.message, error: error.message });
                 } else {

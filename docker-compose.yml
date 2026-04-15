@@ -10,8 +10,10 @@ services:
     environment:
       - DATABASE_URL=sqlite:/data/office.db
       - REDIS_URL=redis://redis:6379
+      - AGENT_WORKSPACE_DIR=/workspace-output
     volumes:
       - ./data:/data
+      - ${HOME}/xylon-agent-output:/workspace-output
   
   client:
     image: agent-office/ui:latest

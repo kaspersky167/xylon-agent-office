@@ -127,6 +127,29 @@ This starts the **server** (port 3000), **UI** (port 80), **Ollama** (with GPU),
 
 ## 🔧 Configuration
 
+### Configure Tool Workspace Output Directory
+
+The server tools (`write_file` and `run_command`) now use a configurable workspace root:
+
+```bash
+AGENT_WORKSPACE_DIR=/workspace-output
+```
+
+If unset, it defaults to `data/workspace`.
+
+#### Docker bind mount example (macOS host)
+
+Use a host folder like `~/xylon-agent-output` and mount it into the same container path used by `AGENT_WORKSPACE_DIR`:
+
+```yaml
+services:
+  server:
+    environment:
+      - AGENT_WORKSPACE_DIR=/workspace-output
+    volumes:
+      - ${HOME}/xylon-agent-output:/workspace-output
+```
+
 ### Change the LLM Model
 
 Edit `packages/server/src/rooms/OfficeRoom.ts`:
