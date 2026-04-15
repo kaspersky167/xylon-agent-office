@@ -199,6 +199,8 @@ export class OfficeRoom extends Room<OfficeState> {
             { name: 'create_task', description: 'Create a task and assign it to an agent' },
             { name: 'write_note',  description: 'Save a note or memo' },
             { name: 'web_search',  description: 'Search the web for information' },
+            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
+            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
         ];
 
         // Builder: file edits + safe shell commands + web search + research
@@ -229,10 +231,10 @@ export class OfficeRoom extends Room<OfficeState> {
             ` available in your memory or recent chat. Combine multiple questions into one query.`,
             ` Never repeat a search you or a colleague already ran this session.`,
             ` Prefer fetch_url for xylondevs.com (free, no credit cost) over a search for it.`,
-            ` web_search/fetch_url tool outputs are JSON in the output field with query, retrievedAt,`,
-            ` sources[{url,title,snippet,publishedAt?}], and freshnessNotes. When reporting findings,`,
-            ` summarize key points with source URLs and explicitly note uncertainty when publish dates`,
-            ` are missing or stale.`,
+            ` RECENCY RULE: for volatile topics (news, pricing, specs, policies, releases, outages),`,
+            ` explicitly prioritize fresh evidence. Use web_search to find recent sources, then`,
+            ` verify key claims with fetch_url (and check_health when useful). Include source URLs`,
+            ` in your findings, and do not rely on stale cached assumptions when freshness matters.`,
         ].join(' ');
 
         // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
@@ -343,7 +345,7 @@ Paired buddy: Sales Outreach.`,
         // CEO — private office, strategic oversight, final approver
         await setupCoreAgent(
             'ceo', 'Faz (CEO)', 'CEO', 32, 30,
-            `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Be concise and direct.`,
+            `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Enforce evidence quality: for volatile topics (news, pricing, specs, policies, releases, outages), require recent sources, require source URLs in findings, and reject stale cached assumptions. Be concise and direct.`,
             { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
             COORDINATOR
         );
