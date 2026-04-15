@@ -33,6 +33,14 @@ interface ApprovalRequest {
     createdAt: string;
     // optional pending tool call to resume after approval
     pending?: { toolName: string; params: any } | null;
+    fileContext?: {
+        fileId: string;
+        filePath: string;
+        fileName: string;
+        sharedByAgentId: string;
+        sharedByAgentName: string;
+        summaryNote: string;
+    } | null;
 }
 
 interface SharedFileUpsertPayload {
@@ -926,6 +934,19 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.8
                             });
+
+                            if (
+                                decision.toolCall.name === 'write_file' &&
+                                String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
+                            ) {
+                                await this.queueFileReviewApproval({
+                                    sharedByAgentId: id,
+                                    sharedByAgentName: coreAgent.config.name,
+                                    filePath: String(decision.toolCall.params?.path || ''),
+                                    summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
+                                    fileId: decision.toolCall.params?.fileId,
+                                });
+                            }
                         }
                     }
 
@@ -1357,6 +1378,110 @@ Paired buddy: Sales Outreach.`,
         return req;
     }
 
+    private async queueFileReviewApproval(input: {
+        sharedByAgentId: string;
+        sharedByAgentName: string;
+        filePath: string;
+        summaryNote?: string;
+        fileId?: string;
+    }): Promise<ApprovalRequest> {
+        const safePath = String(input.filePath || '').trim();
+        const parts = safePath.split('/');
+        const fileName = parts[parts.length - 1] || safePath || 'unknown-file';
+        const fileId = String(input.fileId || safePath || `${input.sharedByAgentId}:${Date.now()}`);
+        const summaryNote = String(input.summaryNote || 'No summary provided.');
+
+        const existingPending = Array.from(this.approvals.values()).find((approval) =>
+            approval.status === 'pending' && approval.fileContext?.fileId === fileId
+        );
+
+        if (existingPending) {
+            existingPending.requestedBy = input.sharedByAgentId;
+            existingPending.requestedByName = input.sharedByAgentName;
+            existingPending.requestedAction = `Review file: ${fileName}`;
+            existingPending.rationale = summaryNote;
+            existingPending.isMajor = true;
+            existingPending.fileContext = {
+                fileId,
+                filePath: safePath,
+                fileName,
+                sharedByAgentId: input.sharedByAgentId,
+                sharedByAgentName: input.sharedByAgentName,
+                summaryNote,
+            };
+
+            await this.memoryStore.saveApproval(existingPending).catch((e) => console.error('saveApproval(update)', e));
+            await this.memoryStore.upsertSharedFile({
+                id: fileId,
+                filePath: safePath,
+                fileName,
+                sharedByAgentId: input.sharedByAgentId,
+                sharedByAgentName: input.sharedByAgentName,
+                summaryNote,
+                status: 'needs_review',
+                approvalId: existingPending.id,
+                updatedAt: this.state.officeTime,
+            }).catch((e) => console.error('upsertSharedFile(update)', e));
+
+            this.broadcast('chat', {
+                sender: '📎 File Review',
+                text: `Updated review request for ${fileName} (${safePath}) from ${input.sharedByAgentName}.`
+            });
+            this.broadcast('system-message', {
+                type: 'file_review_updated',
+                fileId,
+                filePath: safePath,
+                status: 'needs_review',
+                approvalId: existingPending.id,
+            });
+            this.broadcast('approvals-sync', this.listApprovals());
+            return existingPending;
+        }
+
+        const request = this.createApproval({
+            requestedBy: input.sharedByAgentId,
+            requestedByName: input.sharedByAgentName,
+            requestedAction: `Review file: ${fileName}`,
+            rationale: summaryNote,
+            isMajor: true,
+            pending: null,
+            fileContext: {
+                fileId,
+                filePath: safePath,
+                fileName,
+                sharedByAgentId: input.sharedByAgentId,
+                sharedByAgentName: input.sharedByAgentName,
+                summaryNote,
+            },
+        });
+
+        await this.memoryStore.upsertSharedFile({
+            id: fileId,
+            filePath: safePath,
+            fileName,
+            sharedByAgentId: input.sharedByAgentId,
+            sharedByAgentName: input.sharedByAgentName,
+            summaryNote,
+            status: 'needs_review',
+            approvalId: request.id,
+            updatedAt: this.state.officeTime,
+        }).catch((e) => console.error('upsertSharedFile(create)', e));
+
+        this.broadcast('chat', {
+            sender: '📎 File Review',
+            text: `${input.sharedByAgentName} marked ${fileName} as needs_review.`
+        });
+        this.broadcast('system-message', {
+            type: 'file_review_created',
+            fileId,
+            filePath: safePath,
+            status: 'needs_review',
+            approvalId: request.id,
+        });
+
+        return request;
+    }
+
     // Heuristic: a rationale is "weak" if it's empty, placeholder-ish, or too short.
     private isWeakRationale(text: string): boolean {
         if (!text) return true;
@@ -1400,6 +1525,21 @@ Paired buddy: Sales Outreach.`,
         });
         this.broadcast('approvals-sync', this.listApprovals());
         this.emitHighlight('approval', `CEO ${decision}: ${req.requestedAction}`, `Request from ${req.requestedByName}.`, 'ceo');
+
+        if (req.fileContext?.fileId) {
+            this.memoryStore.updateSharedFileStatus(req.fileContext.fileId, decision, req.id).catch((e) => console.error('updateSharedFileStatus', e));
+            this.broadcast('chat', {
+                sender: '📎 File Review',
+                text: `File "${req.fileContext.fileName}" (${req.fileContext.filePath}) was ${decision} by CEO.`
+            });
+            this.broadcast('system-message', {
+                type: 'file_review_state_changed',
+                fileId: req.fileContext.fileId,
+                filePath: req.fileContext.filePath,
+                status: decision,
+                approvalId: req.id,
+            });
+        }
 
         if (decision === 'approved' && req.pending) {
             try {

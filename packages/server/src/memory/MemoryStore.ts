@@ -87,34 +87,26 @@ export class MemoryStore {
                 status TEXT NOT NULL DEFAULT 'pending',
                 pending_tool TEXT,
                 pending_params TEXT,
+                file_id TEXT,
+                file_path TEXT,
+                file_name TEXT,
+                file_shared_by_agent_id TEXT,
+                file_shared_by_agent_name TEXT,
+                file_summary_note TEXT,
                 created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS shared_files (
                 id TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                name TEXT NOT NULL,
-                mime_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL DEFAULT 0,
-                created_by TEXT NOT NULL,
-                shared_with TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'shared', 'needs_review', 'approved')),
-                approval_request_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                shared_by_agent_id TEXT NOT NULL,
+                shared_by_agent_name TEXT NOT NULL,
+                summary_note TEXT,
+                status TEXT NOT NULL DEFAULT 'shared',
+                approval_id TEXT,
+                updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_shared_files_status ON shared_files(status);
-            CREATE INDEX IF NOT EXISTS idx_shared_files_created_by ON shared_files(created_by);
-
-            CREATE TABLE IF NOT EXISTS shared_file_actions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id TEXT NOT NULL,
-                action TEXT NOT NULL,
-                actor TEXT,
-                details TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_shared_file_actions_file_id ON shared_file_actions(file_id);
         `);
 
         // Migration: add embedding column to existing databases
@@ -123,6 +115,24 @@ export class MemoryStore {
         } catch {
             // Column already exists — ignore
         }
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_id TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_path TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_name TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_id TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_name TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_summary_note TEXT');
+        } catch {}
 
         console.log('[MemoryStore] SQLite initialized at', dbPath);
     }
@@ -258,18 +268,32 @@ export class MemoryStore {
         isMajor: boolean;
         status: 'pending' | 'approved' | 'rejected';
         pending?: { toolName: string; params: any } | null;
+        fileContext?: {
+            fileId: string;
+            filePath: string;
+            fileName: string;
+            sharedByAgentId: string;
+            sharedByAgentName: string;
+            summaryNote: string;
+        } | null;
         createdAt: string;
     }): Promise<void> {
         if (!this.db) return;
         await this.db.run(
             `INSERT OR REPLACE INTO approvals
-             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, file_id, file_path, file_name, file_shared_by_agent_id, file_shared_by_agent_name, file_summary_note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 a.id, a.requestedBy, a.requestedByName, a.requestedAction, a.rationale,
                 a.isMajor ? 1 : 0, a.status,
                 a.pending?.toolName || null,
                 a.pending ? JSON.stringify(a.pending.params ?? {}) : null,
+                a.fileContext?.fileId || null,
+                a.fileContext?.filePath || null,
+                a.fileContext?.fileName || null,
+                a.fileContext?.sharedByAgentId || null,
+                a.fileContext?.sharedByAgentName || null,
+                a.fileContext?.summaryNote || null,
                 a.createdAt,
             ]
         );
@@ -300,118 +324,54 @@ export class MemoryStore {
             pending: r.pending_tool
                 ? { toolName: r.pending_tool, params: r.pending_params ? JSON.parse(r.pending_params) : {} }
                 : null,
+            fileContext: r.file_id ? {
+                fileId: r.file_id,
+                filePath: r.file_path || '',
+                fileName: r.file_name || '',
+                sharedByAgentId: r.file_shared_by_agent_id || '',
+                sharedByAgentName: r.file_shared_by_agent_name || '',
+                summaryNote: r.file_summary_note || '',
+            } : null,
         }));
     }
 
     // --- Shared File Operations ---
 
-    async upsertSharedFile(file: SharedFileRecord): Promise<void> {
+    async upsertSharedFile(file: {
+        id: string;
+        filePath: string;
+        fileName: string;
+        sharedByAgentId: string;
+        sharedByAgentName: string;
+        summaryNote?: string;
+        status: 'shared' | 'needs_review' | 'approved' | 'rejected';
+        approvalId?: string | null;
+        updatedAt: string;
+    }): Promise<void> {
         if (!this.db) return;
         await this.db.run(
-            `INSERT INTO shared_files
-             (id, path, name, mime_type, size_bytes, created_by, shared_with, status, approval_request_id, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), datetime('now'))
-             ON CONFLICT(id) DO UPDATE SET
-                path = excluded.path,
-                name = excluded.name,
-                mime_type = excluded.mime_type,
-                size_bytes = excluded.size_bytes,
-                created_by = excluded.created_by,
-                shared_with = excluded.shared_with,
-                status = excluded.status,
-                approval_request_id = excluded.approval_request_id,
-                updated_at = datetime('now')`,
+            `INSERT OR REPLACE INTO shared_files
+             (id, file_path, file_name, shared_by_agent_id, shared_by_agent_name, summary_note, status, approval_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 file.id,
-                file.path,
-                file.name,
-                file.mimeType,
-                file.sizeBytes,
-                file.createdBy,
-                JSON.stringify(file.sharedWith || []),
+                file.filePath,
+                file.fileName,
+                file.sharedByAgentId,
+                file.sharedByAgentName,
+                file.summaryNote || null,
                 file.status,
-                file.approvalRequestId || null,
-                file.createdAt || null,
+                file.approvalId || null,
+                file.updatedAt,
             ]
         );
     }
 
-    async listSharedFiles(opts?: {
-        createdBy?: string;
-        sharedWith?: string;
-        status?: SharedFileStatus;
-    }): Promise<SharedFileRecord[]> {
-        if (!this.db) return [];
-        const conditions: string[] = [];
-        const params: any[] = [];
-
-        if (opts?.createdBy) {
-            conditions.push('created_by = ?');
-            params.push(opts.createdBy);
-        }
-        if (opts?.status) {
-            conditions.push('status = ?');
-            params.push(opts.status);
-        }
-        if (opts?.sharedWith) {
-            conditions.push('shared_with LIKE ?');
-            params.push(`%\"${opts.sharedWith}\"%`);
-        }
-
-        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-        const rows = await this.db.all(
-            `SELECT * FROM shared_files ${where} ORDER BY updated_at DESC`,
-            params
-        );
-        return rows.map((r: any) => ({
-            id: r.id,
-            path: r.path,
-            name: r.name,
-            mimeType: r.mime_type,
-            sizeBytes: Number(r.size_bytes) || 0,
-            createdBy: r.created_by,
-            sharedWith: r.shared_with ? JSON.parse(r.shared_with) : [],
-            status: r.status,
-            createdAt: r.created_at,
-            updatedAt: r.updated_at,
-            approvalRequestId: r.approval_request_id || null,
-        }));
-    }
-
-    async getSharedFile(id: string): Promise<SharedFileRecord | null> {
-        if (!this.db) return null;
-        const r = await this.db.get('SELECT * FROM shared_files WHERE id = ?', [id]);
-        if (!r) return null;
-        return {
-            id: r.id,
-            path: r.path,
-            name: r.name,
-            mimeType: r.mime_type,
-            sizeBytes: Number(r.size_bytes) || 0,
-            createdBy: r.created_by,
-            sharedWith: r.shared_with ? JSON.parse(r.shared_with) : [],
-            status: r.status,
-            createdAt: r.created_at,
-            updatedAt: r.updated_at,
-            approvalRequestId: r.approval_request_id || null,
-        };
-    }
-
-    async updateSharedFileStatus(id: string, status: SharedFileStatus, approvalRequestId?: string | null): Promise<void> {
+    async updateSharedFileStatus(fileId: string, status: 'approved' | 'rejected', approvalId?: string | null): Promise<void> {
         if (!this.db) return;
         await this.db.run(
-            `UPDATE shared_files
-             SET status = ?, approval_request_id = COALESCE(?, approval_request_id), updated_at = datetime('now')
-             WHERE id = ?`,
-            [status, approvalRequestId || null, id]
-        );
-    }
-
-    async logShareAction(input: { fileId: string; action: string; actor?: string; details?: string }): Promise<void> {
-        if (!this.db) return;
-        await this.db.run(
-            'INSERT INTO shared_file_actions (file_id, action, actor, details) VALUES (?, ?, ?, ?)',
-            [input.fileId, input.action, input.actor || null, input.details || null]
+            "UPDATE shared_files SET status = ?, approval_id = ?, updated_at = datetime('now') WHERE id = ?",
+            [status, approvalId || null, fileId]
         );
     }
 

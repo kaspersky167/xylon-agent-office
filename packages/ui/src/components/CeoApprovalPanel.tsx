@@ -11,6 +11,14 @@ interface ApprovalRequest {
     isMajor: boolean;
     status: 'pending' | 'approved' | 'rejected';
     createdAt: string;
+    fileContext?: {
+        fileId: string;
+        filePath: string;
+        fileName: string;
+        sharedByAgentId: string;
+        sharedByAgentName: string;
+        summaryNote: string;
+    } | null;
 }
 
 export function CeoApprovalPanel() {
@@ -120,6 +128,28 @@ export function CeoApprovalPanel() {
                         </div>
                         <div style={{ fontSize: 12, fontWeight: 'bold', margin: '2px 0' }}>{req.requestedAction}</div>
                         <div style={{ fontSize: 11, color: '#ccc', marginBottom: 6 }}>{req.rationale}</div>
+                        {req.fileContext && (
+                            <div style={{
+                                marginBottom: 6,
+                                padding: 6,
+                                borderRadius: 4,
+                                background: 'rgba(108, 92, 231, 0.15)',
+                                border: '1px solid rgba(108, 92, 231, 0.35)',
+                                fontSize: 11
+                            }}>
+                                <div><strong>File:</strong> {req.fileContext.fileName}</div>
+                                <div style={{ color: '#b2bec3' }}><strong>Path:</strong> {req.fileContext.filePath}</div>
+                                <div><strong>Shared by:</strong> {req.fileContext.sharedByAgentName}</div>
+                                <div style={{ color: '#dfe6e9', marginTop: 2 }}><strong>Summary:</strong> {req.fileContext.summaryNote}</div>
+                                <a
+                                    href={`vscode://file/${encodeURI(req.fileContext.filePath)}`}
+                                    style={{ color: '#74b9ff', textDecoration: 'underline', marginTop: 4, display: 'inline-block' }}
+                                    title="Quick-open in VS Code"
+                                >
+                                    🔎 Quick open
+                                </a>
+                            </div>
+                        )}
                         {req.status === 'pending' ? (
                             <div style={{ display: 'flex', gap: 6 }}>
                                 <button onClick={() => decide(req.id, 'approved')} style={{
