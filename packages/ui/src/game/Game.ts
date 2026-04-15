@@ -599,6 +599,12 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('chat', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('chat-message', { detail: message }));
                 });
+                this.room!.onMessage('task-update', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('task-update', { detail: message }));
+                });
+                this.room!.onMessage('tasks-sync', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('tasks-sync', { detail: message }));
+                });
                 this.room!.onMessage('highlight-event', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('highlight-event', { detail: message }));
                     if (this.cinematicMode && message?.agentId) {
