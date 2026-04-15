@@ -247,6 +247,9 @@ export class OfficeRoom extends Room<OfficeState> {
         // Read-only: can inspect files and search, nothing writes or executes
         const READ_ONLY: Capability[] = [
             { name: 'read_file',   description: 'Read a file from the workspace' },
+            { name: 'list_files',  description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',   description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
             { name: 'web_search',  description: 'Search the web for information' },
             { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
             { name: 'write_note',  description: 'Save a note or observation' },
@@ -265,6 +268,9 @@ export class OfficeRoom extends Room<OfficeState> {
         // Builder: file edits + safe shell commands + web search + research
         const BUILDER: Capability[] = [
             { name: 'read_file',    description: 'Read a file from the workspace' },
+            { name: 'list_files',   description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',    description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
             { name: 'write_file',   description: 'Write or update a file in the workspace' },
             { name: 'run_command',  description: 'Run an allowlisted shell command (ls, git status, docker ps, etc.)' },
             { name: 'code_execute', description: 'Execute a small JavaScript snippet' },
@@ -517,6 +523,30 @@ Paired buddy: Sales Outreach.`,
                 });
                 this.seedTaskProgress(targetId, title);
             }
+        });
+
+        // User-triggered workspace read-only tools
+        this.onMessage('tool:list_files', async (client, message) => {
+            const result = await this.toolExecutor.execute('list_files', {
+                path: message?.path,
+                recursive: message?.recursive,
+                limit: message?.limit,
+            });
+            client.send('tool:list_files:result', result);
+        });
+
+        this.onMessage('tool:stat_file', async (client, message) => {
+            const result = await this.toolExecutor.execute('stat_file', { path: message?.path });
+            client.send('tool:stat_file:result', result);
+        });
+
+        this.onMessage('tool:read_file_chunk', async (client, message) => {
+            const result = await this.toolExecutor.execute('read_file_chunk', {
+                path: message?.path,
+                offset: message?.offset,
+                length: message?.length,
+            });
+            client.send('tool:read_file_chunk:result', result);
         });
 
         // ─── CEO APPROVAL HANDLERS ───
