@@ -6,6 +6,7 @@ interface TaskItem {
     title: string;
     assigned_to?: string;
     status: string;
+    progress?: number;
 }
 
 interface ApprovalRequest {
@@ -42,14 +43,22 @@ export function ProjectProgressPanel() {
                 const existing = prev.find((t) => t.title === data.task);
                 if (existing) {
                     return prev.map((t) => (
-                        t.title === data.task ? { ...t, status: data.status, assigned_to: data.agentId } : t
+                        t.title === data.task
+                            ? {
+                                ...t,
+                                status: data.status,
+                                assigned_to: data.agentId,
+                                progress: typeof data.progress === 'number' ? data.progress : t.progress
+                            }
+                            : t
                     ));
                 }
                 return [...prev, {
                     id: Date.now(),
                     title: data.task,
                     assigned_to: data.agentId,
-                    status: data.status || 'pending'
+                    status: data.status || 'pending',
+                    progress: typeof data.progress === 'number' ? data.progress : undefined
                 }];
             });
         };
@@ -61,7 +70,8 @@ export function ProjectProgressPanel() {
                 id: task.id,
                 title: task.title,
                 assigned_to: task.assigned_to || '',
-                status: task.status || 'pending'
+                status: task.status || 'pending',
+                progress: typeof task.progress === 'number' ? task.progress : undefined
             })));
         };
 
@@ -100,6 +110,9 @@ export function ProjectProgressPanel() {
 
     const completionPct = metrics.total === 0 ? 0 : Math.round((metrics.completed / metrics.total) * 100);
     const pendingApprovals = approvals.filter((approval) => approval.status === 'pending').length;
+    const activeTasks = tasks
+        .filter((task) => task.status === 'in_progress')
+        .slice(0, 3);
 
     return (
         <div style={{
@@ -162,6 +175,31 @@ export function ProjectProgressPanel() {
                 border: '1px solid rgba(231,76,60,0.35)'
             }}>
                 🛂 Pending CEO approvals: <strong>{pendingApprovals}</strong>
+            </div>
+
+            <div style={{ fontSize: 11, marginBottom: 10 }}>
+                <div style={{ marginBottom: 6, color: '#9cc8ff', fontWeight: 700 }}>
+                    Active task progress
+                </div>
+                {activeTasks.length === 0 && (
+                    <div style={{ color: '#8ca4d6' }}>No active tasks right now.</div>
+                )}
+                {activeTasks.map((task) => {
+                    const pct = Math.round(Math.max(0, Math.min(1, task.progress ?? 0)) * 100);
+                    return (
+                        <div key={`${task.id}-${task.title}`} style={{ marginBottom: 6 }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                                <span style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                    {task.title}
+                                </span>
+                                <strong>{pct}%</strong>
+                            </div>
+                            <div style={{ height: 6, borderRadius: 999, background: 'rgba(255,255,255,0.12)', overflow: 'hidden' }}>
+                                <div style={{ width: `${pct}%`, height: '100%', background: '#74b9ff' }} />
+                            </div>
+                        </div>
+                    );
+                })}
             </div>
 
             <div style={{ fontSize: 11 }}>
