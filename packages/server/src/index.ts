@@ -1,6 +1,8 @@
 import express from 'express';
 import { Server } from 'colyseus';
 import { createServer } from 'http';
+import { readdir, stat } from 'fs/promises';
+import path from 'path';
 import { OfficeRoom } from './rooms/OfficeRoom';
 
 // Setup Express
@@ -30,6 +32,71 @@ app.get('/api/episode-recap', (req, res) => {
         return;
     }
     res.json({ ok: true, recap: room.getEpisodeRecap() });
+});
+
+const EXTENSION_TO_MIME: Record<string, string> = {
+    '.md': 'text/markdown',
+    '.txt': 'text/plain',
+    '.json': 'application/json',
+    '.js': 'text/javascript',
+    '.ts': 'text/typescript',
+    '.tsx': 'text/tsx',
+    '.jsx': 'text/jsx',
+    '.html': 'text/html',
+    '.css': 'text/css',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf',
+    '.csv': 'text/csv',
+    '.yml': 'text/yaml',
+    '.yaml': 'text/yaml'
+};
+
+const workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+
+const guessMimeType = (filePath: string): string => {
+    const ext = path.extname(filePath).toLowerCase();
+    return EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+};
+
+const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
+    const files: Array<{ path: string; name: string; size: number; mimeType: string; createdAt: string }> = [];
+    const walk = async (dir: string) => {
+        if (files.length >= maxFiles) return;
+        const entries = await readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            if (files.length >= maxFiles) return;
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                await walk(fullPath);
+            } else if (entry.isFile()) {
+                const stats = await stat(fullPath);
+                const relativePath = path.relative(rootDir, fullPath).split(path.sep).join('/');
+                files.push({
+                    path: relativePath,
+                    name: entry.name,
+                    size: stats.size,
+                    mimeType: guessMimeType(entry.name),
+                    createdAt: stats.birthtime.toISOString()
+                });
+            }
+        }
+    };
+    await walk(rootDir);
+    return files.sort((a, b) => a.path.localeCompare(b.path));
+};
+
+app.get('/api/workspace-files', async (_req, res) => {
+    try {
+        const files = await listWorkspaceFiles(workspaceRoot);
+        res.json({ ok: true, files });
+    } catch (error) {
+        console.error('[workspace-files] Failed to list files', error);
+        res.status(500).json({ ok: false, error: 'Unable to list workspace files.' });
+    }
 });
 
 // Create HTTP and Colyseus server
