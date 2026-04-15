@@ -2,6 +2,22 @@ import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 import { MemoryEntry } from '@agent-office/core';
 
+export type SharedFileStatus = 'draft' | 'shared' | 'needs_review' | 'approved';
+
+export interface SharedFileRecord {
+    id: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    sizeBytes: number;
+    createdBy: string;
+    sharedWith: string[];
+    status: SharedFileStatus;
+    createdAt?: string;
+    updatedAt?: string;
+    approvalRequestId?: string | null;
+}
+
 function cosineSimilarity(a: number[], b: number[]): number {
     if (a.length !== b.length) return 0;
     let dot = 0, magA = 0, magB = 0;
@@ -73,6 +89,32 @@ export class MemoryStore {
                 pending_params TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS shared_files (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                shared_with TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'shared', 'needs_review', 'approved')),
+                approval_request_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_shared_files_status ON shared_files(status);
+            CREATE INDEX IF NOT EXISTS idx_shared_files_created_by ON shared_files(created_by);
+
+            CREATE TABLE IF NOT EXISTS shared_file_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT,
+                details TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_shared_file_actions_file_id ON shared_file_actions(file_id);
         `);
 
         // Migration: add embedding column to existing databases
@@ -259,6 +301,118 @@ export class MemoryStore {
                 ? { toolName: r.pending_tool, params: r.pending_params ? JSON.parse(r.pending_params) : {} }
                 : null,
         }));
+    }
+
+    // --- Shared File Operations ---
+
+    async upsertSharedFile(file: SharedFileRecord): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            `INSERT INTO shared_files
+             (id, path, name, mime_type, size_bytes, created_by, shared_with, status, approval_request_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                name = excluded.name,
+                mime_type = excluded.mime_type,
+                size_bytes = excluded.size_bytes,
+                created_by = excluded.created_by,
+                shared_with = excluded.shared_with,
+                status = excluded.status,
+                approval_request_id = excluded.approval_request_id,
+                updated_at = datetime('now')`,
+            [
+                file.id,
+                file.path,
+                file.name,
+                file.mimeType,
+                file.sizeBytes,
+                file.createdBy,
+                JSON.stringify(file.sharedWith || []),
+                file.status,
+                file.approvalRequestId || null,
+                file.createdAt || null,
+            ]
+        );
+    }
+
+    async listSharedFiles(opts?: {
+        createdBy?: string;
+        sharedWith?: string;
+        status?: SharedFileStatus;
+    }): Promise<SharedFileRecord[]> {
+        if (!this.db) return [];
+        const conditions: string[] = [];
+        const params: any[] = [];
+
+        if (opts?.createdBy) {
+            conditions.push('created_by = ?');
+            params.push(opts.createdBy);
+        }
+        if (opts?.status) {
+            conditions.push('status = ?');
+            params.push(opts.status);
+        }
+        if (opts?.sharedWith) {
+            conditions.push('shared_with LIKE ?');
+            params.push(`%\"${opts.sharedWith}\"%`);
+        }
+
+        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const rows = await this.db.all(
+            `SELECT * FROM shared_files ${where} ORDER BY updated_at DESC`,
+            params
+        );
+        return rows.map((r: any) => ({
+            id: r.id,
+            path: r.path,
+            name: r.name,
+            mimeType: r.mime_type,
+            sizeBytes: Number(r.size_bytes) || 0,
+            createdBy: r.created_by,
+            sharedWith: r.shared_with ? JSON.parse(r.shared_with) : [],
+            status: r.status,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at,
+            approvalRequestId: r.approval_request_id || null,
+        }));
+    }
+
+    async getSharedFile(id: string): Promise<SharedFileRecord | null> {
+        if (!this.db) return null;
+        const r = await this.db.get('SELECT * FROM shared_files WHERE id = ?', [id]);
+        if (!r) return null;
+        return {
+            id: r.id,
+            path: r.path,
+            name: r.name,
+            mimeType: r.mime_type,
+            sizeBytes: Number(r.size_bytes) || 0,
+            createdBy: r.created_by,
+            sharedWith: r.shared_with ? JSON.parse(r.shared_with) : [],
+            status: r.status,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at,
+            approvalRequestId: r.approval_request_id || null,
+        };
+    }
+
+    async updateSharedFileStatus(id: string, status: SharedFileStatus, approvalRequestId?: string | null): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            `UPDATE shared_files
+             SET status = ?, approval_request_id = COALESCE(?, approval_request_id), updated_at = datetime('now')
+             WHERE id = ?`,
+            [status, approvalRequestId || null, id]
+        );
+    }
+
+    async logShareAction(input: { fileId: string; action: string; actor?: string; details?: string }): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            'INSERT INTO shared_file_actions (file_id, action, actor, details) VALUES (?, ?, ?, ?)',
+            [input.fileId, input.action, input.actor || null, input.details || null]
+        );
     }
 
     async close(): Promise<void> {

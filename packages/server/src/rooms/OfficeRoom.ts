@@ -3,7 +3,7 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
 import { OllamaAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 
 interface HighlightEvent {
     type: string;
@@ -35,15 +35,15 @@ interface ApprovalRequest {
     pending?: { toolName: string; params: any } | null;
 }
 
-interface ChatAttachment {
-    id: string;
+interface SharedFileUpsertPayload {
+    id?: string;
     path: string;
     name: string;
     mimeType: string;
-    size: number;
-    sharedBy: string;
-    sharedWith: string[];
-    createdAt: string;
+    sizeBytes?: number;
+    createdBy?: string;
+    sharedWith?: string[];
+    status?: SharedFileStatus;
 }
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
@@ -530,6 +530,121 @@ Paired buddy: Sales Outreach.`,
             client.send('approvals-sync', this.listApprovals());
         });
 
+        // Shared file workflows
+        this.onMessage('file-share', async (client, message: SharedFileUpsertPayload) => {
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const fileId = message?.id || `file_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+            const actor = String(message?.createdBy || client.sessionId || 'unknown');
+            const status: SharedFileStatus = message?.status || 'shared';
+
+            const record: SharedFileRecord = {
+                id: fileId,
+                path: String(message?.path || ''),
+                name: String(message?.name || ''),
+                mimeType: String(message?.mimeType || 'application/octet-stream'),
+                sizeBytes: Number(message?.sizeBytes || 0),
+                createdBy: actor,
+                sharedWith: Array.isArray(message?.sharedWith) ? message.sharedWith : [],
+                status,
+                createdAt: nowIso,
+                updatedAt: nowIso,
+            };
+
+            if (!record.path || !record.name) {
+                client.send('file-share-error', { error: 'path and name are required' });
+                return;
+            }
+
+            await this.memoryStore.upsertSharedFile(record);
+            await this.memoryStore.logShareAction({
+                fileId,
+                action: 'file-share',
+                actor,
+                details: JSON.stringify({ path: record.path, status: record.status, sharedWith: record.sharedWith }),
+            });
+
+            if (status === 'needs_review') {
+                const approval = this.createApproval({
+                    requestedBy: actor,
+                    requestedByName: `File Owner (${actor})`,
+                    requestedAction: `Review shared file: ${record.name}`,
+                    rationale: `File "${record.name}" was marked needs_review and requires CEO approval before broad sharing.`,
+                    isMajor: false,
+                });
+                await this.memoryStore.updateSharedFileStatus(fileId, 'needs_review', approval.id);
+                await this.memoryStore.logShareAction({
+                    fileId,
+                    action: 'approval-requested',
+                    actor: 'system',
+                    details: approval.id,
+                });
+            }
+
+            client.send('file-share-ack', { id: fileId });
+            const files = await this.memoryStore.listSharedFiles();
+            this.broadcast('file-list', files);
+        });
+
+        this.onMessage('file-list', async (client, message) => {
+            const files = await this.memoryStore.listSharedFiles({
+                status: message?.status,
+                createdBy: message?.createdBy,
+                sharedWith: message?.sharedWith,
+            });
+            client.send('file-list', files);
+        });
+
+        this.onMessage('file-open', async (client, message) => {
+            const fileId = String(message?.id || '');
+            if (!fileId) {
+                client.send('file-open', null);
+                return;
+            }
+            const file = await this.memoryStore.getSharedFile(fileId);
+            if (file) {
+                await this.memoryStore.logShareAction({
+                    fileId,
+                    action: 'file-open',
+                    actor: client.sessionId,
+                });
+            }
+            client.send('file-open', file);
+        });
+
+        this.onMessage('file-status-update', async (client, message) => {
+            const fileId = String(message?.id || '');
+            const nextStatus = String(message?.status || '') as SharedFileStatus;
+            const allowed: SharedFileStatus[] = ['draft', 'shared', 'needs_review', 'approved'];
+            if (!fileId || !allowed.includes(nextStatus)) {
+                client.send('file-status-update-error', { error: 'invalid id or status' });
+                return;
+            }
+
+            let approvalId: string | null = null;
+            if (nextStatus === 'needs_review') {
+                const current = await this.memoryStore.getSharedFile(fileId);
+                const approval = this.createApproval({
+                    requestedBy: current?.createdBy || client.sessionId,
+                    requestedByName: `File Owner (${current?.createdBy || client.sessionId})`,
+                    requestedAction: `Review shared file: ${current?.name || fileId}`,
+                    rationale: `File "${current?.name || fileId}" status changed to needs_review and now needs CEO review.`,
+                    isMajor: false,
+                });
+                approvalId = approval.id;
+            }
+
+            await this.memoryStore.updateSharedFileStatus(fileId, nextStatus, approvalId);
+            await this.memoryStore.logShareAction({
+                fileId,
+                action: 'file-status-update',
+                actor: client.sessionId,
+                details: JSON.stringify({ status: nextStatus, approvalId }),
+            });
+
+            const file = await this.memoryStore.getSharedFile(fileId);
+            this.broadcast('file-status-update', file);
+        });
+
         // Save office layout from editor
         this.onMessage('save-layout', async (client, message) => {
             const layoutName = message.name || 'default';
@@ -586,7 +701,7 @@ Paired buddy: Sales Outreach.`,
                     currentTask: coreAgent.currentTask || null,
                     recentMessages: coreAgent.getUnreadMessages(),
                     memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision) => {
+                }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
@@ -794,7 +909,7 @@ Paired buddy: Sales Outreach.`,
 
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
 
-                }).catch(err => {
+                }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
                 });
@@ -1233,6 +1348,21 @@ Paired buddy: Sales Outreach.`,
         if (!req || req.status !== 'pending') return;
         req.status = decision;
         this.memoryStore.updateApprovalStatus(id, decision).catch((e) => console.error('updateApprovalStatus', e));
+
+        // If this approval is tied to a shared file review, move file status accordingly.
+        const sharedFiles = await this.memoryStore.listSharedFiles();
+        const linked = sharedFiles.find((f) => f.approvalRequestId === id);
+        if (linked) {
+            const mappedStatus: SharedFileStatus = decision === 'approved' ? 'approved' : 'draft';
+            await this.memoryStore.updateSharedFileStatus(linked.id, mappedStatus, id);
+            await this.memoryStore.logShareAction({
+                fileId: linked.id,
+                action: 'approval-decision',
+                actor: 'ceo',
+                details: JSON.stringify({ decision, approvalId: id, status: mappedStatus }),
+            });
+            this.broadcast('file-status-update', await this.memoryStore.getSharedFile(linked.id));
+        }
 
         this.broadcast('chat', {
             sender: '🛂 CEO',
