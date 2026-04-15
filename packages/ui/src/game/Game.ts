@@ -58,6 +58,8 @@ export class OfficeScene extends Phaser.Scene {
             frameWidth: 16,
             frameHeight: 32
         });
+        // Phaser supports SVG via `load.svg`
+        this.load.svg('xylon-logo', '/xylon-logo.svg', { width: 300, height: 62 });
     }
 
     create() {
@@ -401,6 +403,80 @@ export class OfficeScene extends Phaser.Scene {
             g.strokeRect(200, 240, 120, 80);
 
             // ═══════════════════════════════════════════
+            //  XYLON DEVS STATIC LAYOUT — pods, CEO office, billboard
+            // ═══════════════════════════════════════════
+            const tile = 16;
+            const drawPod = (label: string, x1: number, y1: number, x2: number, y2: number, color: number) => {
+                const px = x1 * tile, py = y1 * tile, pw = (x2 - x1) * tile, ph = (y2 - y1) * tile;
+                g.fillStyle(color, 0.10);
+                g.fillRect(px, py, pw, ph);
+                g.lineStyle(2, color, 0.55);
+                g.strokeRect(px, py, pw, ph);
+                this.add.text(px + 6, py + 4, label, {
+                    fontSize: '9px', color: '#ffffff', fontStyle: 'bold'
+                }).setDepth(2).setAlpha(0.75);
+            };
+
+            // Engineering pod (4 desks): Frontend+Backend+DevOps+Security — roughly (3..10, 8..16)
+            drawPod('ENGINEERING', 3, 8, 11, 16, 0x0984e3);
+            // Ops / Strategy pod (4 desks): Shepherd+Reality+Evidence+SEO — (15..22, 8..16)
+            drawPod('OPS · STRATEGY', 15, 8, 23, 16, 0x00b894);
+            // Growth pod (2 desks): Sales+Proposal — (27..34, 8..13)
+            drawPod('GROWTH', 27, 8, 35, 13, 0xfdcb6e);
+
+            // CEO private office — thicker walls, solid fill, door gap
+            const ceoX1 = 27, ceoY1 = 26, ceoX2 = 36, ceoY2 = 34;
+            g.fillStyle(0x2d2d5a, 0.85);
+            g.fillRect(ceoX1 * tile, ceoY1 * tile, (ceoX2 - ceoX1) * tile, (ceoY2 - ceoY1) * tile);
+            g.lineStyle(3, 0xe74c3c, 0.9);
+            // top wall
+            g.strokeRect(ceoX1 * tile, ceoY1 * tile, (ceoX2 - ceoX1) * tile, (ceoY2 - ceoY1) * tile);
+            // "door" gap on the left wall (draw a blue rect over part of the left edge)
+            g.fillStyle(0x16213e, 1);
+            g.fillRect(ceoX1 * tile - 2, 30 * tile - 4, 4, 8);
+            this.add.text(ceoX1 * tile + 6, ceoY1 * tile + 4, 'CEO OFFICE', {
+                fontSize: '9px', color: '#ff9f80', fontStyle: 'bold'
+            }).setDepth(2);
+            // A desk inside the CEO office (visual)
+            g.fillStyle(0x6d4c2e, 1);
+            g.fillRect(32 * tile - 12, 30 * tile - 8, 24, 16);
+            g.fillStyle(0x2d3436, 1);
+            g.fillRect(32 * tile - 8, 30 * tile - 6, 10, 6);
+
+            // Meeting table (center-bottom-ish) — subtle outline to make it obvious
+            const mt = this.furnitureTargetPx(20, 22);
+            g.fillStyle(0x6d4c2e, 1);
+            g.fillRect(mt.x - 28, mt.y - 12, 56, 24);
+            g.lineStyle(1, 0x000000, 0.4);
+            g.strokeRect(mt.x - 28, mt.y - 12, 56, 24);
+            this.add.text(mt.x, mt.y + 16, 'MEETING TABLE', {
+                fontSize: '8px', color: '#dfe6f3'
+            }).setOrigin(0.5, 0).setDepth(2).setAlpha(0.7);
+
+            // ─── XYLON DEVS BILLBOARD (top of the office, near the whiteboard) ───
+            const bbX = 20 * tile, bbY = 2 * tile;
+            // Dark billboard backing with purple frame
+            g.fillStyle(0xffffff, 1);
+            g.fillRect(bbX - 80, bbY - 18, 160, 42);
+            g.lineStyle(2, 0x6c5ce7, 1);
+            g.strokeRect(bbX - 80, bbY - 18, 160, 42);
+            if (this.textures.exists('xylon-logo')) {
+                const logo = this.add.image(bbX, bbY + 3, 'xylon-logo');
+                // Fit to billboard (original SVG is 300x62 → scale to ~150x31)
+                logo.setDisplaySize(150, 31);
+                logo.setDepth(3);
+            } else {
+                // Fallback text if SVG failed to load
+                this.add.text(bbX, bbY + 3, 'Xylon Devs', {
+                    fontSize: '16px', color: '#111827', fontStyle: 'bold', fontFamily: 'Arial'
+                }).setOrigin(0.5).setDepth(3);
+            }
+            // Small "legs" underneath to make it billboard-shaped
+            g.fillStyle(0x636e72, 1);
+            g.fillRect(bbX - 60, bbY + 24, 4, 10);
+            g.fillRect(bbX + 56, bbY + 24, 4, 10);
+
+            // ═══════════════════════════════════════════
             //  SUBTLE GRID (very faint)
             // ═══════════════════════════════════════════
             g.lineStyle(1, 0x444466, 0.12);
@@ -534,6 +610,12 @@ export class OfficeScene extends Phaser.Scene {
                 });
                 this.room!.onMessage('relationship-update', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('relationship-update', { detail: message }));
+                });
+                this.room!.onMessage('approvals-sync', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('approvals-sync', { detail: message }));
+                });
+                this.room!.onMessage('meeting-state', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('meeting-state', { detail: message }));
                 });
                 this.room!.onMessage('layout-sync', (message: any) => {
                     this.layoutItems = Array.isArray(message?.layout) ? message.layout : [];
@@ -741,6 +823,10 @@ export class OfficeScene extends Phaser.Scene {
         if (!target) return;
         this.followTarget = target;
         this.cinematicReleaseAt = Date.now() + 7000;
+    }
+
+    private furnitureTargetPx(tx: number, ty: number) {
+        return { x: tx * 16, y: ty * 16 };
     }
 
     private renderCustomLayout(items: Array<{ type: string; x: number; y: number; label?: string }>) {

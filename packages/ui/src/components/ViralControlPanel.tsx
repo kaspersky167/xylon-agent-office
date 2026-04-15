@@ -3,7 +3,7 @@ import { getColyseusRoom } from '../game/Game';
 import { eventBus } from '../events';
 import { FloatingPanel } from './FloatingPanel';
 
-const SCENARIOS = ['Startup Crunch', 'Hackathon Night', 'Incident War Room', 'Product Launch'] as const;
+const SCENARIOS = ['Xylon Growth Sprint', 'Startup Crunch', 'Hackathon Night', 'Incident War Room', 'Product Launch'] as const;
 const CHAOS_EVENTS = [
     { id: 'server_outage', label: 'Server Outage' },
     { id: 'funding_cut', label: 'Funding Cut' },

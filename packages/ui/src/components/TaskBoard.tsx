@@ -101,8 +101,25 @@ export function TaskBoard() {
                         }}
                     >
                         <option value="auto">🤖 Auto-assign</option>
-                        <option value="alice">Alice (Engineer)</option>
-                        <option value="bob">Bob (PM)</option>
+                        <optgroup label="Engineering">
+                            <option value="frontend">Frontend Dev</option>
+                            <option value="backend">Backend Architect</option>
+                            <option value="devops">DevOps Automator</option>
+                            <option value="security">Security Engineer</option>
+                        </optgroup>
+                        <optgroup label="Ops / Strategy">
+                            <option value="shepherd">Project Shepherd</option>
+                            <option value="reality">Reality Checker</option>
+                            <option value="evidence">Evidence Collector</option>
+                            <option value="seo">SEO Specialist</option>
+                        </optgroup>
+                        <optgroup label="Growth">
+                            <option value="sales">Sales Outreach</option>
+                            <option value="proposal">Proposal Strategist</option>
+                        </optgroup>
+                        <optgroup label="Leadership">
+                            <option value="ceo">Faz (CEO)</option>
+                        </optgroup>
                     </select>
                     <button type="submit" style={{
                         padding: '6px 14px', borderRadius: 6, border: 'none',
@@ -129,6 +146,9 @@ export function TaskBoard() {
                     }}>
                         <div style={{ fontWeight: 'bold', fontSize: '11px' }}>
                             {statusIcon(task.status)} {task.title}
+                            {/\b(major|deploy|launch|publish|hire|fire|pricing)\b/i.test(task.title) && (
+                                <span style={{ marginLeft: 6, color: '#ff6b6b', fontSize: 10 }}>🛂 CEO</span>
+                            )}
                         </div>
                         <div style={{ fontSize: '10px', color: '#888', marginTop: 2 }}>
                             → {task.assigned_to || 'Unassigned'}

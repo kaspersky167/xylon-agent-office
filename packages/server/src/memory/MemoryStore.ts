@@ -60,6 +60,19 @@ export class MemoryStore {
                 name TEXT NOT NULL DEFAULT 'default',
                 updated_at TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS approvals (
+                id TEXT PRIMARY KEY,
+                requested_by TEXT NOT NULL,
+                requested_by_name TEXT NOT NULL,
+                requested_action TEXT NOT NULL,
+                rationale TEXT,
+                is_major INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                pending_tool TEXT,
+                pending_params TEXT,
+                created_at TEXT NOT NULL
+            );
         `);
 
         // Migration: add embedding column to existing databases
@@ -190,6 +203,62 @@ export class MemoryStore {
         if (!this.db) return null;
         const row = await this.db.get('SELECT layout_json FROM office_layout WHERE name = ?', [name]);
         return row ? JSON.parse(row.layout_json) : null;
+    }
+
+    // --- Approval Operations ---
+
+    async saveApproval(a: {
+        id: string;
+        requestedBy: string;
+        requestedByName: string;
+        requestedAction: string;
+        rationale: string;
+        isMajor: boolean;
+        status: 'pending' | 'approved' | 'rejected';
+        pending?: { toolName: string; params: any } | null;
+        createdAt: string;
+    }): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            `INSERT OR REPLACE INTO approvals
+             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                a.id, a.requestedBy, a.requestedByName, a.requestedAction, a.rationale,
+                a.isMajor ? 1 : 0, a.status,
+                a.pending?.toolName || null,
+                a.pending ? JSON.stringify(a.pending.params ?? {}) : null,
+                a.createdAt,
+            ]
+        );
+    }
+
+    async updateApprovalStatus(id: string, status: 'approved' | 'rejected'): Promise<void> {
+        if (!this.db) return;
+        await this.db.run('UPDATE approvals SET status = ? WHERE id = ?', [status, id]);
+    }
+
+    async deleteApproval(id: string): Promise<void> {
+        if (!this.db) return;
+        await this.db.run('DELETE FROM approvals WHERE id = ?', [id]);
+    }
+
+    async loadApprovals(): Promise<any[]> {
+        if (!this.db) return [];
+        const rows = await this.db.all('SELECT * FROM approvals ORDER BY created_at ASC');
+        return rows.map((r: any) => ({
+            id: r.id,
+            requestedBy: r.requested_by,
+            requestedByName: r.requested_by_name,
+            requestedAction: r.requested_action,
+            rationale: r.rationale || '',
+            isMajor: r.is_major === 1,
+            status: r.status,
+            createdAt: r.created_at,
+            pending: r.pending_tool
+                ? { toolName: r.pending_tool, params: r.pending_params ? JSON.parse(r.pending_params) : {} }
+                : null,
+        }));
     }
 
     async close(): Promise<void> {
