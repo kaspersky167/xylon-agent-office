@@ -3,7 +3,7 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
 import { OllamaAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 
 interface HighlightEvent {
     type: string;
@@ -43,6 +43,17 @@ interface ApprovalRequest {
     } | null;
 }
 
+interface SharedFileUpsertPayload {
+    id?: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    sizeBytes?: number;
+    createdBy?: string;
+    sharedWith?: string[];
+    status?: SharedFileStatus;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -77,6 +88,53 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingActive = false;
     private meetingEndsAt = 0;
     private meetingTopic = '';
+    private taskProgress: Map<string, number> = new Map();
+
+    private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
+        if (!input || typeof input !== 'object') return null;
+
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : '';
+        const filePath = typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '';
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '';
+        const mimeType = typeof input.mimeType === 'string' && input.mimeType.trim() ? input.mimeType.trim() : '';
+        const size = Number(input.size);
+        const sharedBy = typeof input.sharedBy === 'string' && input.sharedBy.trim()
+            ? input.sharedBy.trim()
+            : defaultSharedBy;
+
+        const sharedWith = Array.isArray(input.sharedWith)
+            ? input.sharedWith
+                .filter((entry: unknown) => typeof entry === 'string')
+                .map((entry: string) => entry.trim())
+                .filter(Boolean)
+            : [];
+
+        const createdAtRaw = typeof input.createdAt === 'string' ? input.createdAt : '';
+        const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+        const createdAt = Number.isNaN(createdAtDate.getTime())
+            ? new Date().toISOString()
+            : createdAtDate.toISOString();
+
+        if (!id || !filePath || !name || !mimeType || !Number.isFinite(size) || size < 0) return null;
+
+        return {
+            id,
+            path: filePath,
+            name,
+            mimeType,
+            size: Math.floor(size),
+            sharedBy,
+            sharedWith,
+            createdAt
+        };
+    }
+
+    private parseChatAttachments(raw: any, defaultSharedBy: string): ChatAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+            .filter((item): item is ChatAttachment => Boolean(item));
+    }
 
     // Furniture interaction points: named locations agents can walk to
     private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
@@ -197,6 +255,9 @@ export class OfficeRoom extends Room<OfficeState> {
         // Read-only: can inspect files and search, nothing writes or executes
         const READ_ONLY: Capability[] = [
             { name: 'read_file',   description: 'Read a file from the workspace' },
+            { name: 'list_files',  description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',   description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
             { name: 'web_search',  description: 'Search the web for information' },
             { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
             { name: 'write_note',  description: 'Save a note or observation' },
@@ -215,6 +276,9 @@ export class OfficeRoom extends Room<OfficeState> {
         // Builder: file edits + safe shell commands + web search + research
         const BUILDER: Capability[] = [
             { name: 'read_file',    description: 'Read a file from the workspace' },
+            { name: 'list_files',   description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',    description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
             { name: 'write_file',   description: 'Write or update a file in the workspace' },
             { name: 'run_command',  description: 'Run an allowlisted shell command (ls, git status, docker ps, etc.)' },
             { name: 'code_execute', description: 'Execute a small JavaScript snippet' },
@@ -392,8 +456,13 @@ Paired buddy: Sales Outreach.`,
 
         this.onMessage('chat', (client, message) => {
             const text = String(message?.text || '').trim();
-            console.log(`Chat from ${client.sessionId}: ${text}`);
-            this.broadcast('chat', { sender: 'User', text });
+            const attachments = this.parseChatAttachments(message?.attachments, 'User');
+            console.log(`Chat from ${client.sessionId}: ${text} (attachments=${attachments.length})`);
+            this.broadcast('chat', {
+                sender: 'User',
+                text,
+                attachments: attachments.length > 0 ? attachments : undefined
+            });
 
             // Slash-command router — reliable, parse-first.
             if (text.startsWith('/')) {
@@ -460,7 +529,32 @@ Paired buddy: Sales Outreach.`,
                     task: title,
                     status: 'in_progress'
                 });
+                this.seedTaskProgress(targetId, title);
             }
+        });
+
+        // User-triggered workspace read-only tools
+        this.onMessage('tool:list_files', async (client, message) => {
+            const result = await this.toolExecutor.execute('list_files', {
+                path: message?.path,
+                recursive: message?.recursive,
+                limit: message?.limit,
+            });
+            client.send('tool:list_files:result', result);
+        });
+
+        this.onMessage('tool:stat_file', async (client, message) => {
+            const result = await this.toolExecutor.execute('stat_file', { path: message?.path });
+            client.send('tool:stat_file:result', result);
+        });
+
+        this.onMessage('tool:read_file_chunk', async (client, message) => {
+            const result = await this.toolExecutor.execute('read_file_chunk', {
+                path: message?.path,
+                offset: message?.offset,
+                length: message?.length,
+            });
+            client.send('tool:read_file_chunk:result', result);
         });
 
         // ─── CEO APPROVAL HANDLERS ───
@@ -472,6 +566,121 @@ Paired buddy: Sales Outreach.`,
 
         this.onMessage('request-approvals', (client) => {
             client.send('approvals-sync', this.listApprovals());
+        });
+
+        // Shared file workflows
+        this.onMessage('file-share', async (client, message: SharedFileUpsertPayload) => {
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const fileId = message?.id || `file_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+            const actor = String(message?.createdBy || client.sessionId || 'unknown');
+            const status: SharedFileStatus = message?.status || 'shared';
+
+            const record: SharedFileRecord = {
+                id: fileId,
+                path: String(message?.path || ''),
+                name: String(message?.name || ''),
+                mimeType: String(message?.mimeType || 'application/octet-stream'),
+                sizeBytes: Number(message?.sizeBytes || 0),
+                createdBy: actor,
+                sharedWith: Array.isArray(message?.sharedWith) ? message.sharedWith : [],
+                status,
+                createdAt: nowIso,
+                updatedAt: nowIso,
+            };
+
+            if (!record.path || !record.name) {
+                client.send('file-share-error', { error: 'path and name are required' });
+                return;
+            }
+
+            await this.memoryStore.upsertSharedFile(record);
+            await this.memoryStore.logShareAction({
+                fileId,
+                action: 'file-share',
+                actor,
+                details: JSON.stringify({ path: record.path, status: record.status, sharedWith: record.sharedWith }),
+            });
+
+            if (status === 'needs_review') {
+                const approval = this.createApproval({
+                    requestedBy: actor,
+                    requestedByName: `File Owner (${actor})`,
+                    requestedAction: `Review shared file: ${record.name}`,
+                    rationale: `File "${record.name}" was marked needs_review and requires CEO approval before broad sharing.`,
+                    isMajor: false,
+                });
+                await this.memoryStore.updateSharedFileStatus(fileId, 'needs_review', approval.id);
+                await this.memoryStore.logShareAction({
+                    fileId,
+                    action: 'approval-requested',
+                    actor: 'system',
+                    details: approval.id,
+                });
+            }
+
+            client.send('file-share-ack', { id: fileId });
+            const files = await this.memoryStore.listSharedFiles();
+            this.broadcast('file-list', files);
+        });
+
+        this.onMessage('file-list', async (client, message) => {
+            const files = await this.memoryStore.listSharedFiles({
+                status: message?.status,
+                createdBy: message?.createdBy,
+                sharedWith: message?.sharedWith,
+            });
+            client.send('file-list', files);
+        });
+
+        this.onMessage('file-open', async (client, message) => {
+            const fileId = String(message?.id || '');
+            if (!fileId) {
+                client.send('file-open', null);
+                return;
+            }
+            const file = await this.memoryStore.getSharedFile(fileId);
+            if (file) {
+                await this.memoryStore.logShareAction({
+                    fileId,
+                    action: 'file-open',
+                    actor: client.sessionId,
+                });
+            }
+            client.send('file-open', file);
+        });
+
+        this.onMessage('file-status-update', async (client, message) => {
+            const fileId = String(message?.id || '');
+            const nextStatus = String(message?.status || '') as SharedFileStatus;
+            const allowed: SharedFileStatus[] = ['draft', 'shared', 'needs_review', 'approved'];
+            if (!fileId || !allowed.includes(nextStatus)) {
+                client.send('file-status-update-error', { error: 'invalid id or status' });
+                return;
+            }
+
+            let approvalId: string | null = null;
+            if (nextStatus === 'needs_review') {
+                const current = await this.memoryStore.getSharedFile(fileId);
+                const approval = this.createApproval({
+                    requestedBy: current?.createdBy || client.sessionId,
+                    requestedByName: `File Owner (${current?.createdBy || client.sessionId})`,
+                    requestedAction: `Review shared file: ${current?.name || fileId}`,
+                    rationale: `File "${current?.name || fileId}" status changed to needs_review and now needs CEO review.`,
+                    isMajor: false,
+                });
+                approvalId = approval.id;
+            }
+
+            await this.memoryStore.updateSharedFileStatus(fileId, nextStatus, approvalId);
+            await this.memoryStore.logShareAction({
+                fileId,
+                action: 'file-status-update',
+                actor: client.sessionId,
+                details: JSON.stringify({ status: nextStatus, approvalId }),
+            });
+
+            const file = await this.memoryStore.getSharedFile(fileId);
+            this.broadcast('file-status-update', file);
         });
 
         // Save office layout from editor
@@ -530,7 +739,7 @@ Paired buddy: Sales Outreach.`,
                     currentTask: coreAgent.currentTask || null,
                     recentMessages: coreAgent.getUnreadMessages(),
                     memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision) => {
+                }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
@@ -604,6 +813,7 @@ Paired buddy: Sales Outreach.`,
                                     task: title,
                                     status: 'in_progress'
                                 });
+                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -746,9 +956,11 @@ Paired buddy: Sales Outreach.`,
                         await this.memoryStore.saveMemories(id, recentMemories, this.sessionId);
                     }
 
+                    await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
+
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
 
-                }).catch(err => {
+                }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
                 });
@@ -937,6 +1149,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId, agentName: agent.config.name, task, status: 'in_progress'
             });
+            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -962,6 +1175,63 @@ Paired buddy: Sales Outreach.`,
         };
         const key = handle.toLowerCase();
         return aliases[key] || (this.coreAgents.has(key) ? key : null);
+    }
+
+    private progressKey(agentId: string, taskTitle: string): string {
+        return `${agentId}:${taskTitle}`;
+    }
+
+    private seedTaskProgress(agentId: string, taskTitle: string) {
+        if (!taskTitle) return;
+        this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
+        const taskTitle = agent.currentTask;
+        if (!taskTitle) return;
+
+        const key = this.progressKey(agentId, taskTitle);
+        const current = this.taskProgress.get(key) ?? 0;
+        const delta = action === 'work'
+            ? 0.2
+            : action === 'use_tool'
+                ? 0.3
+                : action === 'talk'
+                    ? 0.08
+                    : 0;
+        if (delta <= 0) return;
+
+        const next = Math.min(1, current + delta);
+        this.taskProgress.set(key, next);
+
+        this.broadcast('task-update', {
+            agentId,
+            agentName: agent.config.name,
+            task: taskTitle,
+            status: next >= 1 ? 'completed' : 'in_progress',
+            progress: next
+        });
+
+        if (next < 1) return;
+
+        this.taskProgress.delete(key);
+        agent.currentTask = null;
+        agentState.currentTask = '';
+
+        try {
+            const tasks = await this.memoryStore.getTasks();
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
+            if (match?.id) await this.memoryStore.completeTask(match.id);
+        } catch {
+            // Best-effort persistence only; task completion is still reflected in broadcast updates.
+        }
+
+        this.emitHighlight(
+            'task',
+            `${agent.config.name} completed a task`,
+            `"${taskTitle}" is complete.`,
+            agentId
+        );
     }
 
     // ─── MEETINGS ───
@@ -1234,6 +1504,21 @@ Paired buddy: Sales Outreach.`,
         req.status = decision;
         this.memoryStore.updateApprovalStatus(id, decision).catch((e) => console.error('updateApprovalStatus', e));
 
+        // If this approval is tied to a shared file review, move file status accordingly.
+        const sharedFiles = await this.memoryStore.listSharedFiles();
+        const linked = sharedFiles.find((f) => f.approvalRequestId === id);
+        if (linked) {
+            const mappedStatus: SharedFileStatus = decision === 'approved' ? 'approved' : 'draft';
+            await this.memoryStore.updateSharedFileStatus(linked.id, mappedStatus, id);
+            await this.memoryStore.logShareAction({
+                fileId: linked.id,
+                action: 'approval-decision',
+                actor: 'ceo',
+                details: JSON.stringify({ decision, approvalId: id, status: mappedStatus }),
+            });
+            this.broadcast('file-status-update', await this.memoryStore.getSharedFile(linked.id));
+        }
+
         this.broadcast('chat', {
             sender: '🛂 CEO',
             text: `${decision === 'approved' ? '✅ Approved' : '❌ Rejected'}: "${req.requestedAction}" (requested by ${req.requestedByName})`
@@ -1462,6 +1747,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
+            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)

@@ -2,6 +2,22 @@ import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 import { MemoryEntry } from '@agent-office/core';
 
+export type SharedFileStatus = 'draft' | 'shared' | 'needs_review' | 'approved';
+
+export interface SharedFileRecord {
+    id: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    sizeBytes: number;
+    createdBy: string;
+    sharedWith: string[];
+    status: SharedFileStatus;
+    createdAt?: string;
+    updatedAt?: string;
+    approvalRequestId?: string | null;
+}
+
 function cosineSimilarity(a: number[], b: number[]): number {
     if (a.length !== b.length) return 0;
     let dot = 0, magA = 0, magB = 0;
