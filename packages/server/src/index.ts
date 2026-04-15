@@ -1,7 +1,7 @@
 import express from 'express';
 import { Server } from 'colyseus';
 import { createServer } from 'http';
-import { readdir, stat } from 'fs/promises';
+import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { OfficeRoom } from './rooms/OfficeRoom';
 
@@ -57,6 +57,16 @@ const EXTENSION_TO_MIME: Record<string, string> = {
 
 const workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
 
+const resolveWorkspacePath = (targetPath: string): string => {
+    const safePath = String(targetPath || '').trim();
+    const fullPath = path.resolve(workspaceRoot, safePath);
+    const relative = path.relative(workspaceRoot, fullPath);
+    if (!safePath || relative.startsWith('..') || path.isAbsolute(relative)) {
+        throw new Error('Invalid workspace path.');
+    }
+    return fullPath;
+};
+
 const guessMimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase();
     return EXTENSION_TO_MIME[ext] || 'application/octet-stream';
@@ -96,6 +106,34 @@ app.get('/api/workspace-files', async (_req, res) => {
     } catch (error) {
         console.error('[workspace-files] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list workspace files.' });
+    }
+});
+
+app.post('/api/workspace-files/save', async (req, res) => {
+    try {
+        const targetPath = String(req.body?.path || '').trim();
+        const content = typeof req.body?.content === 'string' ? req.body.content : '';
+        const fullPath = resolveWorkspacePath(targetPath);
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        await writeFile(fullPath, content, 'utf-8');
+        res.json({ ok: true, path: targetPath });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to save workspace file.' });
+    }
+});
+
+app.post('/api/workspace-files/upload', async (req, res) => {
+    try {
+        const targetPath = String(req.body?.path || '').trim();
+        const base64 = String(req.body?.base64 || '');
+        const fullPath = resolveWorkspacePath(targetPath);
+        const normalized = base64.includes(',') ? base64.split(',').pop() as string : base64;
+        const buffer = Buffer.from(normalized, 'base64');
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        await writeFile(fullPath, buffer);
+        res.json({ ok: true, path: targetPath, size: buffer.length });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to upload workspace file.' });
     }
 });
 

@@ -43,19 +43,23 @@ export function ChatPanel() {
     const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
     const [selectedPath, setSelectedPath] = useState('');
     const [selectedAttachments, setSelectedAttachments] = useState<ChatAttachment[]>([]);
+    const [newFilePath, setNewFilePath] = useState('');
+    const [newFileContent, setNewFileContent] = useState('');
+    const [fileActionStatus, setFileActionStatus] = useState('');
     const endRef = useRef<HTMLDivElement>(null);
 
+    const loadWorkspaceFiles = async () => {
+        try {
+            const response = await fetch('/api/workspace-files');
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const payload = await response.json();
+            setWorkspaceFiles(Array.isArray(payload?.files) ? payload.files : []);
+        } catch (error) {
+            console.warn('Could not load workspace files for chat attachments.', error);
+        }
+    };
+
     useEffect(() => {
-        const loadWorkspaceFiles = async () => {
-            try {
-                const response = await fetch('/api/workspace-files');
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-                const payload = await response.json();
-                setWorkspaceFiles(Array.isArray(payload?.files) ? payload.files : []);
-            } catch (error) {
-                console.warn('Could not load workspace files for chat attachments.', error);
-            }
-        };
         loadWorkspaceFiles();
     }, []);
 
@@ -109,6 +113,56 @@ export function ChatPanel() {
             setSelectedAttachments([]);
         } else {
             setMessages(prev => [...prev, { sender: 'System', text: 'Error: Cannot send message, Colyseus not connected.' }]);
+        }
+    };
+
+    const saveWorkspaceFile = async () => {
+        if (!newFilePath.trim()) {
+            setFileActionStatus('Enter a file path first.');
+            return;
+        }
+        try {
+            setFileActionStatus('Saving...');
+            const response = await fetch('/api/workspace-files/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: newFilePath.trim(), content: newFileContent })
+            });
+            const payload = await response.json();
+            if (!response.ok || !payload?.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+            await loadWorkspaceFiles();
+            setFileActionStatus(`Saved ${newFilePath.trim()}.`);
+        } catch (error: any) {
+            setFileActionStatus(`Save failed: ${error?.message || 'unknown error'}`);
+        }
+    };
+
+    const uploadWorkspaceFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const targetPath = newFilePath.trim() || file.name;
+        try {
+            setFileActionStatus('Uploading...');
+            const base64 = await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(reader.error);
+                reader.readAsDataURL(file);
+            });
+            const response = await fetch('/api/workspace-files/upload', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: targetPath, base64 })
+            });
+            const payload = await response.json();
+            if (!response.ok || !payload?.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+            setNewFilePath(targetPath);
+            await loadWorkspaceFiles();
+            setFileActionStatus(`Uploaded ${targetPath}.`);
+        } catch (error: any) {
+            setFileActionStatus(`Upload failed: ${error?.message || 'unknown error'}`);
+        } finally {
+            event.target.value = '';
         }
     };
 
@@ -168,6 +222,31 @@ export function ChatPanel() {
                     ))}
                 </div>
             )}
+            <div style={{ border: '1px solid #2f3c4a', borderRadius: 6, padding: 8, marginBottom: 8, background: '#111827' }}>
+                <div style={{ fontSize: 11, marginBottom: 6, color: '#d1d5db' }}>Save/upload workspace file</div>
+                <input
+                    type="text"
+                    placeholder="notes/todo.md"
+                    value={newFilePath}
+                    onChange={(e) => setNewFilePath(e.target.value)}
+                    style={{ width: '100%', marginBottom: 6, padding: '6px 8px', boxSizing: 'border-box', background: '#1f2937', color: 'white', border: '1px solid #374151', borderRadius: 4 }}
+                />
+                <textarea
+                    placeholder="File content"
+                    value={newFileContent}
+                    onChange={(e) => setNewFileContent(e.target.value)}
+                    rows={3}
+                    style={{ width: '100%', marginBottom: 6, padding: '6px 8px', boxSizing: 'border-box', background: '#1f2937', color: 'white', border: '1px solid #374151', borderRadius: 4, resize: 'vertical' }}
+                />
+                <div style={{ display: 'flex', gap: 6, marginBottom: 4 }}>
+                    <button type="button" onClick={saveWorkspaceFile} style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '6px 8px', cursor: 'pointer' }}>Save File</button>
+                    <label style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '6px 8px', cursor: 'pointer' }}>
+                        Upload File
+                        <input type="file" onChange={uploadWorkspaceFile} style={{ display: 'none' }} />
+                    </label>
+                </div>
+                {fileActionStatus && <div style={{ fontSize: 10, color: '#93c5fd' }}>{fileActionStatus}</div>}
+            </div>
             <input
                 type="text"
                 placeholder="Send a message..."

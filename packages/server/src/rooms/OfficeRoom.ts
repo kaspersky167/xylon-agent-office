@@ -4,6 +4,8 @@ import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/
 import { OllamaAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import path from 'path';
+import { readFile, stat } from 'fs/promises';
 
 interface HighlightEvent {
     type: string;
@@ -54,6 +56,17 @@ interface SharedFileUpsertPayload {
     status?: SharedFileStatus;
 }
 
+interface ChatAttachment {
+    id: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    sharedBy: string;
+    sharedWith: string[];
+    createdAt: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -89,6 +102,42 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
+    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+
+    private getMimeType(filePath: string): string {
+        const ext = path.extname(filePath).toLowerCase();
+        const map: Record<string, string> = {
+            '.md': 'text/markdown',
+            '.txt': 'text/plain',
+            '.json': 'application/json',
+            '.js': 'text/javascript',
+            '.ts': 'text/typescript',
+            '.tsx': 'text/tsx',
+            '.jsx': 'text/jsx',
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.pdf': 'application/pdf',
+            '.csv': 'text/csv',
+            '.yml': 'text/yaml',
+            '.yaml': 'text/yaml'
+        };
+        return map[ext] || 'application/octet-stream';
+    }
+
+    private resolveWorkspacePath(targetPath: string): string {
+        const safeTarget = String(targetPath || '').trim();
+        const fullPath = path.resolve(this.workspaceRoot, safeTarget);
+        const rel = path.relative(this.workspaceRoot, fullPath);
+        if (!safeTarget || rel.startsWith('..') || path.isAbsolute(rel)) {
+            throw new Error('Invalid workspace file path.');
+        }
+        return fullPath;
+    }
 
     private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
         if (!input || typeof input !== 'object') return null;
@@ -187,7 +236,8 @@ export class OfficeRoom extends Room<OfficeState> {
         this.setState(new OfficeState());
 
         // Initialize memory store
-        await this.memoryStore.initialize();
+        const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
+        await this.memoryStore.initialize(dbPath);
 
         const config: OfficeConfig = {
             name: options.name || 'Startup HQ',
@@ -242,9 +292,11 @@ export class OfficeRoom extends Room<OfficeState> {
 
             // Load persistent memories from previous sessions
             const previousMemories = await this.memoryStore.loadMemories(id, 20);
-            if (previousMemories.length > 0) {
-                coreAgent.loadMemories(previousMemories);
-                console.log(`[${name}] Loaded ${previousMemories.length} memories from previous sessions`);
+            const agencyMemories = await this.memoryStore.loadMemories('agency:global', 20);
+            const mergedMemories = [...previousMemories, ...agencyMemories].slice(-50);
+            if (mergedMemories.length > 0) {
+                coreAgent.loadMemories(mergedMemories);
+                console.log(`[${name}] Loaded ${previousMemories.length} personal + ${agencyMemories.length} agency memories from previous sessions`);
             }
 
             this.coreAgents.set(id, coreAgent);
@@ -463,6 +515,14 @@ Paired buddy: Sales Outreach.`,
                 text,
                 attachments: attachments.length > 0 ? attachments : undefined
             });
+            if (text || attachments.length > 0) {
+                this.memoryStore.saveMemory('agency:global', {
+                    content: `User chat: ${text}${attachments.length > 0 ? ` (attachments: ${attachments.map((a) => a.path).join(', ')})` : ''}`,
+                    type: 'conversation',
+                    timestamp: this.state.officeTime,
+                    importance: 0.75
+                }, this.sessionId).catch(() => {});
+            }
 
             // Slash-command router — reliable, parse-first.
             if (text.startsWith('/')) {
@@ -574,15 +634,25 @@ Paired buddy: Sales Outreach.`,
             const fileId = message?.id || `file_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
             const actor = String(message?.createdBy || client.sessionId || 'unknown');
             const status: SharedFileStatus = message?.status || 'shared';
+            const filePath = String(message?.path || '').trim();
+            const resolvedName = String(message?.name || path.basename(filePath || ''));
+            const resolvedMimeType = String(message?.mimeType || this.getMimeType(resolvedName || filePath));
+            let resolvedSize = Number(message?.sizeBytes || 0);
+            if (resolvedSize <= 0 && filePath) {
+                try {
+                    const meta = await stat(this.resolveWorkspacePath(filePath));
+                    resolvedSize = meta.size;
+                } catch {}
+            }
 
             const record: SharedFileRecord = {
                 id: fileId,
-                path: String(message?.path || ''),
-                name: String(message?.name || ''),
-                mimeType: String(message?.mimeType || 'application/octet-stream'),
-                sizeBytes: Number(message?.sizeBytes || 0),
+                path: filePath,
+                name: resolvedName,
+                mimeType: resolvedMimeType,
+                sizeBytes: resolvedSize,
                 createdBy: actor,
-                sharedWith: Array.isArray(message?.sharedWith) ? message.sharedWith : [],
+                sharedWith: Array.isArray(message?.sharedWith) ? message.sharedWith : [String((message as any)?.audience || 'agent')],
                 status,
                 createdAt: nowIso,
                 updatedAt: nowIso,
@@ -621,6 +691,72 @@ Paired buddy: Sales Outreach.`,
             client.send('file-share-ack', { id: fileId });
             const files = await this.memoryStore.listSharedFiles();
             this.broadcast('file-list', files);
+        });
+
+        this.onMessage('file-preview', async (client, message) => {
+            const filePath = String(message?.path || '').trim();
+            if (!filePath) {
+                client.send('file-error', { message: 'Path is required for file preview.' });
+                return;
+            }
+            try {
+                const fullPath = this.resolveWorkspacePath(filePath);
+                const data = await readFile(fullPath);
+                const mimeType = this.getMimeType(filePath);
+                const isText = mimeType.startsWith('text/') || mimeType === 'application/json';
+                client.send('file-preview', {
+                    path: filePath,
+                    type: isText ? (mimeType === 'application/json' ? 'json' : 'text') : 'unsupported',
+                    content: isText ? data.toString('utf-8') : '',
+                    encoding: isText ? 'utf-8' : 'binary'
+                });
+            } catch (error: any) {
+                client.send('file-error', { message: error?.message || 'Unable to preview file.' });
+            }
+        });
+
+        this.onMessage('file-mark-review', async (client, message) => {
+            const filePath = String(message?.path || '').trim();
+            if (!filePath) {
+                client.send('file-error', { message: 'Path is required for review.' });
+                return;
+            }
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const resolvedName = path.basename(filePath);
+            let resolvedSize = 0;
+            try {
+                const meta = await stat(this.resolveWorkspacePath(filePath));
+                resolvedSize = meta.size;
+            } catch {}
+
+            const record: SharedFileRecord = {
+                id: `file_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+                path: filePath,
+                name: resolvedName,
+                mimeType: this.getMimeType(filePath),
+                sizeBytes: resolvedSize,
+                createdBy: client.sessionId,
+                sharedWith: ['ceo'],
+                status: 'needs_review',
+                createdAt: nowIso,
+                updatedAt: nowIso,
+            };
+            await this.memoryStore.upsertSharedFile(record);
+            await this.memoryStore.logShareAction({
+                fileId: record.id,
+                action: 'file-mark-review',
+                actor: client.sessionId,
+                details: JSON.stringify({ path: record.path, status: record.status }),
+            });
+            const approval = this.createApproval({
+                requestedBy: client.sessionId,
+                requestedByName: `File Owner (${client.sessionId})`,
+                requestedAction: `Review shared file: ${record.name}`,
+                rationale: `File "${record.name}" was marked needs_review and requires CEO approval before broad sharing.`,
+                isMajor: false,
+            });
+            await this.memoryStore.updateSharedFileStatus(record.id, 'needs_review', approval.id);
+            this.broadcast('file-list', await this.memoryStore.listSharedFiles());
         });
 
         this.onMessage('file-list', async (client, message) => {
@@ -784,6 +920,12 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
+                            await this.memoryStore.saveMemory('agency:global', {
+                                content: `${coreAgent.config.name} told ${targetAgent.config.name}: "${decision.message}"`,
+                                type: 'conversation',
+                                timestamp: this.state.officeTime,
+                                importance: 0.7
+                            }, this.sessionId);
                         }
 
                         coreAgent.clearInbox(); // Clear after processing
@@ -934,6 +1076,12 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.8
                             });
+                            await this.memoryStore.saveMemory('agency:global', {
+                                content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
+                                type: 'task_result',
+                                timestamp: this.state.officeTime,
+                                importance: 0.8
+                            }, this.sessionId);
 
                             if (
                                 decision.toolCall.name === 'write_file' &&
@@ -1215,7 +1363,7 @@ Paired buddy: Sales Outreach.`,
         if (next < 1) return;
 
         this.taskProgress.delete(key);
-        agent.currentTask = null;
+        agent.currentTask = '';
         agentState.currentTask = '';
 
         try {
