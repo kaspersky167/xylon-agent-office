@@ -1,5 +1,6 @@
 import { exec } from 'child_process';
 import { tavily, type TavilyClient, type TavilySearchResponse } from '@tavily/core';
+import * as pathModule from 'path';
 
 export interface ToolResult {
     success: boolean;
@@ -17,6 +18,20 @@ let tavilyCreditsUsed = 0;
 // within the last 5 minutes. Agents often think the same thing independently.
 const recentSearches = new Map<string, { result: string; ts: number }>();
 const DEDUP_WINDOW_MS = 5 * 60 * 1000;
+
+interface SearchSource {
+    url: string;
+    title: string;
+    snippet: string;
+    publishedAt?: string;
+}
+
+interface ToolResearchPayload {
+    query: string;
+    retrievedAt: string;
+    sources: SearchSource[];
+    freshnessNotes: string;
+}
 
 export class ToolExecutor {
     private tavilyClient: TavilyClient | null = null;
@@ -97,7 +112,13 @@ export class ToolExecutor {
         const cached = recentSearches.get(cacheKey);
         if (cached && Date.now() - cached.ts < DEDUP_WINDOW_MS) {
             console.log(`[Tavily] Dedup cache hit for: "${query}"`);
-            return { success: true, output: `[cached] ${cached.result}` };
+            try {
+                const payload = JSON.parse(cached.result) as ToolResearchPayload;
+                payload.freshnessNotes = `${payload.freshnessNotes} Cached result reused from ${payload.retrievedAt}.`.trim();
+                return { success: true, output: JSON.stringify(payload) };
+            } catch {
+                return { success: true, output: cached.result };
+            }
         }
 
         const client = this.getTavilyClient();
@@ -121,13 +142,28 @@ export class ToolExecutor {
             tavilyCreditsUsed += 1;
             console.log(`[Tavily] Credits used: ${tavilyCreditsUsed} / ${TAVILY_HARD_LIMIT} | query: "${query}"`);
 
-            const results = (response.results || [])
-                .map((r: TavilySearchResponse['results'][number]) => `${r.title}: ${r.content}`)
-                .join('\n\n');
+            const retrievedAt = new Date().toISOString();
+            const sources: SearchSource[] = (response.results || [])
+                .map((r: TavilySearchResponse['results'][number]) => ({
+                    url: r.url || '',
+                    title: r.title || 'Untitled',
+                    snippet: r.content || '',
+                    ...(r.publishedDate ? { publishedAt: r.publishedDate } : {}),
+                }))
+                .filter((source: SearchSource) => Boolean(source.url || source.snippet));
 
-            const output = results
-                ? `Results:\n${results}`
-                : `No results for "${query}".`;
+            const missingPublishDates = sources.filter((source) => !source.publishedAt).length;
+            const freshnessNotes = sources.length === 0
+                ? `No Tavily results were returned for "${query}".`
+                : missingPublishDates > 0
+                    ? `${missingPublishDates}/${sources.length} source(s) did not include a published date.`
+                    : 'All sources include publish dates.';
+            const output = JSON.stringify({
+                query,
+                retrievedAt,
+                sources,
+                freshnessNotes,
+            } satisfies ToolResearchPayload);
 
             // Cache result for dedup
             recentSearches.set(query.trim().toLowerCase(), { result: output, ts: Date.now() });
@@ -150,19 +186,49 @@ export class ToolExecutor {
             const res = await fetch(`https://api.duckduckgo.com/?q=${encoded}&format=json&no_html=1`);
             const data = await res.json();
 
-            const abstract = data.Abstract || data.AbstractText || '';
-            const relatedTopics = (data.RelatedTopics || []).slice(0, 3).map((t: any) => t.Text || '').join('; ');
+            const related = (data.RelatedTopics || [])
+                .flatMap((topic: any) => topic.Topics || topic)
+                .filter((topic: any) => typeof topic?.Text === 'string')
+                .slice(0, 5);
+            const sources: SearchSource[] = related.map((topic: any) => ({
+                url: topic.FirstURL || data.AbstractURL || 'https://duckduckgo.com',
+                title: topic.Text?.split(' - ')[0]?.trim() || 'DuckDuckGo Result',
+                snippet: topic.Text || '',
+            }));
 
-            const output = abstract
-                ? `Result: ${abstract}`
-                : relatedTopics
-                    ? `Related: ${relatedTopics}`
-                    : `No direct results for "${query}".`;
+            if (sources.length === 0 && (data.Abstract || data.AbstractText)) {
+                sources.push({
+                    url: data.AbstractURL || `https://duckduckgo.com/?q=${encoded}`,
+                    title: data.Heading || query,
+                    snippet: data.Abstract || data.AbstractText,
+                });
+            }
+
+            const output = JSON.stringify({
+                query,
+                retrievedAt: new Date().toISOString(),
+                sources,
+                freshnessNotes: 'DuckDuckGo fallback used (no Tavily). Results may be less current and less complete; verify important facts with primary sources and publication dates.',
+            } satisfies ToolResearchPayload);
 
             return { success: true, output };
         } catch (e: any) {
             return { success: false, output: '', error: `Search failed: ${e.message}` };
         }
+    }
+
+
+    private getWorkspaceRoot(): string {
+        return pathModule.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+    }
+
+    private resolveWorkspacePath(workspaceRoot: string, targetPath: string): string {
+        const resolvedTarget = pathModule.resolve(workspaceRoot, targetPath);
+        const relativePath = pathModule.relative(workspaceRoot, resolvedTarget);
+        if (relativePath.startsWith('..') || pathModule.isAbsolute(relativePath)) {
+            throw new Error('Path traversal not allowed.');
+        }
+        return resolvedTarget;
     }
 
     private async writeNote(content: string): Promise<ToolResult> {
@@ -184,15 +250,11 @@ export class ToolExecutor {
         }
     }
 
-    private async writeFile(path: string, content: string): Promise<ToolResult> {
+    private async writeFile(filePath: string, content: string): Promise<ToolResult> {
         const { writeFile, mkdir } = await import('fs/promises');
-        const pathModule = await import('path');
         try {
-            if (path.includes('..') || path.startsWith('/')) {
-                return { success: false, output: '', error: 'Path traversal not allowed.' };
-            }
-            // Only allow writes inside the workspace data directory
-            const safePath = pathModule.join('data', 'workspace', path);
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, filePath);
             await mkdir(pathModule.dirname(safePath), { recursive: true });
             await writeFile(safePath, content, 'utf-8');
             return { success: true, output: `Written to ${safePath}` };
@@ -216,7 +278,8 @@ export class ToolExecutor {
                 resolve({ success: false, output: '', error: `Command not in allowlist: "${command}"` });
                 return;
             }
-            exec(command, { timeout: 8000, cwd: 'data/workspace' }, (error, stdout, stderr) => {
+            const workspaceRoot = this.getWorkspaceRoot();
+            exec(command, { timeout: 8000, cwd: workspaceRoot }, (error, stdout, stderr) => {
                 if (error) {
                     resolve({ success: false, output: stderr || error.message, error: error.message });
                 } else {
@@ -262,9 +325,27 @@ export class ToolExecutor {
             const titleMatch = raw.match(/<title[^>]*>([^<]+)<\/title>/i);
             const title = titleMatch ? titleMatch[1].trim() : '';
             const body = text.slice(0, 4000);
+            const publishedMatch = raw.match(/<meta[^>]+(?:property|name)=["'](?:article:published_time|pubdate|publish-date|datePublished)["'][^>]*content=["']([^"']+)["'][^>]*>/i);
+            const publishedAt = publishedMatch?.[1];
+            const truncated = text.length > 4000;
+            const payload: ToolResearchPayload = {
+                query: url,
+                retrievedAt: new Date().toISOString(),
+                sources: [
+                    {
+                        url,
+                        title: title || url,
+                        snippet: `${body}${truncated ? '\n…(truncated)' : ''}`,
+                        ...(publishedAt ? { publishedAt } : {}),
+                    },
+                ],
+                freshnessNotes: publishedAt
+                    ? 'Publish date extracted from page metadata.'
+                    : 'No publish date found in page metadata; treat time-sensitive claims as uncertain.',
+            };
             return {
                 success: true,
-                output: `URL: ${url}\nTitle: ${title}\n\n${body}${text.length > 4000 ? '\n…(truncated)' : ''}`,
+                output: JSON.stringify(payload),
             };
         } catch (e: any) {
             return { success: false, output: '', error: `Fetch failed: ${e.message}` };
