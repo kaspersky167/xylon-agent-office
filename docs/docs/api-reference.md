@@ -10,7 +10,7 @@ AgentOffice uses WebSocket (Colyseus) for real-time state sync and message passi
 
 | Message Type | Payload | Description |
 |-------------|---------|-------------|
-| `chat` | `{ text: string }` | Send a chat message to the office |
+| `chat` | `{ text: string, attachments?: ChatAttachment[] }` | Send a chat message to the office |
 | `assign-task` | `{ title: string, agentId?: string }` | Assign a task (auto-assign if no agentId) |
 | `save-layout` | `{ name: string, layout: object[] }` | Save a custom office layout |
 | `file-share` | `{ id?: string, path: string, name: string, mimeType: string, sizeBytes?: number, createdBy?: string, sharedWith?: string[], status?: 'draft'\|'shared'\|'needs_review'\|'approved' }` | Create or upsert a shared file record |
@@ -22,7 +22,7 @@ AgentOffice uses WebSocket (Colyseus) for real-time state sync and message passi
 
 | Message Type | Payload | Description |
 |-------------|---------|-------------|
-| `chat` | `{ sender: string, text: string }` | Chat message (from agent or system) |
+| `chat` | `{ sender: string, text: string, attachments?: ChatAttachment[] }` | Chat message (from user, agent, or system) |
 | `task-update` | `{ agentId, agentName, task, status }` | Task status change |
 | `tasks-sync` | `TaskItem[]` | Full task list on client join |
 | `file-list` | `SharedFile[]` | Shared file list response/sync payload |
@@ -31,6 +31,21 @@ AgentOffice uses WebSocket (Colyseus) for real-time state sync and message passi
 | `file-share-ack` | `{ id: string }` | Acknowledgement for a `file-share` upsert |
 | `file-share-error` | `{ error: string }` | Validation error for `file-share` |
 | `file-status-update-error` | `{ error: string }` | Validation error for `file-status-update` |
+
+### `ChatAttachment` Schema
+
+```typescript
+type ChatAttachment = {
+    id: string
+    path: string
+    name: string
+    mimeType: string
+    size: number
+    sharedBy: string
+    sharedWith: string[]
+    createdAt: string // ISO timestamp
+}
+```
 
 ### Colyseus State Schema
 
@@ -76,7 +91,7 @@ The Phaser game and React components communicate via `eventBus`:
 
 | Event | Detail | Source → Target |
 |-------|--------|----------------|
-| `chat-message` | `{ sender, text }` | Colyseus → ChatPanel |
+| `chat-message` | `{ sender, text, attachments? }` | Colyseus → ChatPanel |
 | `activity-log` | `{ agent, action, thought, time }` | Phaser → SystemLog |
 | `agent-focus` | `{ name, id } \| null` | Phaser → React (focus mode) |
 

@@ -80,6 +80,53 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingActive = false;
     private meetingEndsAt = 0;
     private meetingTopic = '';
+    private taskProgress: Map<string, number> = new Map();
+
+    private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
+        if (!input || typeof input !== 'object') return null;
+
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : '';
+        const filePath = typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '';
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '';
+        const mimeType = typeof input.mimeType === 'string' && input.mimeType.trim() ? input.mimeType.trim() : '';
+        const size = Number(input.size);
+        const sharedBy = typeof input.sharedBy === 'string' && input.sharedBy.trim()
+            ? input.sharedBy.trim()
+            : defaultSharedBy;
+
+        const sharedWith = Array.isArray(input.sharedWith)
+            ? input.sharedWith
+                .filter((entry: unknown) => typeof entry === 'string')
+                .map((entry: string) => entry.trim())
+                .filter(Boolean)
+            : [];
+
+        const createdAtRaw = typeof input.createdAt === 'string' ? input.createdAt : '';
+        const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+        const createdAt = Number.isNaN(createdAtDate.getTime())
+            ? new Date().toISOString()
+            : createdAtDate.toISOString();
+
+        if (!id || !filePath || !name || !mimeType || !Number.isFinite(size) || size < 0) return null;
+
+        return {
+            id,
+            path: filePath,
+            name,
+            mimeType,
+            size: Math.floor(size),
+            sharedBy,
+            sharedWith,
+            createdAt
+        };
+    }
+
+    private parseChatAttachments(raw: any, defaultSharedBy: string): ChatAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+            .filter((item): item is ChatAttachment => Boolean(item));
+    }
 
     // Furniture interaction points: named locations agents can walk to
     private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
@@ -395,8 +442,13 @@ Paired buddy: Sales Outreach.`,
 
         this.onMessage('chat', (client, message) => {
             const text = String(message?.text || '').trim();
-            console.log(`Chat from ${client.sessionId}: ${text}`);
-            this.broadcast('chat', { sender: 'User', text });
+            const attachments = this.parseChatAttachments(message?.attachments, 'User');
+            console.log(`Chat from ${client.sessionId}: ${text} (attachments=${attachments.length})`);
+            this.broadcast('chat', {
+                sender: 'User',
+                text,
+                attachments: attachments.length > 0 ? attachments : undefined
+            });
 
             // Slash-command router — reliable, parse-first.
             if (text.startsWith('/')) {
@@ -463,6 +515,7 @@ Paired buddy: Sales Outreach.`,
                     task: title,
                     status: 'in_progress'
                 });
+                this.seedTaskProgress(targetId, title);
             }
         });
 
@@ -722,6 +775,7 @@ Paired buddy: Sales Outreach.`,
                                     task: title,
                                     status: 'in_progress'
                                 });
+                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -850,6 +904,8 @@ Paired buddy: Sales Outreach.`,
                         const recentMemories = coreAgent.memories.slice(-3);
                         await this.memoryStore.saveMemories(id, recentMemories, this.sessionId);
                     }
+
+                    await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
 
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
 
@@ -1042,6 +1098,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId, agentName: agent.config.name, task, status: 'in_progress'
             });
+            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -1067,6 +1124,63 @@ Paired buddy: Sales Outreach.`,
         };
         const key = handle.toLowerCase();
         return aliases[key] || (this.coreAgents.has(key) ? key : null);
+    }
+
+    private progressKey(agentId: string, taskTitle: string): string {
+        return `${agentId}:${taskTitle}`;
+    }
+
+    private seedTaskProgress(agentId: string, taskTitle: string) {
+        if (!taskTitle) return;
+        this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
+        const taskTitle = agent.currentTask;
+        if (!taskTitle) return;
+
+        const key = this.progressKey(agentId, taskTitle);
+        const current = this.taskProgress.get(key) ?? 0;
+        const delta = action === 'work'
+            ? 0.2
+            : action === 'use_tool'
+                ? 0.3
+                : action === 'talk'
+                    ? 0.08
+                    : 0;
+        if (delta <= 0) return;
+
+        const next = Math.min(1, current + delta);
+        this.taskProgress.set(key, next);
+
+        this.broadcast('task-update', {
+            agentId,
+            agentName: agent.config.name,
+            task: taskTitle,
+            status: next >= 1 ? 'completed' : 'in_progress',
+            progress: next
+        });
+
+        if (next < 1) return;
+
+        this.taskProgress.delete(key);
+        agent.currentTask = null;
+        agentState.currentTask = '';
+
+        try {
+            const tasks = await this.memoryStore.getTasks();
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
+            if (match?.id) await this.memoryStore.completeTask(match.id);
+        } catch {
+            // Best-effort persistence only; task completion is still reflected in broadcast updates.
+        }
+
+        this.emitHighlight(
+            'task',
+            `${agent.config.name} completed a task`,
+            `"${taskTitle}" is complete.`,
+            agentId
+        );
     }
 
     // ─── MEETINGS ───
@@ -1463,6 +1577,7 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('task-update', {
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
+            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)

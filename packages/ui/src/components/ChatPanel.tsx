@@ -2,16 +2,71 @@ import React, { useState, useEffect, useRef } from 'react';
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
 
+type ChatAttachment = {
+    id: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    sharedBy: string;
+    sharedWith: string[];
+    createdAt: string;
+};
+
+type ChatMessage = {
+    sender: string;
+    text: string;
+    attachments?: ChatAttachment[];
+};
+
+type WorkspaceFile = {
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    createdAt: string;
+};
+
+const formatBytes = (bytes: number) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    const value = bytes / (1024 ** index);
+    return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+};
+
 export function ChatPanel() {
-    const [messages, setMessages] = useState<{ sender: string, text: string }[]>([
+    const [messages, setMessages] = useState<ChatMessage[]>([
         { sender: 'System', text: 'Office environment initialized.' }
     ]);
     const [input, setInput] = useState('');
+    const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([]);
+    const [selectedPath, setSelectedPath] = useState('');
+    const [selectedAttachments, setSelectedAttachments] = useState<ChatAttachment[]>([]);
     const endRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
+        const loadWorkspaceFiles = async () => {
+            try {
+                const response = await fetch('/api/workspace-files');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const payload = await response.json();
+                setWorkspaceFiles(Array.isArray(payload?.files) ? payload.files : []);
+            } catch (error) {
+                console.warn('Could not load workspace files for chat attachments.', error);
+            }
+        };
+        loadWorkspaceFiles();
+    }, []);
+
+    useEffect(() => {
         const handleChat = (e: any) => {
-            setMessages(prev => [...prev, e.detail]);
+            const detail = e.detail || {};
+            setMessages(prev => [...prev, {
+                sender: String(detail.sender || 'System'),
+                text: String(detail.text || ''),
+                attachments: Array.isArray(detail.attachments) ? detail.attachments : undefined
+            }]);
         };
         eventBus.addEventListener('chat-message', handleChat);
         return () => eventBus.removeEventListener('chat-message', handleChat);
@@ -21,12 +76,37 @@ export function ChatPanel() {
         endRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages]);
 
+    const attachSelectedFile = () => {
+        if (!selectedPath) return;
+        const file = workspaceFiles.find((entry) => entry.path === selectedPath);
+        if (!file) return;
+        if (selectedAttachments.some((entry) => entry.path === file.path)) return;
+        setSelectedAttachments(prev => [...prev, {
+            id: `att-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+            path: file.path,
+            name: file.name,
+            mimeType: file.mimeType,
+            size: file.size,
+            sharedBy: 'User',
+            sharedWith: ['all'],
+            createdAt: new Date().toISOString()
+        }]);
+    };
+
+    const removeSelectedAttachment = (id: string) => {
+        setSelectedAttachments(prev => prev.filter((item) => item.id !== id));
+    };
+
     const send = () => {
-        if (!input.trim()) return;
+        if (!input.trim() && selectedAttachments.length === 0) return;
         const room = getColyseusRoom();
         if (room) {
-            room.send('chat', { text: input });
+            room.send('chat', {
+                text: input,
+                attachments: selectedAttachments
+            });
             setInput('');
+            setSelectedAttachments([]);
         } else {
             setMessages(prev => [...prev, { sender: 'System', text: 'Error: Cannot send message, Colyseus not connected.' }]);
         }
@@ -37,12 +117,57 @@ export function ChatPanel() {
             <h3 style={{ margin: '0 0 10px 0' }}>Office Chat</h3>
             <div style={{ flex: 1, overflowY: 'auto', fontSize: '14px', marginBottom: 10, paddingRight: 4 }}>
                 {messages.map((m, i) => (
-                    <p key={i} style={{ margin: '6px 0', lineHeight: '1.4' }}>
-                        <strong style={{ color: m.sender === 'System' ? '#00eeff' : '#aaffaa' }}>{m.sender}:</strong> {m.text}
-                    </p>
+                    <div key={i} style={{ margin: '6px 0' }}>
+                        <p style={{ margin: 0, lineHeight: '1.4' }}>
+                            <strong style={{ color: m.sender === 'System' ? '#00eeff' : '#aaffaa' }}>{m.sender}:</strong> {m.text}
+                        </p>
+                        {Array.isArray(m.attachments) && m.attachments.length > 0 && (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                                {m.attachments.map((attachment) => (
+                                    <div key={attachment.id} style={{ border: '1px solid #4f6270', borderRadius: 6, padding: '6px 8px', background: '#1f2937', fontSize: 11, minWidth: 110 }}>
+                                        <div style={{ fontWeight: 700, color: '#d9f99d' }}>{attachment.name}</div>
+                                        <div style={{ color: '#9ca3af' }}>{attachment.mimeType} • {formatBytes(attachment.size)}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                 ))}
                 <div ref={endRef} />
             </div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                <select
+                    value={selectedPath}
+                    onChange={(e) => setSelectedPath(e.target.value)}
+                    style={{ flex: 1, background: '#333', color: 'white', border: '1px solid #444', borderRadius: 4, padding: '8px' }}
+                >
+                    <option value="">Attach workspace file...</option>
+                    {workspaceFiles.map((file) => (
+                        <option key={file.path} value={file.path}>{file.name} ({file.path})</option>
+                    ))}
+                </select>
+                <button
+                    type="button"
+                    onClick={attachSelectedFile}
+                    style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '8px 10px', cursor: 'pointer' }}
+                >
+                    Attach
+                </button>
+            </div>
+            {selectedAttachments.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                    {selectedAttachments.map((attachment) => (
+                        <button
+                            key={attachment.id}
+                            type="button"
+                            onClick={() => removeSelectedAttachment(attachment.id)}
+                            style={{ border: '1px solid #566', background: '#202938', color: '#dbeafe', borderRadius: 999, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}
+                        >
+                            {attachment.name} ×
+                        </button>
+                    ))}
+                </div>
+            )}
             <input
                 type="text"
                 placeholder="Send a message..."
