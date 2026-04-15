@@ -229,6 +229,10 @@ export class OfficeRoom extends Room<OfficeState> {
             ` available in your memory or recent chat. Combine multiple questions into one query.`,
             ` Never repeat a search you or a colleague already ran this session.`,
             ` Prefer fetch_url for xylondevs.com (free, no credit cost) over a search for it.`,
+            ` web_search/fetch_url tool outputs are JSON in the output field with query, retrievedAt,`,
+            ` sources[{url,title,snippet,publishedAt?}], and freshnessNotes. When reporting findings,`,
+            ` summarize key points with source URLs and explicitly note uncertainty when publish dates`,
+            ` are missing or stale.`,
         ].join(' ');
 
         // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
