@@ -10,6 +10,7 @@ import { AgentPulseBoard } from './components/AgentPulseBoard';
 import { RelationshipGraph } from './components/RelationshipGraph';
 import { EpisodeRecapPanel } from './components/EpisodeRecapPanel';
 import { CeoApprovalPanel } from './components/CeoApprovalPanel';
+import { ProjectProgressPanel } from './components/ProjectProgressPanel';
 
 export function App() {
     return (
@@ -29,6 +30,7 @@ export function App() {
             <AgentPulseBoard />
             <EpisodeRecapPanel />
             <CeoApprovalPanel />
+            <ProjectProgressPanel />
         </>
     );
 }
