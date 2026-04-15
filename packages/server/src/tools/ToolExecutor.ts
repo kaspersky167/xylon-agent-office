@@ -2,6 +2,10 @@ import { exec } from 'child_process';
 import { tavily, type TavilyClient, type TavilySearchResponse } from '@tavily/core';
 import * as pathModule from 'path';
 
+const MAX_READ_FILE_BYTES = 8 * 1024;
+const MAX_READ_CHUNK_BYTES = 64 * 1024;
+const MAX_LIST_FILES_RESULTS = 500;
+
 export interface ToolResult {
     success: boolean;
     output: string;
@@ -61,6 +65,12 @@ export class ToolExecutor {
                 return this.writeNote(params.content);
             case 'read_file':
                 return this.readFile(params.path);
+            case 'list_files':
+                return this.listFiles(params.path || '.', params.recursive, params.limit);
+            case 'stat_file':
+                return this.statFile(params.path);
+            case 'read_file_chunk':
+                return this.readFileChunk(params.path, params.offset, params.length);
             case 'write_file':
                 return this.writeFile(params.path, params.content);
             case 'run_command':
@@ -223,6 +233,9 @@ export class ToolExecutor {
     }
 
     private resolveWorkspacePath(workspaceRoot: string, targetPath: string): string {
+        if (typeof targetPath !== 'string' || targetPath.trim() === '') {
+            throw new Error('Path is required.');
+        }
         const resolvedTarget = pathModule.resolve(workspaceRoot, targetPath);
         const relativePath = pathModule.relative(workspaceRoot, resolvedTarget);
         if (relativePath.startsWith('..') || pathModule.isAbsolute(relativePath)) {
@@ -240,11 +253,124 @@ export class ToolExecutor {
     private async readFile(path: string): Promise<ToolResult> {
         const { readFile } = await import('fs/promises');
         try {
-            if (path.includes('..') || path.startsWith('/')) {
-                return { success: false, output: '', error: 'Path traversal not allowed.' };
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, path);
+            const content = await readFile(safePath, 'utf-8');
+            return { success: true, output: content.slice(0, MAX_READ_FILE_BYTES) };
+        } catch (e: any) {
+            return { success: false, output: '', error: e.message };
+        }
+    }
+
+    private normalizeLimit(limit: unknown): number {
+        if (limit === undefined || limit === null) return 200;
+        const parsed = Number(limit);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            throw new Error('limit must be a positive number.');
+        }
+        return Math.min(Math.floor(parsed), MAX_LIST_FILES_RESULTS);
+    }
+
+    private async listFiles(targetPath: string, recursive = false, limit?: number): Promise<ToolResult> {
+        const { readdir } = await import('fs/promises');
+        try {
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+            const maxItems = this.normalizeLimit(limit);
+            const shouldRecurse = Boolean(recursive);
+            const files: Array<{ path: string; type: 'file' | 'directory' | 'other' }> = [];
+            const queue = [safePath];
+
+            while (queue.length > 0 && files.length < maxItems) {
+                const currentDir = queue.shift() as string;
+                const entries = await readdir(currentDir, { withFileTypes: true });
+                for (const entry of entries) {
+                    if (files.length >= maxItems) break;
+                    const absEntryPath = pathModule.join(currentDir, entry.name);
+                    const relPath = pathModule.relative(workspaceRoot, absEntryPath).replace(/\\/g, '/');
+                    const itemType: 'file' | 'directory' | 'other' = entry.isFile()
+                        ? 'file'
+                        : entry.isDirectory()
+                            ? 'directory'
+                            : 'other';
+                    files.push({ path: relPath, type: itemType });
+                    if (shouldRecurse && entry.isDirectory()) {
+                        queue.push(absEntryPath);
+                    }
+                }
             }
-            const content = await readFile(path, 'utf-8');
-            return { success: true, output: content.slice(0, 1000) };
+
+            return {
+                success: true,
+                output: JSON.stringify({
+                    root: pathModule.relative(workspaceRoot, safePath) || '.',
+                    recursive: shouldRecurse,
+                    limit: maxItems,
+                    truncated: files.length >= maxItems,
+                    entries: files,
+                }),
+            };
+        } catch (e: any) {
+            return { success: false, output: '', error: e.message };
+        }
+    }
+
+    private async statFile(targetPath: string): Promise<ToolResult> {
+        const { stat } = await import('fs/promises');
+        try {
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+            const details = await stat(safePath);
+            return {
+                success: true,
+                output: JSON.stringify({
+                    path: pathModule.relative(workspaceRoot, safePath).replace(/\\/g, '/'),
+                    size: details.size,
+                    isFile: details.isFile(),
+                    isDirectory: details.isDirectory(),
+                    mode: details.mode,
+                    createdAt: details.birthtime.toISOString(),
+                    modifiedAt: details.mtime.toISOString(),
+                    accessedAt: details.atime.toISOString(),
+                }),
+            };
+        } catch (e: any) {
+            return { success: false, output: '', error: e.message };
+        }
+    }
+
+    private async readFileChunk(targetPath: string, offset: unknown, length: unknown): Promise<ToolResult> {
+        const { open } = await import('fs/promises');
+        try {
+            const workspaceRoot = this.getWorkspaceRoot();
+            const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+            const parsedOffset = Number(offset ?? 0);
+            const parsedLength = Number(length ?? 4096);
+            if (!Number.isFinite(parsedOffset) || parsedOffset < 0) {
+                return { success: false, output: '', error: 'offset must be a non-negative number.' };
+            }
+            if (!Number.isFinite(parsedLength) || parsedLength <= 0) {
+                return { success: false, output: '', error: 'length must be a positive number.' };
+            }
+            const safeLength = Math.min(Math.floor(parsedLength), MAX_READ_CHUNK_BYTES);
+            const fileHandle = await open(safePath, 'r');
+            try {
+                const buffer = Buffer.alloc(safeLength);
+                const { bytesRead } = await fileHandle.read(buffer, 0, safeLength, Math.floor(parsedOffset));
+                return {
+                    success: true,
+                    output: JSON.stringify({
+                        path: pathModule.relative(workspaceRoot, safePath).replace(/\\/g, '/'),
+                        offset: Math.floor(parsedOffset),
+                        length: safeLength,
+                        bytesRead,
+                        truncated: parsedLength > safeLength,
+                        data: buffer.subarray(0, bytesRead).toString('utf-8'),
+                    }),
+                };
+            } finally {
+                await fileHandle.close();
+            }
         } catch (e: any) {
             return { success: false, output: '', error: e.message };
         }
