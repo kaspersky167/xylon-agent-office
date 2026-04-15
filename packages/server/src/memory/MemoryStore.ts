@@ -71,7 +71,25 @@ export class MemoryStore {
                 status TEXT NOT NULL DEFAULT 'pending',
                 pending_tool TEXT,
                 pending_params TEXT,
+                file_id TEXT,
+                file_path TEXT,
+                file_name TEXT,
+                file_shared_by_agent_id TEXT,
+                file_shared_by_agent_name TEXT,
+                file_summary_note TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS shared_files (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                shared_by_agent_id TEXT NOT NULL,
+                shared_by_agent_name TEXT NOT NULL,
+                summary_note TEXT,
+                status TEXT NOT NULL DEFAULT 'shared',
+                approval_id TEXT,
+                updated_at TEXT NOT NULL
             );
         `);
 
@@ -81,6 +99,24 @@ export class MemoryStore {
         } catch {
             // Column already exists — ignore
         }
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_id TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_path TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_name TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_id TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_name TEXT');
+        } catch {}
+        try {
+            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_summary_note TEXT');
+        } catch {}
 
         console.log('[MemoryStore] SQLite initialized at', dbPath);
     }
@@ -216,18 +252,32 @@ export class MemoryStore {
         isMajor: boolean;
         status: 'pending' | 'approved' | 'rejected';
         pending?: { toolName: string; params: any } | null;
+        fileContext?: {
+            fileId: string;
+            filePath: string;
+            fileName: string;
+            sharedByAgentId: string;
+            sharedByAgentName: string;
+            summaryNote: string;
+        } | null;
         createdAt: string;
     }): Promise<void> {
         if (!this.db) return;
         await this.db.run(
             `INSERT OR REPLACE INTO approvals
-             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, file_id, file_path, file_name, file_shared_by_agent_id, file_shared_by_agent_name, file_summary_note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 a.id, a.requestedBy, a.requestedByName, a.requestedAction, a.rationale,
                 a.isMajor ? 1 : 0, a.status,
                 a.pending?.toolName || null,
                 a.pending ? JSON.stringify(a.pending.params ?? {}) : null,
+                a.fileContext?.fileId || null,
+                a.fileContext?.filePath || null,
+                a.fileContext?.fileName || null,
+                a.fileContext?.sharedByAgentId || null,
+                a.fileContext?.sharedByAgentName || null,
+                a.fileContext?.summaryNote || null,
                 a.createdAt,
             ]
         );
@@ -258,7 +308,55 @@ export class MemoryStore {
             pending: r.pending_tool
                 ? { toolName: r.pending_tool, params: r.pending_params ? JSON.parse(r.pending_params) : {} }
                 : null,
+            fileContext: r.file_id ? {
+                fileId: r.file_id,
+                filePath: r.file_path || '',
+                fileName: r.file_name || '',
+                sharedByAgentId: r.file_shared_by_agent_id || '',
+                sharedByAgentName: r.file_shared_by_agent_name || '',
+                summaryNote: r.file_summary_note || '',
+            } : null,
         }));
+    }
+
+    // --- Shared File Operations ---
+
+    async upsertSharedFile(file: {
+        id: string;
+        filePath: string;
+        fileName: string;
+        sharedByAgentId: string;
+        sharedByAgentName: string;
+        summaryNote?: string;
+        status: 'shared' | 'needs_review' | 'approved' | 'rejected';
+        approvalId?: string | null;
+        updatedAt: string;
+    }): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            `INSERT OR REPLACE INTO shared_files
+             (id, file_path, file_name, shared_by_agent_id, shared_by_agent_name, summary_note, status, approval_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                file.id,
+                file.filePath,
+                file.fileName,
+                file.sharedByAgentId,
+                file.sharedByAgentName,
+                file.summaryNote || null,
+                file.status,
+                file.approvalId || null,
+                file.updatedAt,
+            ]
+        );
+    }
+
+    async updateSharedFileStatus(fileId: string, status: 'approved' | 'rejected', approvalId?: string | null): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            "UPDATE shared_files SET status = ?, approval_id = ?, updated_at = datetime('now') WHERE id = ?",
+            [status, approvalId || null, fileId]
+        );
     }
 
     async close(): Promise<void> {
