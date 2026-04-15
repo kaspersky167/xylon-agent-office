@@ -35,6 +35,17 @@ interface ApprovalRequest {
     pending?: { toolName: string; params: any } | null;
 }
 
+interface ChatAttachment {
+    id: string;
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+    sharedBy: string;
+    sharedWith: string[];
+    createdAt: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -70,6 +81,52 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
+
+    private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
+        if (!input || typeof input !== 'object') return null;
+
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : '';
+        const filePath = typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '';
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '';
+        const mimeType = typeof input.mimeType === 'string' && input.mimeType.trim() ? input.mimeType.trim() : '';
+        const size = Number(input.size);
+        const sharedBy = typeof input.sharedBy === 'string' && input.sharedBy.trim()
+            ? input.sharedBy.trim()
+            : defaultSharedBy;
+
+        const sharedWith = Array.isArray(input.sharedWith)
+            ? input.sharedWith
+                .filter((entry: unknown) => typeof entry === 'string')
+                .map((entry: string) => entry.trim())
+                .filter(Boolean)
+            : [];
+
+        const createdAtRaw = typeof input.createdAt === 'string' ? input.createdAt : '';
+        const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+        const createdAt = Number.isNaN(createdAtDate.getTime())
+            ? new Date().toISOString()
+            : createdAtDate.toISOString();
+
+        if (!id || !filePath || !name || !mimeType || !Number.isFinite(size) || size < 0) return null;
+
+        return {
+            id,
+            path: filePath,
+            name,
+            mimeType,
+            size: Math.floor(size),
+            sharedBy,
+            sharedWith,
+            createdAt
+        };
+    }
+
+    private parseChatAttachments(raw: any, defaultSharedBy: string): ChatAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+            .filter((item): item is ChatAttachment => Boolean(item));
+    }
 
     // Furniture interaction points: named locations agents can walk to
     private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
@@ -385,8 +442,13 @@ Paired buddy: Sales Outreach.`,
 
         this.onMessage('chat', (client, message) => {
             const text = String(message?.text || '').trim();
-            console.log(`Chat from ${client.sessionId}: ${text}`);
-            this.broadcast('chat', { sender: 'User', text });
+            const attachments = this.parseChatAttachments(message?.attachments, 'User');
+            console.log(`Chat from ${client.sessionId}: ${text} (attachments=${attachments.length})`);
+            this.broadcast('chat', {
+                sender: 'User',
+                text,
+                attachments: attachments.length > 0 ? attachments : undefined
+            });
 
             // Slash-command router — reliable, parse-first.
             if (text.startsWith('/')) {
