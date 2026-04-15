@@ -2,7 +2,7 @@ import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 import { MemoryEntry } from '@agent-office/core';
 
-export type SharedFileStatus = 'draft' | 'shared' | 'needs_review' | 'approved';
+export type SharedFileStatus = 'draft' | 'shared' | 'needs_review' | 'approved' | 'rejected';
 
 export interface SharedFileRecord {
     id: string;
@@ -36,7 +36,6 @@ export class MemoryStore {
     }
 
     async initialize(dbPath: string = './data/office-memory.db') {
-        // Ensure data directory exists
         const { mkdir } = await import('fs/promises');
         const path = await import('path');
         await mkdir(path.dirname(dbPath), { recursive: true });
@@ -100,44 +99,42 @@ export class MemoryStore {
                 id TEXT PRIMARY KEY,
                 file_path TEXT NOT NULL,
                 file_name TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes INTEGER DEFAULT 0,
                 shared_by_agent_id TEXT NOT NULL,
                 shared_by_agent_name TEXT NOT NULL,
+                shared_with TEXT,
                 summary_note TEXT,
                 status TEXT NOT NULL DEFAULT 'shared',
                 approval_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS share_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         `);
 
-        // Migration: add embedding column to existing databases
-        try {
-            await this.db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT');
-        } catch {
-            // Column already exists — ignore
-        }
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_id TEXT');
-        } catch {}
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_path TEXT');
-        } catch {}
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_name TEXT');
-        } catch {}
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_id TEXT');
-        } catch {}
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_name TEXT');
-        } catch {}
-        try {
-            await this.db.exec('ALTER TABLE approvals ADD COLUMN file_summary_note TEXT');
-        } catch {}
+        try { await this.db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_id TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_path TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_name TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_id TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_shared_by_agent_name TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE approvals ADD COLUMN file_summary_note TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN mime_type TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN size_bytes INTEGER DEFAULT 0'); } catch {}
+        try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN shared_with TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN created_at TEXT DEFAULT (datetime(\'now\'))'); } catch {}
 
         console.log('[MemoryStore] SQLite initialized at', dbPath);
     }
-
-    // --- Embedding Generation ---
 
     private async generateEmbedding(text: string): Promise<number[] | null> {
         try {
@@ -153,11 +150,8 @@ export class MemoryStore {
         }
     }
 
-    // --- Memory Operations ---
-
     async saveMemory(agentId: string, entry: MemoryEntry, sessionId?: string): Promise<void> {
         if (!this.db) return;
-        // Generate embedding for semantic search (async, non-blocking)
         let embeddingStr: string | null = null;
         if (entry.importance >= 0.5) {
             const embedding = await this.generateEmbedding(entry.content);
@@ -192,7 +186,7 @@ export class MemoryStore {
     async semanticSearch(agentId: string, query: string, topK: number = 5): Promise<MemoryEntry[]> {
         if (!this.db) return [];
         const queryEmbedding = await this.generateEmbedding(query);
-        if (!queryEmbedding) return this.loadMemories(agentId, topK); // Fallback to recency
+        if (!queryEmbedding) return this.loadMemories(agentId, topK);
 
         const rows = await this.db.all(
             'SELECT content, type, timestamp, importance, embedding FROM memories WHERE agent_id = ? AND embedding IS NOT NULL',
@@ -212,8 +206,6 @@ export class MemoryStore {
             importance: s.importance
         }));
     }
-
-    // --- Task Operations ---
 
     async createTask(title: string, assignedTo?: string): Promise<number> {
         if (!this.db) return -1;
@@ -239,8 +231,6 @@ export class MemoryStore {
         await this.db.run("UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?", [taskId]);
     }
 
-    // --- Layout Operations ---
-
     async saveLayout(name: string, layoutJson: string): Promise<void> {
         if (!this.db) return;
         const existing = await this.db.get('SELECT id FROM office_layout WHERE name = ?', [name]);
@@ -256,8 +246,6 @@ export class MemoryStore {
         const row = await this.db.get('SELECT layout_json FROM office_layout WHERE name = ?', [name]);
         return row ? JSON.parse(row.layout_json) : null;
     }
-
-    // --- Approval Operations ---
 
     async saveApproval(a: {
         id: string;
@@ -335,43 +323,124 @@ export class MemoryStore {
         }));
     }
 
-    // --- Shared File Operations ---
-
-    async upsertSharedFile(file: {
+    async upsertSharedFile(file: Partial<SharedFileRecord> & {
         id: string;
-        filePath: string;
-        fileName: string;
-        sharedByAgentId: string;
-        sharedByAgentName: string;
+        filePath?: string;
+        fileName?: string;
+        sharedByAgentId?: string;
+        sharedByAgentName?: string;
         summaryNote?: string;
-        status: 'shared' | 'needs_review' | 'approved' | 'rejected';
         approvalId?: string | null;
-        updatedAt: string;
+        updatedAt?: string;
     }): Promise<void> {
         if (!this.db) return;
+
+        const path = file.path || file.filePath || '';
+        const name = file.name || file.fileName || '';
+        const createdBy = file.createdBy || file.sharedByAgentId || 'unknown';
+        const sharedByName = file.sharedByAgentName || file.createdBy || 'Unknown';
+        const status = file.status || 'shared';
+        const updatedAt = file.updatedAt || new Date().toISOString();
+        const createdAt = file.createdAt || updatedAt;
+        const mimeType = file.mimeType || 'application/octet-stream';
+        const sharedWith = Array.isArray(file.sharedWith) ? file.sharedWith : [];
+
         await this.db.run(
             `INSERT OR REPLACE INTO shared_files
-             (id, file_path, file_name, shared_by_agent_id, shared_by_agent_name, summary_note, status, approval_id, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, file_path, file_name, mime_type, size_bytes, shared_by_agent_id, shared_by_agent_name, shared_with, summary_note, status, approval_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 file.id,
-                file.filePath,
-                file.fileName,
-                file.sharedByAgentId,
-                file.sharedByAgentName,
+                path,
+                name,
+                mimeType,
+                Number(file.sizeBytes || 0),
+                createdBy,
+                sharedByName,
+                JSON.stringify(sharedWith),
                 file.summaryNote || null,
-                file.status,
-                file.approvalId || null,
-                file.updatedAt,
+                status,
+                file.approvalRequestId || file.approvalId || null,
+                createdAt,
+                updatedAt,
             ]
         );
     }
 
-    async updateSharedFileStatus(fileId: string, status: 'approved' | 'rejected', approvalId?: string | null): Promise<void> {
+    async listSharedFiles(filter?: {
+        status?: SharedFileStatus;
+        createdBy?: string;
+        sharedWith?: string;
+    }): Promise<SharedFileRecord[]> {
+        if (!this.db) return [];
+        const clauses: string[] = [];
+        const params: any[] = [];
+        if (filter?.status) {
+            clauses.push('status = ?');
+            params.push(filter.status);
+        }
+        if (filter?.createdBy) {
+            clauses.push('shared_by_agent_id = ?');
+            params.push(filter.createdBy);
+        }
+        if (filter?.sharedWith) {
+            clauses.push('shared_with LIKE ?');
+            params.push(`%${filter.sharedWith}%`);
+        }
+        const sql = `SELECT * FROM shared_files ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY updated_at DESC`;
+        const rows = await this.db.all(sql, params);
+        return rows.map((row: any) => ({
+            id: row.id,
+            path: row.file_path,
+            name: row.file_name,
+            mimeType: row.mime_type || 'application/octet-stream',
+            sizeBytes: Number(row.size_bytes || 0),
+            createdBy: row.shared_by_agent_id,
+            sharedWith: row.shared_with ? JSON.parse(row.shared_with) : [],
+            status: row.status,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            approvalRequestId: row.approval_id || null,
+        }));
+    }
+
+    async getSharedFile(id: string): Promise<SharedFileRecord | null> {
+        if (!this.db) return null;
+        const row = await this.db.get('SELECT * FROM shared_files WHERE id = ?', [id]);
+        if (!row) return null;
+        return {
+            id: row.id,
+            path: row.file_path,
+            name: row.file_name,
+            mimeType: row.mime_type || 'application/octet-stream',
+            sizeBytes: Number(row.size_bytes || 0),
+            createdBy: row.shared_by_agent_id,
+            sharedWith: row.shared_with ? JSON.parse(row.shared_with) : [],
+            status: row.status,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            approvalRequestId: row.approval_id || null,
+        };
+    }
+
+    async updateSharedFileStatus(fileId: string, status: SharedFileStatus, approvalId?: string | null): Promise<void> {
         if (!this.db) return;
         await this.db.run(
             "UPDATE shared_files SET status = ?, approval_id = ?, updated_at = datetime('now') WHERE id = ?",
             [status, approvalId || null, fileId]
+        );
+    }
+
+    async logShareAction(input: {
+        fileId: string;
+        action: string;
+        actor: string;
+        details?: string;
+    }): Promise<void> {
+        if (!this.db) return;
+        await this.db.run(
+            'INSERT INTO share_actions (file_id, action, actor, details) VALUES (?, ?, ?, ?)',
+            [input.fileId, input.action, input.actor, input.details || null]
         );
     }
 
