@@ -1,11 +1,27 @@
-import { Room, Client } from 'colyseus';
-import { OfficeState } from '../schema/OfficeState';
-import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
-import { OllamaAdapter } from '@agent-office/adapters';
-import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore } from '../memory/MemoryStore';
-import path from 'path';
-import { promises as fs } from 'fs';
+import { Room, Client } from "colyseus";
+import { OfficeState } from "../schema/OfficeState";
+import {
+  Agent,
+  Office,
+  OfficeConfig,
+  ConversationMessage,
+  type InferenceConfig,
+} from "@agent-office/core";
+import { OllamaAdapter, OpenAICompatibleAdapter } from "@agent-office/adapters";
+import { ToolExecutor } from "../tools/ToolExecutor";
+import {
+  MemoryStore,
+  SharedFileRecord,
+  SharedFileStatus,
+} from "../memory/MemoryStore";
+import path from "path";
+import { readFile, stat, mkdir, writeFile } from "fs/promises";
+import type { ExtensionRegistry } from "../extensions/registry";
+
+
+
+type TaskStatus = "backlog" | "in_progress" | "blocked" | "review" | "done";
+type TaskPriority = "low" | "medium" | "high" | "urgent";
 
 interface HighlightEvent {
   type: string;
@@ -76,19 +92,32 @@ interface ApprovalRequest {
   } | null;
 }
 
-interface WorkspaceFileEntry {
-    path: string;
-    type: 'file' | 'directory';
-    size?: number;
-    updatedAt?: string;
+interface SharedFileUpsertPayload {
+  id?: string;
+  path: string;
+  name: string;
+  mimeType: string;
+  sizeBytes?: number;
+  createdBy?: string;
+  sharedWith?: string[];
+  status?: SharedFileStatus;
 }
 
-interface WorkspaceFileEntry {
-    path: string;
-    type: 'file' | 'directory';
-    size?: number;
-    updatedAt?: string;
+interface ChatAttachment {
+  id: string;
+  path: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  sharedBy: string;
+  sharedWith: string[];
+  createdAt: string;
 }
+
+type ZoneId = 'main' | 'ceo_office';
+type ZoneBounds = { minX: number; maxX: number; minY: number; maxY: number };
+type LayoutItem = { id: string; type: string; x: number; y: number; label?: string; zoneId: ZoneId };
+type FurnitureTarget = { x: number; y: number; type: string };
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
@@ -102,70 +131,69 @@ const MAJOR_TOOLS = new Set<string>([
 ]);
 
 export class OfficeRoom extends Room<OfficeState> {
-    private static activeRoom: OfficeRoom | null = null;
+  private static activeRoom: OfficeRoom | null = null;
+  private static extensionRegistry: ExtensionRegistry | null = null;
 
-    maxClients = 100;
-    private office!: Office;
-    private demoTickCount = 0;
-    private coreAgents: Map<string, Agent> = new Map();
-    private thinkingLocks: Map<string, boolean> = new Map();
-    private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
-    private hireCount = 0; // Counter for generating unique IDs
-    private toolExecutor = new ToolExecutor();
-    private memoryStore = new MemoryStore();
-    private sessionId = `session_${Date.now()}`;
-    private currentScenario = 'Free Play';
-    private highlights: HighlightEvent[] = [];
-    private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
-    private relationships: Map<string, RelationshipEdge> = new Map();
-    private audienceVotes: Record<string, number> = {};
-    private currentLayout: any[] = [];
-    private approvals: Map<string, ApprovalRequest> = new Map();
-    private meetingActive = false;
-    private meetingEndsAt = 0;
-    private meetingTopic = '';
-    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+  static setExtensionRegistry(extensionRegistry: ExtensionRegistry): void {
+    OfficeRoom.extensionRegistry = extensionRegistry;
+  }
 
-    // Furniture interaction points: named locations agents can walk to
-    private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
-        // ─── ENGINEERING POD (pod of 4, left side) ───
-        // Pair: Frontend + Backend / Pair: DevOps + Security
-        'frontend-desk':    { x: 5,  y: 10, type: 'desk' },
-        'backend-desk':     { x: 8,  y: 10, type: 'desk' },
-        'devops-desk':      { x: 5,  y: 14, type: 'desk' },
-        'security-desk':    { x: 8,  y: 14, type: 'desk' },
+  maxClients = 100;
+  private office!: Office;
+  private demoTickCount = 0;
+  private coreAgents: Map<string, Agent> = new Map();
+  private thinkingLocks: Map<string, boolean> = new Map();
+  private ollamaAdapter = new OllamaAdapter("http://localhost:11434");
+  private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter =
+    this.ollamaAdapter;
+  private inferenceProvider: InferenceConfig["provider"] = "ollama";
+  private defaultModel =
+    process.env.AGENT_MODEL ||
+    process.env.CLAUDE_MODEL ||
+    "claude-3-5-sonnet-latest";
+  private hireCount = 0; // Counter for generating unique IDs
+  private toolExecutor = new ToolExecutor();
+  private memoryStore = new MemoryStore();
+  private sessionId = `session_${Date.now()}`;
+  private currentScenario = "Free Play";
+  private highlights: HighlightEvent[] = [];
+  private chaosHistory: Array<{ event: string; label: string; time: string }> =
+    [];
+  private relationships: Map<string, RelationshipEdge> = new Map();
+  private audienceVotes: Record<string, number> = {};
+  private currentLayout: any[] = [];
+  private approvals: Map<string, ApprovalRequest> = new Map();
+  private meetingActive = false;
+  private meetingEndsAt = 0;
+  private meetingTopic = "";
+  private taskProgress: Map<string, number> = new Map();
+  private workspaceRoot = path.resolve(
+    process.env.AGENT_WORKSPACE_DIR || "data/workspace",
+  );
+  private completedTasks: CompletedTaskRecord[] = [];
+  private fastTrackMode = true;
 
-        // ─── OPS / STRATEGY POD (pod of 4, center) ───
-        // Pair: Shepherd + Reality / Pair: Evidence + SEO
-        'shepherd-desk':    { x: 17, y: 10, type: 'desk' },
-        'reality-desk':     { x: 20, y: 10, type: 'desk' },
-        'evidence-desk':    { x: 17, y: 14, type: 'desk' },
-        'seo-desk':         { x: 20, y: 14, type: 'desk' },
-
-        // ─── GROWTH POD (small pod of 2, right side) ───
-        // Pair: Sales + Proposal
-        'sales-desk':       { x: 29, y: 10, type: 'desk' },
-        'proposal-desk':    { x: 32, y: 10, type: 'desk' },
-
-        // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
-        'ceo-desk':         { x: 32, y: 30, type: 'desk' },
-        'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
-        'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
-        'ceo-office-door':  { x: 28, y: 30, type: 'door' },
-
-        // ─── SHARED FURNITURE ───
-        'meeting-table':  { x: 20, y: 22, type: 'table' },
-        'coffee-machine': { x: 5,  y: 30, type: 'appliance' },
-        'whiteboard':     { x: 20, y: 5,  type: 'board' },
-        'water-cooler':   { x: 12, y: 30, type: 'appliance' },
-        'bookshelf':      { x: 17, y: 30, type: 'furniture' },
-        'beanbag':        { x: 24, y: 30, type: 'seating' },
-        // Extra desks for dynamically hired agents
-        'hire_0-desk': { x: 22, y: 18, type: 'desk' },
-        'hire_1-desk': { x: 22, y: 23, type: 'desk' },
-        'hire_2-desk': { x: 25, y: 18, type: 'desk' },
-        'hire_3-desk': { x: 25, y: 8,  type: 'desk' },
-        'hire_4-desk': { x: 32, y: 18, type: 'desk' },
+  private getMimeType(filePath: string): string {
+    const ext = path.extname(filePath).toLowerCase();
+    const map: Record<string, string> = {
+      ".md": "text/markdown",
+      ".txt": "text/plain",
+      ".json": "application/json",
+      ".js": "text/javascript",
+      ".ts": "text/typescript",
+      ".tsx": "text/tsx",
+      ".jsx": "text/jsx",
+      ".html": "text/html",
+      ".css": "text/css",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".svg": "image/svg+xml",
+      ".pdf": "application/pdf",
+      ".csv": "text/csv",
+      ".yml": "text/yaml",
+      ".yaml": "text/yaml",
     };
     return map[ext] || "application/octet-stream";
   }
@@ -177,138 +205,149 @@ export class OfficeRoom extends Room<OfficeState> {
     if (!safeTarget || rel.startsWith("..") || path.isAbsolute(rel)) {
       throw new Error("Invalid workspace file path.");
     }
+    return fullPath;
+  }
 
-    async onCreate(options: any) {
-        OfficeRoom.activeRoom = this;
-        this.setState(new OfficeState());
+  private normalizeChatAttachment(
+    input: any,
+    defaultSharedBy: string,
+  ): ChatAttachment | null {
+    if (!input || typeof input !== "object") return null;
 
-        // Initialize memory store
-        await this.memoryStore.initialize();
+    const id =
+      typeof input.id === "string" && input.id.trim() ? input.id.trim() : "";
+    const filePath =
+      typeof input.path === "string" && input.path.trim()
+        ? input.path.trim()
+        : "";
+    const name =
+      typeof input.name === "string" && input.name.trim()
+        ? input.name.trim()
+        : "";
+    const mimeType =
+      typeof input.mimeType === "string" && input.mimeType.trim()
+        ? input.mimeType.trim()
+        : "";
+    const size = Number(input.size);
+    const sharedBy =
+      typeof input.sharedBy === "string" && input.sharedBy.trim()
+        ? input.sharedBy.trim()
+        : defaultSharedBy;
 
-        const config: OfficeConfig = {
-            name: options.name || 'Startup HQ',
-            grid: { width: 40, height: 40, tileSize: 16 },
-            rooms: [],
-            furniture: [],
-            spawnPoints: [{ x: 10, y: 10 }],
-            zones: []
-        };
-        this.office = new Office(config);
+    const sharedWith = Array.isArray(input.sharedWith)
+      ? input.sharedWith
+          .filter((entry: unknown) => typeof entry === "string")
+          .map((entry: string) => entry.trim())
+          .filter(Boolean)
+      : [];
 
-        // Setup Core Agents with AI capabilities
-        type Traits = { openness: number; conscientiousness: number; extraversion: number; agreeableness: number; neuroticism: number };
-        type Capability = { name: string; description: string };
-        const setupCoreAgent = async (
-            id: string,
-            name: string,
-            role: string,
-            x: number,
-            y: number,
-            systemPrompt: string,
-            personality: {
-                traits: Traits;
-                communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
-            },
-            capabilities: Capability[],
-            model: string = 'llama3.2:latest'
-        ) => {
-            this.state.createAgent(id, name);
-            const state = this.state.agents.get(id);
-            if (state) { state.x = x; state.y = y; }
+    const createdAtRaw =
+      typeof input.createdAt === "string" ? input.createdAt : "";
+    const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+    const createdAt = Number.isNaN(createdAtDate.getTime())
+      ? new Date().toISOString()
+      : createdAtDate.toISOString();
 
-            const coreAgent = new Agent({
-                id, name, role, avatar: 'sprite.png',
-                inference: {
-                    provider: 'ollama',
-                    model,
-                    systemPrompt,
-                },
-                personality: {
-                    traits: personality.traits,
-                    communicationStyle: personality.communicationStyle,
-                    workHours: { start: '09:00', end: '17:00' },
-                    breakFrequency: 120
-                },
-                capabilities,
-                memory: { shortTermLimit: 50 }
-            });
+    if (
+      !id ||
+      !filePath ||
+      !name ||
+      !mimeType ||
+      !Number.isFinite(size) ||
+      size < 0
+    )
+      return null;
 
-            coreAgent.setInferenceAdapter(this.ollamaAdapter);
-            await coreAgent.initialize();
+    return {
+      id,
+      path: filePath,
+      name,
+      mimeType,
+      size: Math.floor(size),
+      sharedBy,
+      sharedWith,
+      createdAt,
+    };
+  }
 
-            // Load persistent memories from previous sessions
-            const previousMemories = await this.memoryStore.loadMemories(id, 20);
-            if (previousMemories.length > 0) {
-                coreAgent.loadMemories(previousMemories);
-                console.log(`[${name}] Loaded ${previousMemories.length} memories from previous sessions`);
-            }
+  private parseChatAttachments(
+    raw: any,
+    defaultSharedBy: string,
+  ): ChatAttachment[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+      .filter((item): item is ChatAttachment => Boolean(item));
+  }
 
-            this.coreAgents.set(id, coreAgent);
-            this.thinkingLocks.set(id, false);
-        };
+  // Furniture interaction points: named locations agents can walk to
+  private furnitureTargets: Record<
+    string,
+    { x: number; y: number; type: string }
+  > = {
+    // ─── ENGINEERING POD (pod of 4, left side) ───
+    // Pair: Frontend + Backend / Pair: DevOps + Security
+    "frontend-desk": { x: 5, y: 10, type: "desk" },
+    "backend-desk": { x: 8, y: 10, type: "desk" },
+    "devops-desk": { x: 5, y: 14, type: "desk" },
+    "security-desk": { x: 8, y: 14, type: "desk" },
 
-        // ─── SHARED CAPABILITY SETS ───
-        // Read-only: can inspect files and search, nothing writes or executes
-        const READ_ONLY: Capability[] = [
-            { name: 'read_file',   description: 'Read a file from the workspace' },
-            { name: 'web_search',  description: 'Search the web for information' },
-            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
-            { name: 'write_note',  description: 'Save a note or observation' },
-            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
-        ];
+    // ─── OPS / STRATEGY POD (pod of 4, center) ───
+    // Pair: Shepherd + Reality / Pair: Evidence + SEO
+    "shepherd-desk": { x: 17, y: 10, type: "desk" },
+    "reality-desk": { x: 20, y: 10, type: "desk" },
+    "evidence-desk": { x: 17, y: 14, type: "desk" },
+    "seo-desk": { x: 20, y: 14, type: "desk" },
 
-        // Coordinator: task flow + notes, no file access
-        const COORDINATOR: Capability[] = [
-            { name: 'create_task', description: 'Create a task and assign it to an agent' },
-            { name: 'write_note',  description: 'Save a note or memo' },
-            { name: 'web_search',  description: 'Search the web for information' },
-            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
-            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
-        ];
+    // ─── GROWTH POD (small pod of 2, right side) ───
+    // Pair: Sales + Proposal
+    "sales-desk": { x: 29, y: 10, type: "desk" },
+    "proposal-desk": { x: 32, y: 10, type: "desk" },
 
-        // Builder: file edits + safe shell commands + web search + research
-        const BUILDER: Capability[] = [
-            { name: 'read_file',    description: 'Read a file from the workspace' },
-            { name: 'write_file',   description: 'Write or update a file in the workspace' },
-            { name: 'run_command',  description: 'Run an allowlisted shell command (ls, git status, docker ps, etc.)' },
-            { name: 'code_execute', description: 'Execute a small JavaScript snippet' },
-            { name: 'web_search',   description: 'Search the web for information' },
-            { name: 'fetch_url',    description: 'Fetch and read the visible text of a public URL' },
-            { name: 'write_note',   description: 'Save a note or memo' },
-            { name: 'create_task',  description: 'Create a task and assign it to an agent' },
-        ];
+    // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
+    "ceo-desk": { x: 32, y: 30, type: "desk" },
+    "ceo-office-wall-1": { x: 28, y: 27, type: "wall" },
+    "ceo-office-wall-2": { x: 28, y: 33, type: "wall" },
+    "ceo-office-door": { x: 28, y: 30, type: "door" },
 
-        // ─── COLLAB CHARTER (shared across all agents) ───
-        // Keep it short so it doesn't dominate the prompt but nudges real teamwork.
-        const COLLAB = [
-            `You work at Xylon Devs as part of a small agency team.`,
-            `Collaborate often — consult your paired buddy first when a task overlaps.`,
-            `Loop in other pods (engineering / ops-strategy / growth) when it matters.`,
-            `Keep thoughts concise. Propose concrete next actions, not just observations.`,
-            `For MAJOR decisions (hiring, deploys, destructive commands, pricing commitments,`,
-            ` publishing/launch, major reprioritization, or anything tagged "major") you MUST`,
-            ` request CEO approval before executing. Minor work (drafting, research, notes,`,
-            ` internal coordination, proposing tasks) does not need approval.`,
-            `When collaborating on workspace files, share relevant files with other agents for review`,
-            ` and escalate important outcomes to the CEO (use chat summary + rationale).`,
-            `WEB SEARCH BUDGET: the team shares a limited Tavily API budget (1 000 credits total).`,
-            ` Be frugal — only call web_search or fetch_url when the information is not already`,
-            ` available in your memory or recent chat. Combine multiple questions into one query.`,
-            ` Never repeat a search you or a colleague already ran this session.`,
-            ` Prefer fetch_url for xylondevs.com (free, no credit cost) over a search for it.`,
-            ` RECENCY RULE: for volatile topics (news, pricing, specs, policies, releases, outages),`,
-            ` explicitly prioritize fresh evidence. Use web_search to find recent sources, then`,
-            ` verify key claims with fetch_url (and check_health when useful). Include source URLs`,
-            ` in your findings, and do not rely on stale cached assumptions when freshness matters.`,
-        ].join(' ');
+    // ─── SHARED FURNITURE ───
+    "meeting-table": { x: 20, y: 22, type: "table" },
+    "coffee-machine": { x: 5, y: 30, type: "appliance" },
+    whiteboard: { x: 20, y: 5, type: "board" },
+    "water-cooler": { x: 12, y: 30, type: "appliance" },
+    bookshelf: { x: 17, y: 30, type: "furniture" },
+    beanbag: { x: 24, y: 30, type: "seating" },
+    // Extra desks for dynamically hired agents
+    "hire_0-desk": { x: 22, y: 18, type: "desk" },
+    "hire_1-desk": { x: 22, y: 23, type: "desk" },
+    "hire_2-desk": { x: 25, y: 18, type: "desk" },
+    "hire_3-desk": { x: 25, y: 8, type: "desk" },
+    "hire_4-desk": { x: 32, y: 18, type: "desk" },
+  };
 
-        // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
-        // Engineering pod — Frontend + Backend (pair), DevOps + Security (pair)
-        await setupCoreAgent(
-            'frontend', 'Frontend Dev', 'Frontend Developer', 5, 10,
-            `${COLLAB} Your focus: modern UI, UX clarity, conversion, and front-end implementation. Paired buddy: Backend Architect — sync with them before API shape changes.`,
-            { traits: { openness: 0.9, conscientiousness: 0.8, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'creative' },
-            BUILDER
+  static getActiveRoom(): OfficeRoom | null {
+    return OfficeRoom.activeRoom;
+  }
+
+  private configureInferenceProvider() {
+    const provider = (process.env.AGENT_INFERENCE_PROVIDER || "")
+      .toLowerCase()
+      .trim();
+    if (provider === "claude" || provider === "openai-compatible") {
+      const baseUrl =
+        process.env.CLAUDE_BASE_URL ||
+        process.env.OPENAI_COMPAT_BASE_URL ||
+        "https://openrouter.ai/api";
+      const apiKey =
+        process.env.CLAUDE_API_KEY ||
+        process.env.OPENAI_API_KEY ||
+        process.env.OPENROUTER_API_KEY ||
+        "";
+      if (apiKey) {
+        this.inferenceAdapter = new OpenAICompatibleAdapter(
+          baseUrl,
+          apiKey,
+          "openai",
         );
         this.inferenceProvider = "openai";
         this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
@@ -1235,203 +1274,49 @@ Paired buddy: Sales Outreach.`,
           rationale: `File "${current?.name || fileId}" status changed to needs_review and now needs CEO review.`,
           isMajor: false,
         });
+        approvalId = approval.id;
+      }
 
-        // ─── DESKTOP COMPUTER FILE HANDLERS ───
-        this.onMessage('file-list', async (client) => {
-            const files = await this.listWorkspaceFiles();
-            client.send('file-list', { files });
-        });
+      await this.memoryStore.updateSharedFileStatus(
+        fileId,
+        nextStatus,
+        approvalId,
+      );
+      await this.memoryStore.logShareAction({
+        fileId,
+        action: "file-status-update",
+        actor: client.sessionId,
+        details: JSON.stringify({ status: nextStatus, approvalId }),
+      });
 
-        this.onMessage('file-preview', async (client, message) => {
-            const targetPath = String(message?.path || '');
-            const result = await this.readWorkspaceFile(targetPath);
-            if (!result.ok) {
-                client.send('file-error', { path: targetPath, message: result.error });
-                return;
-            }
-            client.send('file-preview', result.preview);
-        });
+      const file = await this.memoryStore.getSharedFile(fileId);
+      this.broadcast("file-status-update", file);
+    });
 
-        this.onMessage('file-save', async (client, message) => {
-            const targetPath = String(message?.path || '');
-            const content = String(message?.content ?? '');
-            const result = await this.writeWorkspaceFile(targetPath, content);
-            if (!result.ok) {
-                client.send('file-error', { path: targetPath, message: result.error });
-                return;
-            }
-            this.broadcast('chat', { sender: 'System', text: `💾 File saved: ${targetPath}` });
-            this.broadcast('file-preview', {
-                path: targetPath,
-                type: this.guessPreviewType(targetPath),
-                content
-            });
-            const files = await this.listWorkspaceFiles();
-            this.broadcast('file-list', { files });
-        });
+    // Save office layout from editor
+    this.onMessage("save-layout", async (client, message) => {
+      const layoutName = message.name || "default";
+      const layout = Array.isArray(message.layout) ? message.layout : [];
+      await this.memoryStore.saveLayout(layoutName, JSON.stringify(layout));
+      this.currentLayout = layout;
+      this.broadcast("layout-sync", {
+        name: layoutName,
+        layout: this.currentLayout,
+      });
+      this.broadcast("chat", {
+        sender: "System",
+        text: "✅ Office layout saved!",
+      });
+    });
 
-        this.onMessage('file-share', (client, message) => {
-            const targetPath = String(message?.path || '');
-            const audience = String(message?.audience || '').toLowerCase();
-            const instructions = String(message?.instructions || '').trim();
-            const recipientRaw = String(message?.recipient || '').trim();
+    // Start Simulation Loop
+    this.setSimulationInterval((delta) => this.update(delta), 100);
+  }
 
-            if (!targetPath) {
-                client.send('file-error', { message: 'Missing file path for share action.' });
-                return;
-            }
-
-            if (audience === 'ceo') {
-                const ceo = this.coreAgents.get('ceo');
-                if (ceo) {
-                    ceo.receiveMessage({
-                        from: 'User',
-                        to: ceo.config.name,
-                        content: `File shared with CEO for review: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}`,
-                        timestamp: this.state.officeTime
-                    });
-                }
-                this.broadcast('chat', { sender: 'System', text: `📤 Shared ${targetPath} with CEO.` });
-                this.emitHighlight('file_share', 'Shared with CEO', `${targetPath} was routed to CEO review.`, 'ceo');
-                return;
-            }
-
-            const targetAgentId = this.resolveAgentId(recipientRaw);
-            if (!targetAgentId) {
-                client.send('file-error', { message: 'Choose a valid agent recipient before sharing.' });
-                return;
-            }
-
-            const targetAgent = this.coreAgents.get(targetAgentId);
-            if (!targetAgent) {
-                client.send('file-error', { message: 'Agent recipient is currently unavailable.' });
-                return;
-            }
-
-            targetAgent.receiveMessage({
-                from: 'User',
-                to: targetAgent.config.name,
-                content: `Please review/update file: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}. If this is major or client-facing, share outcomes with CEO.`,
-                timestamp: this.state.officeTime
-            });
-
-            this.broadcast('chat', {
-                sender: 'System',
-                text: `📤 Shared ${targetPath} with ${targetAgent.config.name}${instructions ? ' (with instructions)' : ''}.`
-            });
-            this.emitHighlight('file_share', `Shared with ${targetAgent.config.name}`, targetPath, targetAgentId);
-        });
-
-        this.onMessage('file-mark-review', (client, message) => {
-            const targetPath = String(message?.path || '');
-            const note = String(message?.note || 'Review requested by user.');
-            if (!targetPath) {
-                client.send('file-error', { message: 'Missing file path for review mark.' });
-                return;
-            }
-            this.broadcast('chat', { sender: 'System', text: `📝 Review requested for ${targetPath}. ${note}` });
-            this.emitHighlight('file_review', 'File marked for review', `${targetPath} — ${note}`);
-        });
-
-        // ─── DESKTOP COMPUTER FILE HANDLERS ───
-        this.onMessage('file-list', async (client) => {
-            const files = await this.listWorkspaceFiles();
-            client.send('file-list', { files });
-        });
-
-        this.onMessage('file-preview', async (client, message) => {
-            const targetPath = String(message?.path || '');
-            const result = await this.readWorkspaceFile(targetPath);
-            if (!result.ok) {
-                client.send('file-error', { path: targetPath, message: result.error });
-                return;
-            }
-            client.send('file-preview', result.preview);
-        });
-
-        this.onMessage('file-save', async (client, message) => {
-            const targetPath = String(message?.path || '');
-            const content = String(message?.content ?? '');
-            const result = await this.writeWorkspaceFile(targetPath, content);
-            if (!result.ok) {
-                client.send('file-error', { path: targetPath, message: result.error });
-                return;
-            }
-            this.broadcast('chat', { sender: 'System', text: `💾 File saved: ${targetPath}` });
-            this.broadcast('file-preview', {
-                path: targetPath,
-                type: this.guessPreviewType(targetPath),
-                content
-            });
-            const files = await this.listWorkspaceFiles();
-            this.broadcast('file-list', { files });
-        });
-
-        this.onMessage('file-share', (client, message) => {
-            const targetPath = String(message?.path || '');
-            const audience = String(message?.audience || '').toLowerCase();
-            const instructions = String(message?.instructions || '').trim();
-            const recipientRaw = String(message?.recipient || '').trim();
-
-            if (!targetPath) {
-                client.send('file-error', { message: 'Missing file path for share action.' });
-                return;
-            }
-
-            if (audience === 'ceo') {
-                const ceo = this.coreAgents.get('ceo');
-                if (ceo) {
-                    ceo.receiveMessage({
-                        from: 'User',
-                        to: ceo.config.name,
-                        content: `File shared with CEO for review: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}`,
-                        timestamp: this.state.officeTime
-                    });
-                }
-                this.broadcast('chat', { sender: 'System', text: `📤 Shared ${targetPath} with CEO.` });
-                this.emitHighlight('file_share', 'Shared with CEO', `${targetPath} was routed to CEO review.`, 'ceo');
-                return;
-            }
-
-            const targetAgentId = this.resolveAgentId(recipientRaw);
-            if (!targetAgentId) {
-                client.send('file-error', { message: 'Choose a valid agent recipient before sharing.' });
-                return;
-            }
-
-            const targetAgent = this.coreAgents.get(targetAgentId);
-            if (!targetAgent) {
-                client.send('file-error', { message: 'Agent recipient is currently unavailable.' });
-                return;
-            }
-
-            targetAgent.receiveMessage({
-                from: 'User',
-                to: targetAgent.config.name,
-                content: `Please review/update file: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}. If this is major or client-facing, share outcomes with CEO.`,
-                timestamp: this.state.officeTime
-            });
-
-            this.broadcast('chat', {
-                sender: 'System',
-                text: `📤 Shared ${targetPath} with ${targetAgent.config.name}${instructions ? ' (with instructions)' : ''}.`
-            });
-            this.emitHighlight('file_share', `Shared with ${targetAgent.config.name}`, targetPath, targetAgentId);
-        });
-
-        this.onMessage('file-mark-review', (client, message) => {
-            const targetPath = String(message?.path || '');
-            const note = String(message?.note || 'Review requested by user.');
-            if (!targetPath) {
-                client.send('file-error', { message: 'Missing file path for review mark.' });
-                return;
-            }
-            this.broadcast('chat', { sender: 'System', text: `📝 Review requested for ${targetPath}. ${note}` });
-            this.emitHighlight('file_review', 'File marked for review', `${targetPath} — ${note}`);
-        });
-
-        // Start Simulation Loop
-        this.setSimulationInterval((delta) => this.update(delta), 100);
+  private autoAssignAgent(): string {
+    // Pick the agent with no current task, or the first one
+    for (const [id, agent] of this.coreAgents) {
+      if (!agent.currentTask) return id;
     }
     // fallback: first registered core agent (Project Shepherd by default)
     return this.coreAgents.keys().next().value || "shepherd";
@@ -1472,222 +1357,20 @@ Paired buddy: Sales Outreach.`,
           }
         });
 
-                coreAgent.think({
-                    time: this.state.officeTime,
-                    location: `${agentState.x},${agentState.y}`,
-                    nearbyAgents,
-                    currentTask: coreAgent.currentTask || null,
-                    recentMessages: coreAgent.getUnreadMessages(),
-                    memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision: any) => {
-                    agentState.action = decision.action;
+        coreAgent
+          .think({
+            time: this.state.officeTime,
+            location: `${agentState.x},${agentState.y}`,
+            nearbyAgents,
+            currentTask: coreAgent.currentTask || null,
+            recentMessages: coreAgent.getUnreadMessages(),
+            memories: coreAgent.getRecentMemories(5),
+          })
+          .then(async (decision: any) => {
+            agentState.action = decision.action;
 
-                    if (decision.thought) {
-                        agentState.thought = decision.thought;
-                    }
-
-                    // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
-                    if (decision.action === 'talk' && decision.message) {
-                        const targetName = decision.target || '';
-                        let targetId = '';
-                        this.coreAgents.forEach((a, aId) => {
-                            if (a.config.name.toLowerCase() === targetName.toLowerCase()) targetId = aId;
-                        });
-
-                        const targetAgent = this.coreAgents.get(targetId);
-                        if (targetAgent) {
-                            const msg: ConversationMessage = {
-                                from: coreAgent.config.name,
-                                to: targetAgent.config.name,
-                                content: decision.message,
-                                timestamp: this.state.officeTime
-                            };
-                            targetAgent.receiveMessage(msg);
-
-                            // Broadcast to UI chat
-                            this.broadcast('chat', {
-                                sender: coreAgent.config.name,
-                                text: `💬 (to ${targetAgent.config.name}): ${decision.message}`
-                            });
-                            this.emitHighlight(
-                                'conversation',
-                                `${coreAgent.config.name} pinged ${targetAgent.config.name}`,
-                                decision.message.slice(0, 120),
-                                id
-                            );
-                            this.updateRelationship(id, targetId, 0.08);
-
-                            // Save conversation memory
-                            await this.memoryStore.saveMemory(id, {
-                                content: `Said to ${targetAgent.config.name}: "${decision.message}"`,
-                                type: 'conversation',
-                                timestamp: this.state.officeTime,
-                                importance: 0.7
-                            }, this.sessionId);
-                        }
-
-                        coreAgent.clearInbox(); // Clear after processing
-                    }
-
-                    // ─── HANDLE TOOL EXECUTION ───
-                    if (decision.action === 'use_tool' && decision.toolCall) {
-                        // Special case: agent-created tasks
-                        if (decision.toolCall.name === 'create_task') {
-                            const { title, assignee } = decision.toolCall.params;
-                            const targetId = assignee?.toLowerCase() || this.autoAssignAgent();
-                            const targetAgent = this.coreAgents.get(targetId);
-                            const targetState = this.state.agents.get(targetId);
-
-                            if (targetAgent && targetState) {
-                                targetAgent.currentTask = title;
-                                targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
-
-                                this.broadcast('chat', {
-                                    sender: coreAgent.config.name,
-                                    text: `📋 Created task "${title}" for ${targetAgent.config.name}`
-                                });
-                                this.broadcast('task-update', {
-                                    agentId: targetId,
-                                    agentName: targetAgent.config.name,
-                                    task: title,
-                                    status: 'in_progress'
-                                });
-                                this.emitHighlight(
-                                    'task',
-                                    `${coreAgent.config.name} assigned work`,
-                                    `"${title}" is now owned by ${targetAgent.config.name}.`,
-                                    targetId
-                                );
-                            }
-                        } else if (decision.toolCall.name === 'hire_agent' && id !== 'ceo') {
-                            // Hiring is MAJOR → route to CEO approval queue
-                            this.createApproval({
-                                requestedBy: id,
-                                requestedByName: coreAgent.config.name,
-                                requestedAction: `hire_agent (${decision.toolCall.params?.role || 'Intern'})`,
-                                rationale: decision.thought || 'No rationale provided.',
-                                isMajor: true,
-                                pending: { toolName: 'hire_agent', params: decision.toolCall.params },
-                            });
-                        } else if (decision.toolCall.name === 'hire_agent') {
-                            // ─── DYNAMIC AGENT HIRING (CEO-executed) ───
-                            const hireParams = decision.toolCall.params;
-                            const hireName = hireParams.name || ['Charlie', 'Diana', 'Eve', 'Frank', 'Grace'][this.hireCount % 5];
-                            const hireRole = hireParams.role || 'Intern';
-                            const hireId = `hire_${this.hireCount}`;
-
-                            if (this.hireCount < 5 && !this.coreAgents.has(hireId)) {
-                                // Spawn at office door (top-center), then walk to their desk
-                                const spawnX = 20;
-                                const spawnY = 2;
-
-                                this.state.createAgent(hireId, hireName);
-                                const hireState = this.state.agents.get(hireId);
-                                if (hireState) { hireState.x = spawnX; hireState.y = spawnY; }
-
-                                const hireAgent = new Agent({
-                                    id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
-                                    inference: {
-                                        provider: 'ollama',
-                                        model: 'llama3.2:latest',
-                                        systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
-                                    },
-                                    personality: {
-                                        traits: { openness: 0.9, conscientiousness: 0.7, extraversion: 0.8, agreeableness: 0.9, neuroticism: 0.2 },
-                                        communicationStyle: hireRole.includes('Design') ? 'creative' : 'casual',
-                                        workHours: { start: '09:00', end: '17:00' },
-                                        breakFrequency: 90
-                                    },
-                                    capabilities: [
-                                        { name: 'code_execute', description: 'Execute JavaScript code' },
-                                        { name: 'web_search', description: 'Search the web' },
-                                        { name: 'write_note', description: 'Write a note' },
-                                        { name: 'create_task', description: 'Create a task for the team' }
-                                    ],
-                                    memory: { shortTermLimit: 50 }
-                                });
-
-                                hireAgent.setInferenceAdapter(this.ollamaAdapter);
-                                await hireAgent.initialize();
-                                this.coreAgents.set(hireId, hireAgent);
-                                this.thinkingLocks.set(hireId, false);
-
-                                this.hireCount++;
-                                this.rebuildRelationshipGraph();
-
-                                this.broadcast('chat', {
-                                    sender: '🏢 Office',
-                                    text: `🎉 ${coreAgent.config.name} hired ${hireName} as ${hireRole}! Welcome to the team!`
-                                });
-                                this.emitHighlight(
-                                    'hiring',
-                                    `${hireName} joined the team`,
-                                    `${coreAgent.config.name} hired ${hireName} (${hireRole}).`,
-                                    hireId
-                                );
-
-                                // Give the hiring agent a memory of the hire
-                                coreAgent.addMemory({
-                                    content: `I hired ${hireName} as a ${hireRole}. They just joined the team.`,
-                                    type: 'achievement',
-                                    timestamp: this.state.officeTime,
-                                    importance: 0.9
-                                });
-                            } else if (this.hireCount >= 5) {
-                                this.broadcast('chat', {
-                                    sender: '🏢 Office',
-                                    text: `⚠️ ${coreAgent.config.name} tried to hire but the office is full! (Max 7 agents)`
-                                });
-                            }
-                        } else if (id !== 'ceo' && this.isMajorToolCall(decision.toolCall.name, decision.toolCall.params)) {
-                            // ─── MAJOR ACTION → CEO APPROVAL GATE ───
-                            this.createApproval({
-                                requestedBy: id,
-                                requestedByName: coreAgent.config.name,
-                                requestedAction: `${decision.toolCall.name}`,
-                                rationale: decision.thought || 'No rationale provided — please supply more context.',
-                                isMajor: true,
-                                pending: { toolName: decision.toolCall.name, params: decision.toolCall.params },
-                            });
-                        } else {
-                            const result = await this.toolExecutor.execute(
-                                decision.toolCall.name,
-                                decision.toolCall.params
-                            );
-
-                            this.broadcast('chat', {
-                                sender: coreAgent.config.name,
-                                text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
-                            });
-                            this.emitHighlight(
-                                'tool',
-                                `${coreAgent.config.name} used ${decision.toolCall.name}`,
-                                (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
-                                id
-                            );
-
-                            coreAgent.addMemory({
-                                content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            });
-                        }
-                    }
-
-                    // ─── PERSIST MEMORIES PERIODICALLY ───
-                    if (Math.random() < 0.3) {
-                        const recentMemories = coreAgent.memories.slice(-3);
-                        await this.memoryStore.saveMemories(id, recentMemories, this.sessionId);
-                    }
-
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
-
-                }).catch((err: any) => {
-                    console.error(`Agent ${id} think error:`, err);
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
-                });
+            if (decision.thought) {
+              agentState.thought = decision.thought;
             }
 
             // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
@@ -3369,142 +3052,6 @@ Paired buddy: Sales Outreach.`,
     for (const [id, agent] of this.coreAgents) {
       await this.memoryStore.saveMemories(id, agent.memories, this.sessionId);
     }
-
-    onJoin(client: Client, options: any) {
-        console.log(client.sessionId, "joined the office room!");
-        // Send existing tasks to newly joined client
-        this.memoryStore.getTasks().then(tasks => {
-            client.send('tasks-sync', tasks);
-        });
-        client.send('relationship-update', this.buildRelationshipPayload());
-        client.send('layout-sync', { name: 'default', layout: this.currentLayout });
-        client.send('approvals-sync', this.listApprovals());
-        client.send('meeting-state', this.meetingActive
-            ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
-            : { active: false });
-        this.listWorkspaceFiles().then((files) => {
-            client.send('file-list', { files });
-        }).catch((err) => {
-            client.send('file-error', { message: `Unable to list workspace files: ${String(err?.message || err)}` });
-        });
-    }
-
-    onLeave(client: Client, consented: boolean) {
-        console.log(client.sessionId, "left the office room!");
-    }
-
-    async onDispose() {
-        console.log("room", this.roomId, "disposing... saving memories");
-        OfficeRoom.activeRoom = null;
-        // Persist all agent memories on shutdown
-        for (const [id, agent] of this.coreAgents) {
-            await this.memoryStore.saveMemories(id, agent.memories, this.sessionId);
-        }
-        await this.memoryStore.close();
-    }
-
-    private safeWorkspacePath(relativePath: string): string {
-        const cleaned = String(relativePath || '').replace(/^\/+/, '');
-        const resolved = path.resolve(this.workspaceRoot, cleaned);
-        const rel = path.relative(this.workspaceRoot, resolved);
-        if (rel.startsWith('..') || path.isAbsolute(rel)) {
-            throw new Error('Path traversal not allowed.');
-        }
-        return resolved;
-    }
-
-    private guessPreviewType(filePath: string): 'text' | 'markdown' | 'json' | 'html' | 'unsupported' {
-        const ext = path.extname(filePath).toLowerCase();
-        if (ext === '.json') return 'json';
-        if (ext === '.md' || ext === '.mdx') return 'markdown';
-        if (ext === '.html' || ext === '.htm') return 'html';
-        const textSet = new Set(['.txt', '.log', '.csv', '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.go', '.rb', '.css', '.scss', '.yml', '.yaml', '.xml']);
-        return textSet.has(ext) ? 'text' : 'unsupported';
-    }
-
-    private async listWorkspaceFiles(): Promise<WorkspaceFileEntry[]> {
-        const output: WorkspaceFileEntry[] = [];
-        const maxDepth = 4;
-        const walk = async (dir: string, depth: number) => {
-            if (depth > maxDepth) return;
-            const entries = await fs.readdir(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.name.startsWith('.')) continue;
-                const fullPath = path.join(dir, entry.name);
-                const relPath = path.relative(this.workspaceRoot, fullPath).replace(/\\/g, '/');
-                const stat = await fs.stat(fullPath);
-                if (entry.isDirectory()) {
-                    output.push({ path: relPath, type: 'directory', updatedAt: stat.mtime.toISOString() });
-                    await walk(fullPath, depth + 1);
-                } else if (entry.isFile()) {
-                    output.push({
-                        path: relPath,
-                        type: 'file',
-                        size: stat.size,
-                        updatedAt: stat.mtime.toISOString()
-                    });
-                }
-            }
-        };
-
-        await fs.mkdir(this.workspaceRoot, { recursive: true });
-        await walk(this.workspaceRoot, 0);
-        return output.sort((a, b) => a.path.localeCompare(b.path));
-    }
-
-    private async readWorkspaceFile(relativePath: string): Promise<{ ok: true; preview: any } | { ok: false; error: string }> {
-        try {
-            if (!relativePath) return { ok: false, error: 'Missing file path.' };
-            const fullPath = this.safeWorkspacePath(relativePath);
-            const buf = await fs.readFile(fullPath);
-            const looksBinary = buf.includes(0);
-            if (looksBinary) {
-                return {
-                    ok: true,
-                    preview: {
-                        path: relativePath,
-                        type: 'unsupported',
-                        content: '',
-                        downloadUrl: `file://${fullPath}`,
-                        externalUrl: `file://${fullPath}`
-                    }
-                };
-            }
-            return {
-                ok: true,
-                preview: {
-                    path: relativePath,
-                    type: this.guessPreviewType(relativePath),
-                    content: buf.toString('utf-8')
-                }
-            };
-        } catch (err: any) {
-            return { ok: false, error: String(err?.message || err) };
-        }
-    }
-
-    private async writeWorkspaceFile(relativePath: string, content: string): Promise<{ ok: true } | { ok: false; error: string }> {
-        try {
-            if (!relativePath) return { ok: false, error: 'Missing file path.' };
-            const fullPath = this.safeWorkspacePath(relativePath);
-            await fs.mkdir(path.dirname(fullPath), { recursive: true });
-            await fs.writeFile(fullPath, content, 'utf-8');
-            return { ok: true };
-        } catch (err: any) {
-            return { ok: false, error: String(err?.message || err) };
-        }
-    }
-
-    private resolveAgentId(input: string): string | null {
-        if (!input) return null;
-        const normalized = input.toLowerCase();
-        if (this.coreAgents.has(normalized)) return normalized;
-        for (const [id, agent] of this.coreAgents.entries()) {
-            const name = agent.config.name.toLowerCase();
-            if (name === normalized || name.includes(normalized) || normalized.includes(name)) {
-                return id;
-            }
-        }
-        return null;
-    }
+    await this.memoryStore.close();
+  }
 }
