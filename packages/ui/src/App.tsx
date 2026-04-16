@@ -1,5 +1,11 @@
 import React from 'react';
 import { ChatPanel } from './components/ChatPanel';
+import { TaskBoard } from './components/TaskBoard';
+import { AgentInspector } from './components/AgentInspector';
+import { LayoutEditor } from './components/LayoutEditor';
+import { SystemLog } from './components/SystemLog';
+import { ViralControlPanel } from './components/ViralControlPanel';
+import { HighlightsFeed } from './components/HighlightsFeed';
 import { AgentPulseBoard } from './components/AgentPulseBoard';
 import { RelationshipGraph } from './components/RelationshipGraph';
 import { EpisodeRecapPanel } from './components/EpisodeRecapPanel';
@@ -49,13 +55,5 @@ function AppContent() {
             {panelVisibility.advanced && panelVisibility.layoutEditor && <LayoutEditor />}
             {panelVisibility.advanced && panelVisibility.inspector && <AgentInspector />}
         </>
-    );
-}
-
-export function App() {
-    return (
-        <UIStoreProvider>
-            <AppContent />
-        </UIStoreProvider>
     );
 }
