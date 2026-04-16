@@ -286,6 +286,9 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('file-list', (message: any) => {
                     emitUIEvent(UIEvents.desktopFilesSync, message);
                 });
+                this.room!.onMessage('file-list', (message: any) => {
+                    emitUIEvent(UIEvents.desktopFilesSync, message);
+                });
                 this.room!.onMessage('file-preview', (message: any) => {
                     emitUIEvent(UIEvents.desktopFilePreview, message);
                 });

@@ -83,6 +83,13 @@ interface WorkspaceFileEntry {
     updatedAt?: string;
 }
 
+interface WorkspaceFileEntry {
+    path: string;
+    type: 'file' | 'directory';
+    size?: number;
+    updatedAt?: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
   "hire_agent",
@@ -1227,6 +1234,103 @@ Paired buddy: Sales Outreach.`,
           requestedAction: `Review shared file: ${current?.name || fileId}`,
           rationale: `File "${current?.name || fileId}" status changed to needs_review and now needs CEO review.`,
           isMajor: false,
+        });
+
+        // ─── DESKTOP COMPUTER FILE HANDLERS ───
+        this.onMessage('file-list', async (client) => {
+            const files = await this.listWorkspaceFiles();
+            client.send('file-list', { files });
+        });
+
+        this.onMessage('file-preview', async (client, message) => {
+            const targetPath = String(message?.path || '');
+            const result = await this.readWorkspaceFile(targetPath);
+            if (!result.ok) {
+                client.send('file-error', { path: targetPath, message: result.error });
+                return;
+            }
+            client.send('file-preview', result.preview);
+        });
+
+        this.onMessage('file-save', async (client, message) => {
+            const targetPath = String(message?.path || '');
+            const content = String(message?.content ?? '');
+            const result = await this.writeWorkspaceFile(targetPath, content);
+            if (!result.ok) {
+                client.send('file-error', { path: targetPath, message: result.error });
+                return;
+            }
+            this.broadcast('chat', { sender: 'System', text: `💾 File saved: ${targetPath}` });
+            this.broadcast('file-preview', {
+                path: targetPath,
+                type: this.guessPreviewType(targetPath),
+                content
+            });
+            const files = await this.listWorkspaceFiles();
+            this.broadcast('file-list', { files });
+        });
+
+        this.onMessage('file-share', (client, message) => {
+            const targetPath = String(message?.path || '');
+            const audience = String(message?.audience || '').toLowerCase();
+            const instructions = String(message?.instructions || '').trim();
+            const recipientRaw = String(message?.recipient || '').trim();
+
+            if (!targetPath) {
+                client.send('file-error', { message: 'Missing file path for share action.' });
+                return;
+            }
+
+            if (audience === 'ceo') {
+                const ceo = this.coreAgents.get('ceo');
+                if (ceo) {
+                    ceo.receiveMessage({
+                        from: 'User',
+                        to: ceo.config.name,
+                        content: `File shared with CEO for review: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}`,
+                        timestamp: this.state.officeTime
+                    });
+                }
+                this.broadcast('chat', { sender: 'System', text: `📤 Shared ${targetPath} with CEO.` });
+                this.emitHighlight('file_share', 'Shared with CEO', `${targetPath} was routed to CEO review.`, 'ceo');
+                return;
+            }
+
+            const targetAgentId = this.resolveAgentId(recipientRaw);
+            if (!targetAgentId) {
+                client.send('file-error', { message: 'Choose a valid agent recipient before sharing.' });
+                return;
+            }
+
+            const targetAgent = this.coreAgents.get(targetAgentId);
+            if (!targetAgent) {
+                client.send('file-error', { message: 'Agent recipient is currently unavailable.' });
+                return;
+            }
+
+            targetAgent.receiveMessage({
+                from: 'User',
+                to: targetAgent.config.name,
+                content: `Please review/update file: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}. If this is major or client-facing, share outcomes with CEO.`,
+                timestamp: this.state.officeTime
+            });
+
+            this.broadcast('chat', {
+                sender: 'System',
+                text: `📤 Shared ${targetPath} with ${targetAgent.config.name}${instructions ? ' (with instructions)' : ''}.`
+            });
+            this.emitHighlight('file_share', `Shared with ${targetAgent.config.name}`, targetPath, targetAgentId);
+        });
+
+        this.onMessage('file-mark-review', (client, message) => {
+            const targetPath = String(message?.path || '');
+            const note = String(message?.note || 'Review requested by user.');
+            if (!targetPath) {
+                client.send('file-error', { message: 'Missing file path for review mark.' });
+                return;
+            }
+            this.broadcast('chat', { sender: 'System', text: `📝 Review requested for ${targetPath}. ${note}` });
+            this.emitHighlight('file_review', 'File marked for review', `${targetPath} — ${note}`);
         });
 
         // ─── DESKTOP COMPUTER FILE HANDLERS ───
