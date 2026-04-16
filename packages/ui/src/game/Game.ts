@@ -2,10 +2,6 @@ import Phaser from 'phaser';
 import * as Colyseus from 'colyseus.js';
 import { OfficeState, AgentState } from './schema';
 import { UIEvents, emitUIEvent, eventBus } from '../events';
-import { COLORS, GRID_SIZE_PX } from './theme';
-import { drawOfficeBase, drawSubtleGrid, drawZoneFrames } from './render/zones';
-import { drawFurniture } from './render/furniture';
-import { AGENT_EMOTE_MAP, getAgentStyle } from './render/agents';
 
 let activeRoom: Colyseus.Room<OfficeState> | undefined;
 
@@ -287,12 +283,17 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('file-preview', (message: any) => {
                     emitUIEvent(UIEvents.desktopFilePreview, message);
                 });
+                this.room!.onMessage('file-list', (message: any) => {
+                    emitUIEvent(UIEvents.desktopFilesSync, message);
+                });
+                this.room!.onMessage('file-preview', (message: any) => {
+                    emitUIEvent(UIEvents.desktopFilePreview, message);
+                });
                 this.room!.onMessage('file-error', (message: any) => {
                     emitUIEvent(UIEvents.desktopFileError, message);
                 });
 
                 this.room!.send('file-list', { request: true });
-                this.room!.send('request-completed-work', {});
 
                 state.agents.onAdd((agent: AgentState, sessionId: string) => {
                     console.log(`[Colyseus] Agent added: ${agent.name} at (${agent.x}, ${agent.y})`);
