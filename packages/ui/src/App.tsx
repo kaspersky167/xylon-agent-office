@@ -10,6 +10,7 @@ import { ViralControlPanel } from './components/ViralControlPanel';
 import { HighlightsFeed } from './components/HighlightsFeed';
 import { LayoutEditor } from './components/LayoutEditor';
 import { AgentInspector } from './components/AgentInspector';
+import { TaskBoard } from './components/TaskBoard';
 
 export function App() {
     const [desktopPanelOpen, setDesktopPanelOpen] = useState(false);
@@ -39,6 +40,7 @@ export function App() {
             <CeoOperationsPanel />
             <DesktopComputerPanel isOpen={desktopPanelOpen} onClose={() => setDesktopPanelOpen(false)} />
 
+            {showAdvancedPanels && <TaskBoard />}
             {showAdvancedPanels && <AgentPulseBoard />}
             {showAdvancedPanels && <RelationshipGraph />}
             {showAdvancedPanels && <EpisodeRecapPanel />}
