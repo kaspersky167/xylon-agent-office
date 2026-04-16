@@ -13,6 +13,9 @@ export const UIEvents = {
     agentSelected: 'agent-selected',
     agentRemoved: 'agent-removed',
     layoutSync: 'layout-sync',
+    agentHover: 'agent-hover',
+    agentSelect: 'agent-select',
+    agentFocus: 'agent-focus',
     desktopFilesSync: 'desktop-files-sync',
     desktopFilePreview: 'desktop-file-preview',
     desktopFileError: 'desktop-file-error'

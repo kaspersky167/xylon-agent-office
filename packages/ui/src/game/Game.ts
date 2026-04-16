@@ -39,7 +39,10 @@ export class OfficeScene extends Phaser.Scene {
     private room?: Colyseus.Room;
     private agentSprites: Map<string, Phaser.GameObjects.Container> = new Map();
     private statusText!: Phaser.GameObjects.Text;
-    private followTarget: Phaser.GameObjects.Container | null = null;
+    private selectedFollowTarget: Phaser.GameObjects.Container | null = null;
+    private cinematicFollowTarget: Phaser.GameObjects.Container | null = null;
+    private selectedAgentId: string | null = null;
+    private hoveredAgentId: string | null = null;
     private cinematicMode = true;
     private cinematicReleaseAt = 0;
     private customLayoutLayer?: Phaser.GameObjects.Container;
@@ -48,6 +51,8 @@ export class OfficeScene extends Phaser.Scene {
     private layoutDragItemId: string | null = null;
     private gridSize = GRID_SIZE_PX;
     private heldMoveKeys: Set<'left' | 'right' | 'up' | 'down'> = new Set();
+    private agentUiSnapshot: Map<string, { name: string; action: string; status: string }> = new Map();
+    private agentSelectionRing: Map<string, Phaser.GameObjects.Graphics> = new Map();
 
     constructor() {
         super('OfficeScene');
@@ -287,53 +292,90 @@ export class OfficeScene extends Phaser.Scene {
                         backgroundColor: `${labelColor}66`, padding: { x: 3, y: 1 }
                     }).setOrigin(0.5, 0);
 
-                    // Focus highlight ring (hidden by default)
+                    // Focus highlight ring (selected)
                     const focusRing = this.add.graphics();
-                    focusRing.lineStyle(1, 0x6c5ce7, 0.8);
+                    focusRing.lineStyle(2, 0x6c5ce7, 0.9);
                     focusRing.strokeCircle(0, 0, 14);
                     focusRing.setVisible(false);
+                    this.agentSelectionRing.set(sessionId, focusRing);
 
-                    container.add([focusRing, sprite, thoughtBubble, emoteBubble, label]);
+                    // Hover ring (temporary tint/outline)
+                    const hoverRing = this.add.graphics();
+                    hoverRing.lineStyle(1, 0xfbbf24, 0.95);
+                    hoverRing.strokeCircle(0, 0, 16);
+                    hoverRing.setVisible(false);
+
+                    // Short-lived status chip for meaningful actions
+                    const statusChip = this.add.text(0, -50, '', {
+                        fontSize: '8px',
+                        color: '#f3f4f6',
+                        backgroundColor: '#0f172aee',
+                        padding: { x: 4, y: 2 }
+                    }).setOrigin(0.5, 1);
+                    statusChip.setVisible(false);
+
+                    container.add([hoverRing, focusRing, sprite, thoughtBubble, emoteBubble, statusChip, label]);
                     container.setSize(32, 48);
-                    container.setInteractive();
+                    container.setInteractive({ useHandCursor: true });
                     this.agentSprites.set(sessionId, container);
-                    eventBus.dispatchEvent(new CustomEvent('agent-state', {
-                        detail: {
-                            id: sessionId,
-                            name: agent.name,
-                            action: agent.action,
-                            currentTask: agent.currentTask || '',
-                            mood: Number(agent.mood || 0),
-                            reputation: Number(agent.reputation || 0),
-                            riskLevel: Number(agent.riskLevel || 0),
-                            momentum: Number(agent.momentum || 0)
-                        }
-                    }));
+                    this.agentUiSnapshot.set(sessionId, {
+                        name: agent.name,
+                        action: agent.action || 'idle',
+                        status: this.composeAgentStatus(agent)
+                    });
 
-                    // --- FOCUS MODE: Click to follow ---
-                    container.on('pointerdown', () => {
-                        if (this.followTarget === container) {
-                            // Unfollow on second click
-                            this.followTarget = null;
-                            focusRing.setVisible(false);
-                            eventBus.dispatchEvent(new CustomEvent('agent-focus', { detail: null }));
-                            eventBus.dispatchEvent(new CustomEvent('agent-selected', { detail: null }));
-                        } else {
-                            // Unfollow previous
-                            if (this.followTarget) {
-                                const prevRing = this.followTarget.getAt(0) as Phaser.GameObjects.Graphics;
-                                prevRing?.setVisible(false);
-                            }
-                            this.followTarget = container;
-                            focusRing.setVisible(true);
-                            eventBus.dispatchEvent(new CustomEvent('agent-focus', { detail: { name: agent.name, id: sessionId } }));
-                            eventBus.dispatchEvent(new CustomEvent('agent-selected', { detail: { name: agent.name, id: sessionId } }));
+                    // --- SELECTION MODE: Click to follow ---
+                    container.on('pointerover', () => {
+                        this.hoveredAgentId = sessionId;
+                        hoverRing.setVisible(this.selectedAgentId !== sessionId);
+                        if ('setTint' in sprite) {
+                            (sprite as Phaser.GameObjects.Sprite).setTint(0xfff1b3);
                         }
+                        label.setStyle({ backgroundColor: `${labelColor}99` });
+                        this.emitAgentUiEvent(UIEvents.agentHover, {
+                            type: 'hover',
+                            source: 'pointer',
+                            agentId: sessionId,
+                            selected: this.selectedAgentId === sessionId
+                        });
+                    });
+                    container.on('pointerout', () => {
+                        if (this.hoveredAgentId === sessionId) this.hoveredAgentId = null;
+                        hoverRing.setVisible(false);
+                        if ('clearTint' in sprite) {
+                            (sprite as Phaser.GameObjects.Sprite).clearTint();
+                        }
+                        label.setStyle({ backgroundColor: `${labelColor}66` });
+                        this.emitAgentUiEvent(UIEvents.agentHover, {
+                            type: 'hover',
+                            source: 'pointer',
+                            agentId: null,
+                            selected: false
+                        });
+                    });
+                    container.on('pointerdown', () => {
+                        const nextSelected = this.selectedAgentId === sessionId ? null : sessionId;
+                        this.setSelectedAgent(nextSelected, 'pointer');
+                        eventBus.dispatchEvent(new CustomEvent('agent-focus', {
+                            detail: nextSelected ? { name: agent.name, id: sessionId } : null
+                        }));
                     });
 
                     let prevX = agent.x;
                     let prevY = agent.y;
                     let lastAction = '';
+                    let lastEmoteAt = 0;
+                    let lastThoughtShown = '';
+                    let lastThoughtAt = 0;
+                    let lastStatusChipAt = 0;
+                    let lastActivityKey = '';
+                    const keyActionMap: Record<string, string> = {
+                        work: 'Working',
+                        talk: 'In conversation',
+                        use_tool: 'Using tool',
+                        think: 'Planning',
+                        move: 'Moving'
+                    };
 
                     agent.onChange(() => {
                         this.tweens.add({
@@ -359,31 +401,62 @@ export class OfficeScene extends Phaser.Scene {
                         }
 
                         // --- EMOTE BUBBLES based on action ---
-                        const emote = AGENT_EMOTE_MAP[agent.action] || '';
-                        if (emote && agent.action !== lastAction) {
+                        const emoteMap: Record<string, string> = {
+                            'work': '💻', 'talk': '💬', 'idle': '😌',
+                            'use_tool': '🔧', 'move': '🚶', 'think': '💡'
+                        };
+                        const emote = emoteMap[agent.action] || '';
+                        const now = Date.now();
+                        const actionChanged = agent.action !== lastAction;
+                        if (emote && actionChanged && now - lastEmoteAt > 2500 && agent.action !== 'idle') {
                             emoteBubble.setText(emote);
                             emoteBubble.setVisible(true);
-                            // Auto-hide after 3s
-                            this.time.delayedCall(3000, () => emoteBubble.setVisible(false));
+                            this.time.delayedCall(1800, () => emoteBubble.setVisible(false));
+                            lastEmoteAt = now;
+                        } else if (agent.action === 'idle') {
+                            emoteBubble.setVisible(false);
+                        }
+
+                        const keyActionLabel = keyActionMap[agent.action];
+                        if (keyActionLabel && actionChanged && now - lastStatusChipAt > 1500) {
+                            statusChip.setText(keyActionLabel);
+                            statusChip.setVisible(true);
+                            this.time.delayedCall(2000, () => statusChip.setVisible(false));
+                            lastStatusChipAt = now;
                         }
 
                         // Thought bubble
-                        if (agent.thought && agent.thought !== '') {
-                            thoughtBubble.setText(agent.thought);
+                        const thought = (agent.thought || '').trim();
+                        const meaningfulThought = thought.length >= 4 && thought !== lastThoughtShown && now - lastThoughtAt > 7000;
+                        if (meaningfulThought) {
+                            thoughtBubble.setText(thought);
                             thoughtBubble.setVisible(true);
-                            this.time.delayedCall(6000, () => thoughtBubble.setVisible(false));
+                            this.time.delayedCall(4000, () => thoughtBubble.setVisible(false));
+                            lastThoughtShown = thought;
+                            lastThoughtAt = now;
+                        } else if (!thought) {
+                            thoughtBubble.setVisible(false);
                         }
 
+                        const latestStatus = this.composeAgentStatus(agent);
+                        this.agentUiSnapshot.set(sessionId, {
+                            name: agent.name,
+                            action: agent.action || 'idle',
+                            status: latestStatus
+                        });
+
                         // --- SYSTEM LOG EVENT ---
-                        if (agent.action !== lastAction || agent.thought !== '') {
+                        const activityKey = `${agent.action}:${thought}`;
+                        if ((actionChanged || meaningfulThought) && activityKey !== lastActivityKey) {
                             eventBus.dispatchEvent(new CustomEvent('activity-log', {
                                 detail: {
                                     agent: agent.name,
                                     action: agent.action,
-                                    thought: agent.thought,
+                                    thought,
                                     time: new Date().toLocaleTimeString()
                                 }
                             }));
+                            lastActivityKey = activityKey;
                         }
                         eventBus.dispatchEvent(new CustomEvent('agent-telemetry', {
                             detail: {
@@ -421,12 +494,14 @@ export class OfficeScene extends Phaser.Scene {
                         sprite.destroy();
                         this.agentSprites.delete(sessionId);
                     }
-                    eventBus.dispatchEvent(new CustomEvent('agent-removed', {
-                        detail: {
-                            id: sessionId,
-                            name: agent.name
-                        }
-                    }));
+                    this.agentUiSnapshot.delete(sessionId);
+                    this.agentSelectionRing.delete(sessionId);
+                    if (this.selectedAgentId === sessionId) {
+                        this.setSelectedAgent(null, 'system');
+                    }
+                    if (this.cinematicFollowTarget === sprite) {
+                        this.cinematicFollowTarget = null;
+                    }
                 });
             });
 
@@ -437,10 +512,64 @@ export class OfficeScene extends Phaser.Scene {
         }
     }
 
+    private getActiveFollowTarget() {
+        return this.selectedFollowTarget ?? this.cinematicFollowTarget;
+    }
+
+    private composeAgentStatus(agent: AgentState) {
+        const task = (agent.currentTask || '').trim();
+        if (task) return task;
+        const thought = (agent.thought || '').trim();
+        if (thought) return thought;
+        return (agent.action || 'idle').trim();
+    }
+
+    private emitAgentUiEvent(eventName: string, payload: {
+        type: 'hover' | 'select' | 'focus';
+        source: 'pointer' | 'selection' | 'cinematic' | 'system';
+        agentId: string | null;
+        selected?: boolean;
+    }) {
+        const snapshot = payload.agentId ? this.agentUiSnapshot.get(payload.agentId) : undefined;
+        emitUIEvent(eventName, {
+            ...payload,
+            agentId: payload.agentId,
+            agentName: snapshot?.name ?? null,
+            action: snapshot?.action ?? null,
+            status: snapshot?.status ?? null
+        });
+    }
+
+    private setSelectedAgent(agentId: string | null, source: 'pointer' | 'system' = 'pointer') {
+        this.selectedAgentId = agentId;
+        this.selectedFollowTarget = agentId ? this.agentSprites.get(agentId) ?? null : null;
+        this.agentSelectionRing.forEach((ring, id) => {
+            ring.setVisible(Boolean(agentId) && id === agentId);
+        });
+        this.emitAgentUiEvent(UIEvents.agentSelect, {
+            type: 'select',
+            source: source === 'pointer' ? 'pointer' : 'system',
+            agentId,
+            selected: Boolean(agentId)
+        });
+        this.emitAgentUiEvent(UIEvents.agentFocus, {
+            type: 'focus',
+            source: 'selection',
+            agentId,
+            selected: Boolean(agentId)
+        });
+    }
+
     update() {
         if (this.cinematicReleaseAt > 0 && Date.now() > this.cinematicReleaseAt) {
             this.cinematicReleaseAt = 0;
-            this.followTarget = null;
+            this.cinematicFollowTarget = null;
+            this.emitAgentUiEvent(UIEvents.agentFocus, {
+                type: 'focus',
+                source: 'cinematic',
+                agentId: this.selectedAgentId,
+                selected: Boolean(this.selectedAgentId)
+            });
         }
         const speed = 5;
         const manualPan =
@@ -451,7 +580,7 @@ export class OfficeScene extends Phaser.Scene {
             Boolean(this.cursors?.down.isDown);
         if (manualPan) {
             // User input should always win over cinematic follow.
-            this.followTarget = null;
+            this.cinematicFollowTarget = null;
             this.cinematicReleaseAt = 0;
             if (this.cursors?.left.isDown || this.heldMoveKeys.has('left')) this.cameras.main.scrollX -= speed;
             if (this.cursors?.right.isDown || this.heldMoveKeys.has('right')) this.cameras.main.scrollX += speed;
@@ -459,10 +588,11 @@ export class OfficeScene extends Phaser.Scene {
             if (this.cursors?.down.isDown || this.heldMoveKeys.has('down')) this.cameras.main.scrollY += speed;
         }
         // If following an agent, smoothly track them
-        if (this.followTarget && !manualPan) {
+        const followTarget = this.getActiveFollowTarget();
+        if (followTarget && !manualPan) {
             const cam = this.cameras.main;
-            const targetX = this.followTarget.x - cam.width / (2 * cam.zoom);
-            const targetY = this.followTarget.y - cam.height / (2 * cam.zoom);
+            const targetX = followTarget.x - cam.width / (2 * cam.zoom);
+            const targetY = followTarget.y - cam.height / (2 * cam.zoom);
             cam.scrollX += (targetX - cam.scrollX) * 0.08;
             cam.scrollY += (targetY - cam.scrollY) * 0.08;
         }
@@ -476,8 +606,14 @@ export class OfficeScene extends Phaser.Scene {
     private focusAgentTemporarily(agentId: string) {
         const target = this.agentSprites.get(agentId);
         if (!target) return;
-        this.followTarget = target;
+        this.cinematicFollowTarget = target;
         this.cinematicReleaseAt = Date.now() + 7000;
+        this.emitAgentUiEvent(UIEvents.agentFocus, {
+            type: 'focus',
+            source: 'cinematic',
+            agentId,
+            selected: this.selectedAgentId === agentId
+        });
     }
 
     private renderCustomLayout(items: Array<{ type: string; x: number; y: number; label?: string }>) {
