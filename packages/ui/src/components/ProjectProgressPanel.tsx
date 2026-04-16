@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { eventBus } from '../events';
+import { getColyseusRoom } from '../game/Game';
 
 interface TaskItem {
     id: number | string;
@@ -28,12 +29,24 @@ interface ProjectMetrics {
     pending: number;
 }
 
+interface CompletedWorkItem {
+    id: string;
+    task: string;
+    agentId: string;
+    agentName: string;
+    completedAt: string;
+    summaryPath: string;
+}
+
 const priorityPattern = /\b(blocker|blocked|high[- ]?priority|urgent|risk|critical)\b/i;
 
 export function ProjectProgressPanel() {
     const [tasks, setTasks] = useState<TaskItem[]>([]);
     const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
     const [priorityHighlights, setPriorityHighlights] = useState<HighlightEvent[]>([]);
+    const [fastTrackEnabled, setFastTrackEnabled] = useState(true);
+    const [completedWork, setCompletedWork] = useState<CompletedWorkItem[]>([]);
+    const [reviewFolder, setReviewFolder] = useState('data/workspace/completed-work');
 
     useEffect(() => {
         const onTaskUpdate = (event: Event) => {
@@ -87,16 +100,32 @@ export function ProjectProgressPanel() {
             setPriorityHighlights((prev) => [detail, ...prev].slice(0, 5));
         };
 
+        const onFastTrackState = (event: Event) => {
+            setFastTrackEnabled(Boolean((event as CustomEvent).detail?.enabled));
+        };
+
+        const onCompletedWork = (event: Event) => {
+            const detail = (event as CustomEvent).detail || {};
+            setCompletedWork(Array.isArray(detail.items) ? detail.items : []);
+            if (typeof detail.reviewFolder === 'string' && detail.reviewFolder.trim()) {
+                setReviewFolder(detail.reviewFolder.trim());
+            }
+        };
+
         eventBus.addEventListener('task-update', onTaskUpdate);
         eventBus.addEventListener('tasks-sync', onTasksSync);
         eventBus.addEventListener('approvals-sync', onApprovalsSync);
         eventBus.addEventListener('highlight-event', onHighlight);
+        eventBus.addEventListener('fast-track-state', onFastTrackState);
+        eventBus.addEventListener('completed-work-sync', onCompletedWork);
 
         return () => {
             eventBus.removeEventListener('task-update', onTaskUpdate);
             eventBus.removeEventListener('tasks-sync', onTasksSync);
             eventBus.removeEventListener('approvals-sync', onApprovalsSync);
             eventBus.removeEventListener('highlight-event', onHighlight);
+            eventBus.removeEventListener('fast-track-state', onFastTrackState);
+            eventBus.removeEventListener('completed-work-sync', onCompletedWork);
         };
     }, []);
 
@@ -113,6 +142,13 @@ export function ProjectProgressPanel() {
     const activeTasks = tasks
         .filter((task) => task.status === 'in_progress')
         .slice(0, 3);
+
+    const toggleFastTrack = () => {
+        const next = !fastTrackEnabled;
+        setFastTrackEnabled(next);
+        const room = getColyseusRoom();
+        room?.send('set-fast-track', { enabled: next });
+    };
 
     return (
         <div style={{
@@ -132,6 +168,23 @@ export function ProjectProgressPanel() {
             <h3 style={{ margin: '0 0 8px 0', fontSize: 14 }}>
                 📈 Project Progress
             </h3>
+            <button
+                type="button"
+                onClick={toggleFastTrack}
+                style={{
+                    width: '100%',
+                    marginBottom: 10,
+                    borderRadius: 8,
+                    border: '1px solid rgba(255,255,255,0.25)',
+                    background: fastTrackEnabled ? 'rgba(16,185,129,0.25)' : 'rgba(71,85,105,0.35)',
+                    color: '#fff',
+                    padding: '6px 8px',
+                    cursor: 'pointer',
+                    fontSize: 11
+                }}
+            >
+                {fastTrackEnabled ? '⚡ Fast-track ON (click to pause)' : '🧭 Fast-track OFF (click to accelerate)'}
+            </button>
 
             <div style={{ fontSize: 12, marginBottom: 10 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -218,6 +271,37 @@ export function ProjectProgressPanel() {
                     }}>
                         <div style={{ fontWeight: 700, fontSize: 11 }}>{item.title || 'Priority event'}</div>
                         <div style={{ color: '#d4def2', marginTop: 2 }}>{item.body || item.type || 'No details provided.'}</div>
+                    </div>
+                ))}
+            </div>
+
+            <div style={{
+                marginTop: 8,
+                paddingTop: 8,
+                borderTop: '1px solid rgba(255,255,255,0.12)',
+                fontSize: 11
+            }}>
+                <div style={{ marginBottom: 6, color: '#9cc8ff', fontWeight: 700 }}>
+                    Completed work snapshots ({completedWork.length})
+                </div>
+                <div style={{ color: '#8ca4d6', marginBottom: 6 }}>
+                    Review folder: <code>{reviewFolder}</code>
+                </div>
+                {completedWork.length === 0 && (
+                    <div style={{ color: '#8ca4d6' }}>No completed deliverables exported yet.</div>
+                )}
+                {completedWork.slice(0, 3).map((item) => (
+                    <div key={item.id} style={{
+                        marginBottom: 6,
+                        padding: '6px 8px',
+                        borderRadius: 6,
+                        background: 'rgba(255,255,255,0.06)'
+                    }}>
+                        <div style={{ fontWeight: 700, fontSize: 11 }}>{item.task}</div>
+                        <div style={{ color: '#d4def2', marginTop: 2 }}>
+                            {item.agentName} · {new Date(item.completedAt).toLocaleString()}
+                        </div>
+                        <div style={{ color: '#9cc8ff', marginTop: 2 }}>{item.summaryPath}</div>
                     </div>
                 ))}
             </div>

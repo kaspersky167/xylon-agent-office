@@ -35,6 +35,8 @@ const formatBytes = (bytes: number) => {
     return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
 };
 
+const mentionHandles = ['frontend', 'backend', 'devops', 'security', 'shepherd', 'reality', 'evidence', 'seo', 'sales', 'proposal', 'ceo'];
+
 export function ChatPanel() {
     const [messages, setMessages] = useState<ChatMessage[]>([
         { sender: 'System', text: 'Office environment initialized.' }
@@ -99,6 +101,14 @@ export function ChatPanel() {
 
     const removeSelectedAttachment = (id: string) => {
         setSelectedAttachments(prev => prev.filter((item) => item.id !== id));
+    };
+
+    const insertMention = (handle: string) => {
+        setInput((prev) => {
+            const trimmed = prev.trimEnd();
+            const prefix = trimmed.length === 0 ? '' : `${trimmed} `;
+            return `${prefix}@${handle} `;
+        });
     };
 
     const send = () => {
@@ -208,6 +218,18 @@ export function ChatPanel() {
                     Attach
                 </button>
             </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                {mentionHandles.slice(0, 6).map((handle) => (
+                    <button
+                        key={handle}
+                        type="button"
+                        onClick={() => insertMention(handle)}
+                        style={{ border: '1px solid #43506b', background: '#0f172a', color: '#c7d2fe', borderRadius: 999, padding: '3px 8px', fontSize: 10, cursor: 'pointer' }}
+                    >
+                        @{handle}
+                    </button>
+                ))}
+            </div>
             {selectedAttachments.length > 0 && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
                     {selectedAttachments.map((attachment) => (
@@ -249,7 +271,7 @@ export function ChatPanel() {
             </div>
             <input
                 type="text"
-                placeholder="Send a message..."
+                placeholder="Send a message... (tip: use @frontend, @devops, @shepherd)"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && send()}
