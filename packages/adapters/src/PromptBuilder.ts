@@ -8,7 +8,7 @@ export class PromptBuilder {
         currentTask?: Task
     ): string {
         const caps = agentConfig.capabilities.map((c) => `- ${c.name}: ${c.description}`).join('\n');
-        const tools = agentConfig.inference.tools?.map((t: ToolDefinition) => `- ${t.name}: ${t.description}`).join('\n') || 'None';
+        const tools = agentConfig.inference.tools?.map((t) => `- ${t.name}: ${t.description}`).join('\n') || 'None';
         const memories = recentMemories.map((m) => `- ${m.content}`).join('\n') || 'None';
         const taskInfo = currentTask ? `${currentTask.title}: ${currentTask.description}` : 'None assigned';
 

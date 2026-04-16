@@ -13,7 +13,7 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
         const start = Date.now();
 
         // Map tools if required
-        const tools = request.tools ? request.tools.map((t) => ({
+        const tools = request.tools ? request.tools.map((t: { name: string; description: string; parameters: unknown }) => ({
             type: "function",
             function: {
                 name: t.name,

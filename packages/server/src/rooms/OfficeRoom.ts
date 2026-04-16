@@ -1,27 +1,12 @@
-import { Room, Client } from "colyseus";
-import { OfficeState } from "../schema/OfficeState";
-import {
-  Agent,
-  Office,
-  OfficeConfig,
-  ConversationMessage,
-  type InferenceConfig,
-} from "@agent-office/core";
-import { OllamaAdapter, OpenAICompatibleAdapter } from "@agent-office/adapters";
-import { ToolExecutor } from "../tools/ToolExecutor";
-import {
-  MemoryStore,
-  SharedFileRecord,
-  SharedFileStatus,
-} from "../memory/MemoryStore";
-import path from "path";
-import { readFile, stat, mkdir, writeFile } from "fs/promises";
-import type { ExtensionRegistry } from "../extensions/registry";
-
-
-
-type TaskStatus = "backlog" | "in_progress" | "blocked" | "review" | "done";
-type TaskPriority = "low" | "medium" | "high" | "urgent";
+import { Room, Client } from 'colyseus';
+import { OfficeState } from '../schema/OfficeState';
+import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
+import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
+import { ToolExecutor } from '../tools/ToolExecutor';
+import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import path from 'path';
+import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import type { InferenceConfig } from '@agent-office/core';
 
 interface HighlightEvent {
   type: string;
@@ -133,6 +118,25 @@ interface MailMessage {
     createdAt: string;
 }
 
+interface MailAttachment {
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+}
+
+interface MailMessage {
+    id: string;
+    threadId: string;
+    from: string;
+    to: string;
+    toAgentId?: string;
+    subject: string;
+    body: string;
+    attachments: MailAttachment[];
+    createdAt: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
   "hire_agent",
@@ -154,7 +158,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private thinkingLocks: Map<string, boolean> = new Map();
     private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
     private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
-    private inferenceProvider = 'ollama';
+    private inferenceProvider: InferenceConfig['provider'] = 'ollama';
     private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
     private hireCount = 0; // Counter for generating unique IDs
     private toolExecutor = new ToolExecutor();
@@ -330,149 +334,166 @@ export class OfficeRoom extends Room<OfficeState> {
     if (!safeTarget || rel.startsWith("..") || path.isAbsolute(rel)) {
       throw new Error("Invalid workspace file path.");
     }
-    return fullPath;
-  }
 
-  private normalizeChatAttachment(
-    input: any,
-    defaultSharedBy: string,
-  ): ChatAttachment | null {
-    if (!input || typeof input !== "object") return null;
+    private configureInferenceProvider() {
+        const provider = (process.env.AGENT_INFERENCE_PROVIDER || '').toLowerCase().trim();
+        if (provider === 'claude' || provider === 'openai-compatible') {
+            const baseUrl = process.env.CLAUDE_BASE_URL || process.env.OPENAI_COMPAT_BASE_URL || 'https://openrouter.ai/api';
+            const apiKey = process.env.CLAUDE_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || '';
+            if (apiKey) {
+                this.inferenceAdapter = new OpenAICompatibleAdapter(baseUrl, apiKey, 'claude');
+                this.inferenceProvider = 'openai';
+                this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
+                console.log(`[Inference] Claude/OpenAI-compatible adapter enabled (${this.defaultModel}) @ ${baseUrl}`);
+                return;
+            }
+            console.warn('[Inference] Claude requested but no API key found; falling back to local Ollama.');
+        }
+        this.inferenceAdapter = this.ollamaAdapter;
+        this.inferenceProvider = 'ollama';
+        this.defaultModel = process.env.AGENT_MODEL || 'llama3.2:latest';
+        console.log(`[Inference] Using Ollama adapter (${this.defaultModel}).`);
+    }
 
-    const id =
-      typeof input.id === "string" && input.id.trim() ? input.id.trim() : "";
-    const filePath =
-      typeof input.path === "string" && input.path.trim()
-        ? input.path.trim()
-        : "";
-    const name =
-      typeof input.name === "string" && input.name.trim()
-        ? input.name.trim()
-        : "";
-    const mimeType =
-      typeof input.mimeType === "string" && input.mimeType.trim()
-        ? input.mimeType.trim()
-        : "";
-    const size = Number(input.size);
-    const sharedBy =
-      typeof input.sharedBy === "string" && input.sharedBy.trim()
-        ? input.sharedBy.trim()
-        : defaultSharedBy;
+    async onCreate(options: any) {
+        OfficeRoom.activeRoom = this;
+        this.setState(new OfficeState());
 
-    const sharedWith = Array.isArray(input.sharedWith)
-      ? input.sharedWith
-          .filter((entry: unknown) => typeof entry === "string")
-          .map((entry: string) => entry.trim())
-          .filter(Boolean)
-      : [];
+        // Initialize memory store
+        const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
+        await this.memoryStore.initialize(dbPath);
 
-    const createdAtRaw =
-      typeof input.createdAt === "string" ? input.createdAt : "";
-    const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
-    const createdAt = Number.isNaN(createdAtDate.getTime())
-      ? new Date().toISOString()
-      : createdAtDate.toISOString();
+        const config: OfficeConfig = {
+            name: options.name || 'Startup HQ',
+            grid: { width: 40, height: 40, tileSize: 16 },
+            rooms: [],
+            furniture: [],
+            spawnPoints: [{ x: 10, y: 10 }],
+            zones: []
+        };
+        this.office = new Office(config);
+        this.configureInferenceProvider();
 
-    if (
-      !id ||
-      !filePath ||
-      !name ||
-      !mimeType ||
-      !Number.isFinite(size) ||
-      size < 0
-    )
-      return null;
+        // Setup Core Agents with AI capabilities
+        type Traits = { openness: number; conscientiousness: number; extraversion: number; agreeableness: number; neuroticism: number };
+        type Capability = { name: string; description: string };
+        const setupCoreAgent = async (
+            id: string,
+            name: string,
+            role: string,
+            x: number,
+            y: number,
+            systemPrompt: string,
+            personality: {
+                traits: Traits;
+                communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
+            },
+            capabilities: Capability[],
+            model: string = this.defaultModel
+        ) => {
+            this.state.createAgent(id, name);
+            const state = this.state.agents.get(id);
+            if (state) { state.x = x; state.y = y; }
 
-    return {
-      id,
-      path: filePath,
-      name,
-      mimeType,
-      size: Math.floor(size),
-      sharedBy,
-      sharedWith,
-      createdAt,
-    };
-  }
+            const coreAgent = new Agent({
+                id, name, role, avatar: 'sprite.png',
+                inference: {
+                    provider: this.inferenceProvider,
+                    model,
+                    systemPrompt,
+                },
+                personality: {
+                    traits: personality.traits,
+                    communicationStyle: personality.communicationStyle,
+                    workHours: { start: '09:00', end: '17:00' },
+                    breakFrequency: 120
+                },
+                capabilities,
+                memory: { shortTermLimit: 50 }
+            });
 
-  private parseChatAttachments(
-    raw: any,
-    defaultSharedBy: string,
-  ): ChatAttachment[] {
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
-      .filter((item): item is ChatAttachment => Boolean(item));
-  }
+            coreAgent.setInferenceAdapter(this.inferenceAdapter);
+            await coreAgent.initialize();
 
-  // Furniture interaction points: named locations agents can walk to
-  private furnitureTargets: Record<
-    string,
-    { x: number; y: number; type: string }
-  > = {
-    // ─── ENGINEERING POD (pod of 4, left side) ───
-    // Pair: Frontend + Backend / Pair: DevOps + Security
-    "frontend-desk": { x: 5, y: 10, type: "desk" },
-    "backend-desk": { x: 8, y: 10, type: "desk" },
-    "devops-desk": { x: 5, y: 14, type: "desk" },
-    "security-desk": { x: 8, y: 14, type: "desk" },
+            // Load persistent memories from previous sessions
+            const previousMemories = await this.memoryStore.loadMemories(id, 20);
+            const agencyMemories = await this.memoryStore.loadMemories('agency:global', 20);
+            const mergedMemories = [...previousMemories, ...agencyMemories].slice(-50);
+            if (mergedMemories.length > 0) {
+                coreAgent.loadMemories(mergedMemories);
+                console.log(`[${name}] Loaded ${previousMemories.length} personal + ${agencyMemories.length} agency memories from previous sessions`);
+            }
 
-    // ─── OPS / STRATEGY POD (pod of 4, center) ───
-    // Pair: Shepherd + Reality / Pair: Evidence + SEO
-    "shepherd-desk": { x: 17, y: 10, type: "desk" },
-    "reality-desk": { x: 20, y: 10, type: "desk" },
-    "evidence-desk": { x: 17, y: 14, type: "desk" },
-    "seo-desk": { x: 20, y: 14, type: "desk" },
+            this.coreAgents.set(id, coreAgent);
+            this.thinkingLocks.set(id, false);
+        };
 
-    // ─── GROWTH POD (small pod of 2, right side) ───
-    // Pair: Sales + Proposal
-    "sales-desk": { x: 29, y: 10, type: "desk" },
-    "proposal-desk": { x: 32, y: 10, type: "desk" },
+        // ─── SHARED CAPABILITY SETS ───
+        // Read-only: can inspect files and search, nothing writes or executes
+        const READ_ONLY: Capability[] = [
+            { name: 'read_file',   description: 'Read a file from the workspace' },
+            { name: 'list_files',  description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',   description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
+            { name: 'web_search',  description: 'Search the web for information' },
+            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
+            { name: 'write_note',  description: 'Save a note or observation' },
+            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
+        ];
 
-    // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
-    "ceo-desk": { x: 32, y: 30, type: "desk" },
-    "ceo-office-wall-1": { x: 28, y: 27, type: "wall" },
-    "ceo-office-wall-2": { x: 28, y: 33, type: "wall" },
-    "ceo-office-door": { x: 28, y: 30, type: "door" },
+        // Coordinator: task flow + notes, no file access
+        const COORDINATOR: Capability[] = [
+            { name: 'create_task', description: 'Create a task and assign it to an agent' },
+            { name: 'write_note',  description: 'Save a note or memo' },
+            { name: 'web_search',  description: 'Search the web for information' },
+            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
+            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
+        ];
 
-    // ─── SHARED FURNITURE ───
-    "meeting-table": { x: 20, y: 22, type: "table" },
-    "coffee-machine": { x: 5, y: 30, type: "appliance" },
-    whiteboard: { x: 20, y: 5, type: "board" },
-    "water-cooler": { x: 12, y: 30, type: "appliance" },
-    bookshelf: { x: 17, y: 30, type: "furniture" },
-    beanbag: { x: 24, y: 30, type: "seating" },
-    // Extra desks for dynamically hired agents
-    "hire_0-desk": { x: 22, y: 18, type: "desk" },
-    "hire_1-desk": { x: 22, y: 23, type: "desk" },
-    "hire_2-desk": { x: 25, y: 18, type: "desk" },
-    "hire_3-desk": { x: 25, y: 8, type: "desk" },
-    "hire_4-desk": { x: 32, y: 18, type: "desk" },
-  };
+        // Builder: file edits + safe shell commands + web search + research
+        const BUILDER: Capability[] = [
+            { name: 'read_file',    description: 'Read a file from the workspace' },
+            { name: 'list_files',   description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',    description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
+            { name: 'write_file',   description: 'Write or update a file in the workspace' },
+            { name: 'run_command',  description: 'Run an allowlisted shell command (ls, git status, docker ps, etc.)' },
+            { name: 'code_execute', description: 'Execute a small JavaScript snippet' },
+            { name: 'web_search',   description: 'Search the web for information' },
+            { name: 'fetch_url',    description: 'Fetch and read the visible text of a public URL' },
+            { name: 'write_note',   description: 'Save a note or memo' },
+            { name: 'create_task',  description: 'Create a task and assign it to an agent' },
+        ];
 
-  static getActiveRoom(): OfficeRoom | null {
-    return OfficeRoom.activeRoom;
-  }
+        // ─── COLLAB CHARTER (shared across all agents) ───
+        // Keep it short so it doesn't dominate the prompt but nudges real teamwork.
+        const COLLAB = [
+            `You work at Xylon Devs as part of a small agency team.`,
+            `Collaborate often — consult your paired buddy first when a task overlaps.`,
+            `Loop in other pods (engineering / ops-strategy / growth) when it matters.`,
+            `Keep thoughts concise. Propose concrete next actions, not just observations.`,
+            `For MAJOR decisions (hiring, deploys, destructive commands, pricing commitments,`,
+            ` publishing/launch, major reprioritization, or anything tagged "major") you MUST`,
+            ` request CEO approval before executing. Minor work (drafting, research, notes,`,
+            ` internal coordination, proposing tasks) does not need approval.`,
+            `WEB SEARCH BUDGET: the team shares a limited Tavily API budget (1 000 credits total).`,
+            ` Be frugal — only call web_search or fetch_url when the information is not already`,
+            ` available in your memory or recent chat. Combine multiple questions into one query.`,
+            ` Never repeat a search you or a colleague already ran this session.`,
+            ` Prefer fetch_url for xylondevs.com (free, no credit cost) over a search for it.`,
+            ` RECENCY RULE: for volatile topics (news, pricing, specs, policies, releases, outages),`,
+            ` explicitly prioritize fresh evidence. Use web_search to find recent sources, then`,
+            ` verify key claims with fetch_url (and check_health when useful). Include source URLs`,
+            ` in your findings, and do not rely on stale cached assumptions when freshness matters.`,
+        ].join(' ');
 
-  private configureInferenceProvider() {
-    const provider = (process.env.AGENT_INFERENCE_PROVIDER || "")
-      .toLowerCase()
-      .trim();
-    if (provider === "claude" || provider === "openai-compatible") {
-      const baseUrl =
-        process.env.CLAUDE_BASE_URL ||
-        process.env.OPENAI_COMPAT_BASE_URL ||
-        "https://openrouter.ai/api";
-      const apiKey =
-        process.env.CLAUDE_API_KEY ||
-        process.env.OPENAI_API_KEY ||
-        process.env.OPENROUTER_API_KEY ||
-        "";
-      if (apiKey) {
-        this.inferenceAdapter = new OpenAICompatibleAdapter(
-          baseUrl,
-          apiKey,
-          "openai",
+        // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
+        // Engineering pod — Frontend + Backend (pair), DevOps + Security (pair)
+        await setupCoreAgent(
+            'frontend', 'Frontend Dev', 'Frontend Developer', 5, 10,
+            `${COLLAB} Your focus: modern UI, UX clarity, conversion, and front-end implementation. Paired buddy: Backend Architect — sync with them before API shape changes.`,
+            { traits: { openness: 0.9, conscientiousness: 0.8, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'creative' },
+            BUILDER
         );
         this.inferenceProvider = "openai";
         this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
@@ -1750,6 +1771,92 @@ Paired buddy: Sales Outreach.`,
 
             const file = await this.memoryStore.getSharedFile(fileId);
             this.broadcast('file-status-update', file);
+        });
+
+        this.onMessage('mail-request-sync', (client) => {
+            client.send('mail-sync', { messages: this.mailMessages.slice(-150) });
+        });
+
+        this.onMessage('mail-send', async (client, message) => {
+            const toAgentId = String(message?.toAgentId || '').trim().toLowerCase();
+            const subject = String(message?.subject || '').trim() || 'No subject';
+            const body = String(message?.body || '').trim();
+            const attachments = this.normalizeMailAttachments(message?.attachments);
+            const targetAgent = this.coreAgents.get(toAgentId);
+
+            if (!targetAgent) {
+                client.send('mail-error', { message: `Unknown agent: ${toAgentId || '(empty)'}` });
+                return;
+            }
+            if (!body && attachments.length === 0) {
+                client.send('mail-error', { message: 'Add instructions or attachments before sending.' });
+                return;
+            }
+
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const threadId = `mail-${toAgentId}-${Date.now()}`;
+            const outbound: MailMessage = {
+                id: `${threadId}-user`,
+                threadId,
+                from: 'You',
+                to: targetAgent.config.name,
+                toAgentId,
+                subject,
+                body,
+                attachments,
+                createdAt: nowIso
+            };
+            this.pushMail(outbound);
+
+            const targetState = this.state.agents.get(toAgentId);
+            const attachmentList = attachments.length > 0
+                ? attachments.map((a) => a.path).join(', ')
+                : 'none';
+
+            targetAgent.receiveMessage({
+                from: 'Faz (CEO)',
+                to: targetAgent.config.name,
+                content: `EMAIL SUBJECT: ${subject}\nINSTRUCTIONS: ${body || '(none)'}\nATTACHMENTS: ${attachmentList}\nReply with clear next steps and ETA in office email.`,
+                timestamp: nowIso
+            });
+            targetAgent.currentTask = `Email follow-up: ${subject}`.slice(0, 120);
+            if (targetState) {
+                targetState.currentTask = targetAgent.currentTask;
+                targetState.action = 'talk';
+            }
+
+            this.broadcast('chat', {
+                sender: '📨 Office Mail',
+                text: `Sent "${subject}" to ${targetAgent.config.name}.`
+            });
+
+            const ackBody = [
+                `Received your email: "${subject}".`,
+                body ? `Planned action: ${body.slice(0, 140)}` : 'Planned action: reviewing provided context.',
+                attachments.length > 0
+                    ? `I will process these files: ${attachments.map((a) => a.name).join(', ')}.`
+                    : 'No attachments were included.',
+                'I will post progress updates and outcomes in chat + completed work if artifacts are produced.'
+            ].join(' ');
+
+            setTimeout(() => {
+                const reply: MailMessage = {
+                    id: `${threadId}-agent`,
+                    threadId,
+                    from: targetAgent.config.name,
+                    to: 'You',
+                    toAgentId,
+                    subject: `RE: ${subject}`,
+                    body: ackBody,
+                    attachments: [],
+                    createdAt: this.state.officeTime || new Date().toISOString()
+                };
+                this.pushMail(reply);
+                this.broadcast('chat', {
+                    sender: '📨 Office Mail',
+                    text: `${targetAgent.config.name} replied to "${subject}".`
+                });
+            }, 1800 + Math.floor(Math.random() * 1800));
         });
 
         this.onMessage('mail-request-sync', (client) => {
