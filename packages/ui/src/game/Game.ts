@@ -44,6 +44,8 @@ export class OfficeScene extends Phaser.Scene {
     private layoutDragItemId: string | null = null;
     private gridSize = 40 * 16;
     private heldMoveKeys: Set<'left' | 'right' | 'up' | 'down'> = new Set();
+    private agentNameToSessionId: Map<string, string> = new Map();
+    private onFocusAgentRequest?: (event: Event) => void;
 
     constructor() {
         super('OfficeScene');
@@ -507,6 +509,14 @@ export class OfficeScene extends Phaser.Scene {
                 this.layoutEditMode = Boolean(detail?.enabled);
                 if (!this.layoutEditMode) this.layoutDragItemId = null;
             });
+            this.onFocusAgentRequest = (event: Event) => {
+                const detail = (event as CustomEvent).detail as { agentId?: string; agentName?: string };
+                const byId = typeof detail?.agentId === 'string' ? detail.agentId : '';
+                const byName = typeof detail?.agentName === 'string' ? detail.agentName : '';
+                const targetId = byId || (byName ? this.agentNameToSessionId.get(byName) : undefined);
+                if (targetId) this.focusAgentTemporarily(targetId);
+            };
+            eventBus.addEventListener('focus-agent-request', this.onFocusAgentRequest);
 
             this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
                 if (!this.layoutEditMode || !this.layoutDragItemId || !pointer.isDown) return;
@@ -561,6 +571,9 @@ export class OfficeScene extends Phaser.Scene {
                 document.removeEventListener('keydown', keyDownHandler, true);
                 document.removeEventListener('keyup', keyUpHandler, true);
                 this.heldMoveKeys.clear();
+                if (this.onFocusAgentRequest) {
+                    eventBus.removeEventListener('focus-agent-request', this.onFocusAgentRequest);
+                }
             });
 
             this.connectToServer();
@@ -687,6 +700,7 @@ export class OfficeScene extends Phaser.Scene {
                     container.setSize(32, 48);
                     container.setInteractive();
                     this.agentSprites.set(sessionId, container);
+                    this.agentNameToSessionId.set(agent.name, sessionId);
 
                     // --- FOCUS MODE: Click to follow ---
                     container.on('pointerdown', () => {
@@ -789,6 +803,7 @@ export class OfficeScene extends Phaser.Scene {
                         sprite.destroy();
                         this.agentSprites.delete(sessionId);
                     }
+                    this.agentNameToSessionId.delete(agent.name);
                 });
             });
 
