@@ -654,26 +654,63 @@ export class ToolExecutor {
   // Useful for agents to actually read xylondevs.com, a prospect's site, etc.
   private async fetchUrl(url: string): Promise<ToolResult> {
     try {
-      if (!url || (!url.startsWith("http://") && !url.startsWith("https://"))) {
+      if (!url || typeof url !== "string" || url.trim() === "") {
         return {
           success: false,
           output: "",
-          error: "URL must start with http:// or https://",
+          error: "URL is required.",
         };
       }
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(url, {
-        method: "GET",
-        signal: controller.signal,
-        headers: { "User-Agent": "XylonAgent/1.0 (+https://xylondevs.com)" },
-      });
-      clearTimeout(timeout);
+      const normalizedUrl = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)
+        ? url.trim()
+        : `https://${url.trim()}`;
+      if (
+        !normalizedUrl.startsWith("http://") &&
+        !normalizedUrl.startsWith("https://")
+      ) {
+        return {
+          success: false,
+          output: "",
+          error: "URL must use http:// or https://",
+        };
+      }
+
+      const fetchWithTimeout = async (targetUrl: string): Promise<Response> => {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 12000);
+        try {
+          return await fetch(targetUrl, {
+            method: "GET",
+            signal: controller.signal,
+            redirect: "follow",
+            headers: {
+              "User-Agent":
+                "Mozilla/5.0 (compatible; XylonAgent/1.0; +https://xylondevs.com)",
+              Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+            },
+          });
+        } finally {
+          clearTimeout(timeout);
+        }
+      };
+
+      let fetchTarget = normalizedUrl;
+      let res: Response;
+      try {
+        res = await fetchWithTimeout(fetchTarget);
+      } catch {
+        // Some sites block non-browser fetches or fail TLS handshakes in server runtimes.
+        // Use r.jina.ai text mirror as a best-effort fallback.
+        fetchTarget = `https://r.jina.ai/http://${normalizedUrl.replace(/^https?:\/\//i, "")}`;
+        res = await fetchWithTimeout(fetchTarget);
+      }
+
       if (!res.ok) {
         return {
           success: false,
           output: "",
-          error: `HTTP ${res.status} ${res.statusText}`,
+          error: `HTTP ${res.status} ${res.statusText} while fetching ${fetchTarget}`,
         };
       }
       const raw = await res.text();
@@ -700,12 +737,12 @@ export class ToolExecutor {
       const publishedAt = publishedMatch?.[1];
       const truncated = text.length > 4000;
       const payload: ToolResearchPayload = {
-        query: url,
+        query: normalizedUrl,
         retrievedAt: new Date().toISOString(),
         sources: [
           {
-            url,
-            title: title || url,
+            url: normalizedUrl,
+            title: title || normalizedUrl,
             snippet: `${body}${truncated ? "\n…(truncated)" : ""}`,
             ...(publishedAt ? { publishedAt } : {}),
           },
@@ -719,10 +756,11 @@ export class ToolExecutor {
         output: JSON.stringify(payload),
       };
     } catch (e: any) {
+      const cause = e?.cause?.message ? ` (cause: ${e.cause.message})` : "";
       return {
         success: false,
         output: "",
-        error: `Fetch failed: ${e.message}`,
+        error: `Fetch failed: ${e?.message || "Unknown error"}${cause}`,
       };
     }
   }
