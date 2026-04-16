@@ -1,15 +1,20 @@
 import React from 'react';
+import { Panel } from './ui/Panel';
+import { SectionHeader } from './ui/SectionHeader';
+import { Stat } from './ui/Stat';
+import { tokens } from '../theme/tokens';
 
 export function AgentInspector({ agent }: { agent?: any }) {
     if (!agent) return null;
+
     return (
-        <div style={{ position: 'absolute', right: 20, top: 20, width: 250, backgroundColor: 'rgba(0,0,0,0.8)', color: 'white', padding: 16, borderRadius: 8 }}>
-            <h3 style={{ margin: '0 0 10px 0' }}>Inspector: {agent.name}</h3>
-            <div style={{ fontSize: '14px' }}>
-                <p style={{ margin: '4px 0' }}><strong>Role:</strong> {agent.role}</p>
-                <p style={{ margin: '4px 0' }}><strong>Status:</strong> {agent.status}</p>
-                <p style={{ margin: '4px 0' }}><strong>Current Task:</strong> {agent.currentTask || 'None'}</p>
+        <Panel style={{ position: 'absolute', right: 20, top: 20, width: 260 }}>
+            <SectionHeader title={`Inspector: ${agent.name}`} subtitle="Live agent snapshot" />
+            <div style={{ display: 'grid', gap: tokens.spacing.xs }}>
+                <Stat label="Role" value={agent.role || 'Unknown'} />
+                <Stat label="Status" value={agent.status || 'Idle'} />
+                <Stat label="Current Task" value={agent.currentTask || 'None'} />
             </div>
-        </div>
+        </Panel>
     );
 }

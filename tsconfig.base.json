@@ -13,6 +13,12 @@
         "rootDir": "./src",
         "strict": true,
         "moduleResolution": "node",
+        "baseUrl": ".",
+        "paths": {
+            "@agent-office/core": [
+                "packages/core/src"
+            ]
+        },
         "esModuleInterop": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true,
