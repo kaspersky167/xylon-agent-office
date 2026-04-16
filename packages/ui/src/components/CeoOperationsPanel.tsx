@@ -42,7 +42,7 @@ export function CeoOperationsPanel() {
     };
 
     return (
-        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26}>
+        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26} mode={mode}>
             <div style={{ display: 'grid', gap: 10, fontSize: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                     <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{simulation.fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
@@ -95,7 +95,7 @@ export function CeoOperationsPanel() {
                     <div style={{ marginTop: 4 }}>Completion: <strong>{metrics.completionPct}%</strong></div>
                 </div>
 
-                <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
+                <div ref={approvalsSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Pending Approvals ({pendingApprovals.length})</div>
                     {pendingApprovals.length === 0 && <div style={{ opacity: 0.7 }}>No pending approvals.</div>}
                     {pendingApprovals.map((req) => (

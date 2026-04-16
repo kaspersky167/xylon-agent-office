@@ -1,32 +1,72 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { eventBus } from '../events';
+import { Button } from './ui/Button';
+import { Panel } from './ui/Panel';
+import { SectionHeader } from './ui/SectionHeader';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 interface LogEntry {
-    id: number;
+    id: string;
+    category: EventCategory;
     agent: string;
     action: string;
-    thought: string;
+    title: string;
+    summary: string;
+    agentId?: string;
+    taskId?: string | number;
+    approvalId?: string;
+    status?: string;
     time: string;
+    createdAt: number;
+    dedupeKey: string;
 }
 
 const actionIcons: Record<string, string> = {
-    'work': '💻', 'talk': '💬', 'idle': '😌',
-    'use_tool': '🔧', 'move': '🚶', 'think': '💡'
+    work: '💻', talk: '💬', idle: '😌',
+    use_tool: '🔧', move: '🚶', think: '💡'
 };
 
-export function SystemLog() {
+export function SystemLog({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [logs, setLogs] = useState<LogEntry[]>([]);
-    const [isOpen, setIsOpen] = useState(true);
+    const [categoryFilter, setCategoryFilter] = useState<Record<EventCategory, boolean>>({
+        activity: true,
+        highlight: true,
+        task: true,
+        approval: true
+    });
+    const [agentFilter, setAgentFilter] = useState('all');
     const scrollRef = useRef<HTMLDivElement>(null);
-    const idRef = useRef(0);
+    const idRef = useRef(1);
+    const seenByKeyRef = useRef<Map<string, number>>(new Map());
+    const knownApprovalsRef = useRef<Map<string, string>>(new Map());
 
-    const lastEntryPerAgent = useRef<Record<string, string>>({});
+    const pushLog = (entry: Omit<LogEntry, 'id' | 'createdAt'>) => {
+        const now = Date.now();
+        const lastSeenAt = seenByKeyRef.current.get(entry.dedupeKey);
+        if (lastSeenAt && now - lastSeenAt < 5000) return;
+        seenByKeyRef.current.set(entry.dedupeKey, now);
+        if (seenByKeyRef.current.size > 500) {
+            const cutoff = now - 90_000;
+            for (const [key, seenAt] of seenByKeyRef.current.entries()) {
+                if (seenAt < cutoff) {
+                    seenByKeyRef.current.delete(key);
+                }
+            }
+        }
+
+        setLogs((prev) => {
+            const next = [...prev, {
+                ...entry,
+                id: `event_${idRef.current++}`,
+                createdAt: now
+            }];
+            return next.slice(-160);
+        });
+    };
 
     useEffect(() => {
         const handler = (e: Event) => {
             const detail = (e as CustomEvent).detail;
-
-            // Deduplicate: skip if same agent + action + thought as last time
             const key = `${detail.agent}:${detail.action}:${detail.thought}`;
             if (lastEntryPerAgent.current[detail.agent] === key) return;
             lastEntryPerAgent.current[detail.agent] = key;
@@ -34,70 +74,79 @@ export function SystemLog() {
             setLogs(prev => {
                 const newLog: LogEntry = { id: idRef.current++, ...detail };
                 const updated = [...prev, newLog];
-                return updated.slice(-30); // Keep last 30 entries
+                return updated.slice(-30);
             });
+            if (knownApprovalsRef.current.size > 250) {
+                const activeIds = new Set(approvals.map((item: any) => item.id));
+                for (const approvalId of knownApprovalsRef.current.keys()) {
+                    if (!activeIds.has(approvalId)) {
+                        knownApprovalsRef.current.delete(approvalId);
+                    }
+                }
+            }
         };
-        eventBus.addEventListener('activity-log', handler);
-        return () => eventBus.removeEventListener('activity-log', handler);
+
+        eventBus.addEventListener('activity-log', onActivity);
+        eventBus.addEventListener('highlight-event', onHighlight);
+        eventBus.addEventListener('task-update', onTaskUpdate);
+        eventBus.addEventListener('approvals-sync', onApprovalsSync);
+        return () => {
+            eventBus.removeEventListener('activity-log', onActivity);
+            eventBus.removeEventListener('highlight-event', onHighlight);
+            eventBus.removeEventListener('task-update', onTaskUpdate);
+            eventBus.removeEventListener('approvals-sync', onApprovalsSync);
+        };
     }, []);
+
+    const visibleLogs = useMemo(() => (
+        logs.filter((log) => categoryFilter[log.category] && (agentFilter === 'all' || log.agent === agentFilter))
+    ), [agentFilter, categoryFilter, logs]);
+
+    const knownAgents = useMemo(() => {
+        const names = Array.from(new Set(logs.map((log) => log.agent).filter(Boolean)));
+        return names.sort((a, b) => a.localeCompare(b));
+    }, [logs]);
 
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
         }
-    }, [logs]);
+    }, [visibleLogs]);
 
     if (!isOpen) {
         return (
-            <button
+            <Button
                 onClick={() => setIsOpen(true)}
-                style={{
-                    position: 'absolute', right: 20, top: 20,
-                    padding: '6px 12px', borderRadius: 8, border: 'none',
-                    backgroundColor: '#2d3436', color: '#aaa',
-                    cursor: 'pointer', fontSize: '11px', zIndex: 10
-                }}
+                style={{ position: 'absolute', right: 20, top: 20, zIndex: 10 }}
             >
                 📊 Activity Log
-            </button>
+            </Button>
         );
     }
 
     return (
-        <div style={{
-            position: 'absolute', right: 20, top: 20, width: 260,
-            backgroundColor: 'rgba(10,10,30,0.92)', color: 'white',
-            padding: 12, borderRadius: 12,
-            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-            border: '1px solid rgba(108,92,231,0.3)',
-            maxHeight: '35vh', display: 'flex', flexDirection: 'column',
-            zIndex: 10
-        }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <h3 style={{ margin: 0, fontSize: '13px' }}>📊 System Activity Log</h3>
-                <button onClick={() => setIsOpen(false)} style={{ background: 'none', border: 'none', color: '#666', cursor: 'pointer', fontSize: '14px' }}>✕</button>
-            </div>
+        <Panel style={{ position: 'absolute', right: 20, top: 20, width: 280, maxHeight: '35vh', display: 'flex', flexDirection: 'column', zIndex: 10 }}>
+            <SectionHeader
+                title="📊 System Activity Log"
+                action={<Button onClick={() => setIsOpen(false)} style={{ padding: '4px 8px' }}>✕</Button>}
+            />
 
-            <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', fontSize: '10px', lineHeight: 1.5 }}>
+            <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', fontSize: tokens.typography.micro, lineHeight: 1.5, ...controlRoomStyles.scroll }}>
                 {logs.length === 0 && (
-                    <p style={{ color: '#555', fontStyle: 'italic', margin: 0 }}>Waiting for agent events...</p>
+                    <p style={{ color: tokens.color.textMuted, fontStyle: 'italic', margin: 0 }}>Waiting for agent events...</p>
                 )}
                 {logs.map(log => (
-                    <div key={log.id} style={{
-                        padding: '3px 0', borderBottom: '1px solid rgba(255,255,255,0.04)',
-                        display: 'flex', gap: 4, alignItems: 'flex-start'
-                    }}>
-                        <span style={{ opacity: 0.4, minWidth: 48 }}>{log.time}</span>
+                    <div key={log.id} style={{ padding: '3px 0', borderBottom: `1px solid ${tokens.color.borderSoft}`, display: 'flex', gap: 4, alignItems: 'flex-start' }}>
+                        <span style={{ opacity: 0.5, minWidth: 48, color: tokens.color.textMuted }}>{log.time}</span>
                         <span>{actionIcons[log.action] || '•'}</span>
                         <span>
-                            <strong style={{ color: log.agent === 'Alice' ? '#aaffaa' : '#3a86ff' }}>{log.agent}</strong>
-                            {' '}
-                            <span style={{ color: '#888' }}>{log.action}</span>
-                            {log.thought && <span style={{ color: '#666', fontStyle: 'italic' }}> — "{log.thought.slice(0, 60)}"</span>}
+                            <strong style={{ color: log.agent === 'Alice' ? '#a8ffd4' : '#9bc8ff' }}>{log.agent}</strong>{' '}
+                            <span style={{ color: tokens.color.textSecondary }}>{log.action}</span>
+                            {log.thought && <span style={{ color: tokens.color.textMuted, fontStyle: 'italic' }}> — "{log.thought.slice(0, 60)}"</span>}
                         </span>
                     </div>
                 ))}
             </div>
-        </div>
+        </Panel>
     );
 }
