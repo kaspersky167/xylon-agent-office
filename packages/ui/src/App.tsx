@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChatPanel } from './components/ChatPanel';
 import { AgentPulseBoard } from './components/AgentPulseBoard';
 import { RelationshipGraph } from './components/RelationshipGraph';
@@ -9,11 +9,26 @@ import { SystemLog } from './components/SystemLog';
 import { ViralControlPanel } from './components/ViralControlPanel';
 import { LayoutEditor } from './components/LayoutEditor';
 import { AgentInspector } from './components/AgentInspector';
-import { UIStoreProvider, useUIStore } from './store/uiStore';
+import { eventBus } from './events';
 
-function AppContent() {
-    const { state, actions } = useUIStore();
-    const { panelVisibility } = state;
+export function App() {
+    const [desktopPanelOpen, setDesktopPanelOpen] = useState(false);
+    const [showAdvancedPanels, setShowAdvancedPanels] = useState(false);
+    const [activeZone, setActiveZone] = useState<'main' | 'ceo_office'>('main');
+
+    useEffect(() => {
+        const onZoneState = (e: Event) => {
+            const detail = (e as CustomEvent).detail as { zoneId?: 'main' | 'ceo_office' };
+            setActiveZone(detail?.zoneId === 'ceo_office' ? 'ceo_office' : 'main');
+        };
+        eventBus.addEventListener('zone-state', onZoneState);
+        return () => eventBus.removeEventListener('zone-state', onZoneState);
+    }, []);
+
+    const switchZone = (zoneId: 'main' | 'ceo_office', focus = false) => {
+        eventBus.dispatchEvent(new CustomEvent('zone-switch', { detail: { zoneId, focus } }));
+        setActiveZone(zoneId);
+    };
 
     return (
         <>
@@ -26,6 +41,21 @@ function AppContent() {
                         style={{ borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: panelVisibility.advanced ? 'rgba(168,85,247,0.35)' : 'rgba(16,185,129,0.35)', color: '#fff', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}
                     >
                         {panelVisibility.advanced ? 'Hide Advanced Panels' : 'Show Advanced Panels'}
+                    </button>
+                </div>
+                <div style={{ display: 'flex', gap: 6, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 11, opacity: 0.7 }}>Zone:</span>
+                    <button
+                        onClick={() => switchZone('main', true)}
+                        style={{ borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: activeZone === 'main' ? 'rgba(56,189,248,0.35)' : 'rgba(255,255,255,0.08)', color: '#fff', padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}
+                    >
+                        Main Floor
+                    </button>
+                    <button
+                        onClick={() => switchZone('ceo_office', true)}
+                        style={{ borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: activeZone === 'ceo_office' ? 'rgba(251,113,133,0.35)' : 'rgba(255,255,255,0.08)', color: '#fff', padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}
+                    >
+                        CEO Office
                     </button>
                 </div>
                 <button

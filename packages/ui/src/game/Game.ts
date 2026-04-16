@@ -35,6 +35,11 @@ function resolveWsEndpoint(): string {
 }
 
 export class OfficeScene extends Phaser.Scene {
+    private readonly zones = ['main', 'ceo_office'] as const;
+    private readonly zoneBounds: Record<string, { minX: number; maxX: number; minY: number; maxY: number }> = {
+        main: { minX: 2, maxX: 36, minY: 2, maxY: 36 },
+        ceo_office: { minX: 28, maxX: 35, minY: 27, maxY: 33 }
+    };
     private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
     private room?: Colyseus.Room;
     private agentSprites: Map<string, Phaser.GameObjects.Container> = new Map();
@@ -46,7 +51,11 @@ export class OfficeScene extends Phaser.Scene {
     private cinematicMode = true;
     private cinematicReleaseAt = 0;
     private customLayoutLayer?: Phaser.GameObjects.Container;
-    private layoutItems: Array<{ id: string; type: string; x: number; y: number; label?: string }> = [];
+    private layoutItemsByZone: Record<string, Array<{ id: string; type: string; x: number; y: number; label?: string; zoneId: string }>> = {
+        main: [],
+        ceo_office: []
+    };
+    private activeZone: 'main' | 'ceo_office' = 'main';
     private layoutEditMode = false;
     private layoutDragItemId: string | null = null;
     private gridSize = GRID_SIZE_PX;
@@ -116,8 +125,10 @@ export class OfficeScene extends Phaser.Scene {
             });
             eventBus.addEventListener('layout-preview-update', (e: Event) => {
                 const detail = (e as CustomEvent).detail as { items: Array<{ id: string; type: string; x: number; y: number; label?: string }> };
-                this.layoutItems = Array.isArray(detail?.items) ? detail.items : [];
-                this.renderCustomLayout(this.layoutItems);
+                this.layoutItemsByZone[this.activeZone] = Array.isArray(detail?.items)
+                    ? detail.items.map((item) => ({ ...item, zoneId: this.activeZone }))
+                    : [];
+                this.renderCustomLayout(this.getActiveZoneItems());
             });
             eventBus.addEventListener('layout-edit-mode', (e: Event) => {
                 const detail = (e as CustomEvent).detail as { enabled: boolean };
@@ -135,13 +146,14 @@ export class OfficeScene extends Phaser.Scene {
 
             this.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
                 if (!this.layoutEditMode || !this.layoutDragItemId || !pointer.isDown) return;
-                const gx = Phaser.Math.Clamp(Math.round(pointer.worldX / 16), 2, 36);
-                const gy = Phaser.Math.Clamp(Math.round(pointer.worldY / 16), 2, 36);
-                this.layoutItems = this.layoutItems.map((item) =>
+                const bounds = this.zoneBounds[this.activeZone];
+                const gx = Phaser.Math.Clamp(Math.round(pointer.worldX / 16), bounds.minX, bounds.maxX);
+                const gy = Phaser.Math.Clamp(Math.round(pointer.worldY / 16), bounds.minY, bounds.maxY);
+                this.layoutItemsByZone[this.activeZone] = this.getActiveZoneItems().map((item) =>
                     item.id === this.layoutDragItemId ? { ...item, x: gx, y: gy } : item
                 );
-                this.renderCustomLayout(this.layoutItems);
-                eventBus.dispatchEvent(new CustomEvent('layout-item-moved', { detail: { items: this.layoutItems } }));
+                this.renderCustomLayout(this.getActiveZoneItems());
+                eventBus.dispatchEvent(new CustomEvent('layout-item-moved', { detail: { items: this.getActiveZoneItems(), zoneId: this.activeZone } }));
             });
             this.input.on('pointerup', () => {
                 this.layoutDragItemId = null;
@@ -149,6 +161,10 @@ export class OfficeScene extends Phaser.Scene {
             this.input.on('wheel', (_pointer: Phaser.Input.Pointer, _objects: Phaser.GameObjects.GameObject[], _deltaX: number, deltaY: number) => {
                 const nextZoom = Phaser.Math.Clamp(this.cameras.main.zoom - deltaY * 0.001, 1, 3);
                 this.cameras.main.setZoom(nextZoom);
+            });
+            eventBus.addEventListener('zone-switch', (e: Event) => {
+                const detail = (e as CustomEvent).detail as { zoneId?: string; focus?: boolean };
+                this.setActiveZone(detail?.zoneId || 'main', Boolean(detail?.focus));
             });
 
             const toMoveDirection = (event: KeyboardEvent): 'left' | 'right' | 'up' | 'down' | null => {
@@ -253,9 +269,15 @@ export class OfficeScene extends Phaser.Scene {
                     eventBus.dispatchEvent(new CustomEvent('completed-work-sync', { detail: message }));
                 });
                 this.room!.onMessage('layout-sync', (message: any) => {
-                    this.layoutItems = Array.isArray(message?.layout) ? message.layout : [];
-                    this.renderCustomLayout(this.layoutItems);
-                    eventBus.dispatchEvent(new CustomEvent('layout-sync', { detail: { items: this.layoutItems } }));
+                    this.layoutItemsByZone = this.normalizeLayoutByZone(message?.layoutByZone ?? message?.layout);
+                    this.setActiveZone(message?.zoneId || this.activeZone, false);
+                    eventBus.dispatchEvent(new CustomEvent('layout-sync', {
+                        detail: {
+                            items: this.getActiveZoneItems(),
+                            layoutByZone: this.layoutItemsByZone,
+                            zoneId: this.activeZone
+                        }
+                    }));
                 });
                 this.room!.onMessage('file-list', (message: any) => {
                     emitUIEvent(UIEvents.desktopFilesSync, message);
@@ -491,7 +513,8 @@ export class OfficeScene extends Phaser.Scene {
                                 reputation: Number(agent.reputation || 0),
                                 riskLevel: Number(agent.riskLevel || 0),
                                 momentum: Number(agent.momentum || 0),
-                                action: agent.action
+                                action: agent.action,
+                                zoneId: agent.zoneId || 'main'
                             }
                         }));
                         eventBus.dispatchEvent(new CustomEvent('agent-state-sync', {
@@ -636,7 +659,54 @@ export class OfficeScene extends Phaser.Scene {
         });
     }
 
-    private renderCustomLayout(items: Array<{ type: string; x: number; y: number; label?: string }>) {
+    private normalizeLayoutByZone(input: any): Record<string, Array<{ id: string; type: string; x: number; y: number; label?: string; zoneId: string }>> {
+        const normalized: Record<string, Array<{ id: string; type: string; x: number; y: number; label?: string; zoneId: string }>> = {
+            main: [],
+            ceo_office: []
+        };
+        if (!input) return normalized;
+        if (Array.isArray(input)) {
+            normalized.main = input.map((item: any, idx: number) => ({
+                id: item?.id || `item_main_${idx}`,
+                type: item?.type || 'desk',
+                x: Number(item?.x) || 2,
+                y: Number(item?.y) || 2,
+                label: item?.label,
+                zoneId: 'main'
+            }));
+            return normalized;
+        }
+        for (const zone of this.zones) {
+            const items = Array.isArray(input?.[zone]) ? input[zone] : [];
+            normalized[zone] = items.map((item: any, idx: number) => ({
+                id: item?.id || `item_${zone}_${idx}`,
+                type: item?.type || 'desk',
+                x: Number(item?.x) || 2,
+                y: Number(item?.y) || 2,
+                label: item?.label,
+                zoneId: zone
+            }));
+        }
+        return normalized;
+    }
+
+    private getActiveZoneItems() {
+        return this.layoutItemsByZone[this.activeZone] || [];
+    }
+
+    private setActiveZone(zoneId: string, focusCamera = false) {
+        this.activeZone = zoneId === 'ceo_office' ? 'ceo_office' : 'main';
+        this.renderCustomLayout(this.getActiveZoneItems());
+        eventBus.dispatchEvent(new CustomEvent('zone-state', { detail: { zoneId: this.activeZone } }));
+        if (focusCamera) {
+            const bounds = this.zoneBounds[this.activeZone];
+            const centerX = ((bounds.minX + bounds.maxX) / 2) * 16;
+            const centerY = ((bounds.minY + bounds.maxY) / 2) * 16;
+            this.cameras.main.centerOn(centerX, centerY);
+        }
+    }
+
+    private renderCustomLayout(items: Array<{ type: string; x: number; y: number; label?: string; zoneId?: string }>) {
         if (!this.customLayoutLayer) return;
         this.customLayoutLayer.removeAll(true);
         for (let index = 0; index < items.length; index++) {

@@ -20,34 +20,68 @@ const FURNITURE_PALETTE: { type: FurnitureItem['type']; emoji: string; label: st
     { type: 'whiteboard', emoji: '📝', label: 'Board' },
 ];
 
-export function LayoutEditor({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
+const ZONE_BOUNDS: Record<'main' | 'ceo_office', { min: number; max: number; minY: number; maxY: number }> = {
+    main: { min: 2, max: 36, minY: 2, maxY: 36 },
+    ceo_office: { min: 28, max: 35, minY: 27, maxY: 33 }
+};
+
+export function LayoutEditor() {
     const [isOpen, setIsOpen] = useState(false);
     const [items, setItems] = useState<FurnitureItem[]>([]);
+    const [zoneId, setZoneId] = useState<'main' | 'ceo_office'>('main');
+    const [itemsByZone, setItemsByZone] = useState<Record<'main' | 'ceo_office', FurnitureItem[]>>({ main: [], ceo_office: [] });
     const [selected, setSelected] = useState<FurnitureItem['type']>('desk');
     const [moveMode, setMoveMode] = useState(true);
 
     useEffect(() => {
         const syncHandler = (e: Event) => {
-            const detail = (e as CustomEvent).detail as { items: FurnitureItem[] };
-            if (!Array.isArray(detail?.items)) return;
-            setItems(detail.items.map((item, idx) => ({
+            const detail = (e as CustomEvent).detail as { items: FurnitureItem[]; zoneId?: 'main' | 'ceo_office'; layoutByZone?: Record<'main' | 'ceo_office', FurnitureItem[]> };
+            const nextZone = detail?.zoneId === 'ceo_office' ? 'ceo_office' : 'main';
+            const nextByZone = detail?.layoutByZone || {
+                main: nextZone === 'main' ? (detail?.items || []) : itemsByZone.main,
+                ceo_office: nextZone === 'ceo_office' ? (detail?.items || []) : itemsByZone.ceo_office
+            };
+            setZoneId(nextZone);
+            setItemsByZone({
+                main: (nextByZone.main || []).map((item, idx) => ({
+                    ...item,
+                    id: item.id || `item_sync_main_${idx}`,
+                    label: item.label || FURNITURE_PALETTE.find((f) => f.type === item.type)?.label
+                })),
+                ceo_office: (nextByZone.ceo_office || []).map((item, idx) => ({
+                    ...item,
+                    id: item.id || `item_sync_ceo_${idx}`,
+                    label: item.label || FURNITURE_PALETTE.find((f) => f.type === item.type)?.label
+                }))
+            });
+            setItems((nextByZone[nextZone] || []).map((item, idx) => ({
                 ...item,
                 id: item.id || `item_sync_${idx}`,
                 label: item.label || FURNITURE_PALETTE.find((f) => f.type === item.type)?.label
             })));
         };
         const movedHandler = (e: Event) => {
-            const detail = (e as CustomEvent).detail as { items: FurnitureItem[] };
+            const detail = (e as CustomEvent).detail as { items: FurnitureItem[]; zoneId?: 'main' | 'ceo_office' };
             if (!Array.isArray(detail?.items)) return;
+            const nextZone = detail?.zoneId === 'ceo_office' ? 'ceo_office' : zoneId;
+            setItemsByZone((prev) => ({ ...prev, [nextZone]: detail.items }));
             setItems(detail.items as FurnitureItem[]);
+        };
+        const zoneHandler = (e: Event) => {
+            const detail = (e as CustomEvent).detail as { zoneId?: 'main' | 'ceo_office' };
+            const nextZone = detail?.zoneId === 'ceo_office' ? 'ceo_office' : 'main';
+            setZoneId(nextZone);
+            setItems(itemsByZone[nextZone] || []);
         };
         eventBus.addEventListener('layout-sync', syncHandler);
         eventBus.addEventListener('layout-item-moved', movedHandler);
+        eventBus.addEventListener('zone-state', zoneHandler);
         return () => {
             eventBus.removeEventListener('layout-sync', syncHandler);
             eventBus.removeEventListener('layout-item-moved', movedHandler);
+            eventBus.removeEventListener('zone-state', zoneHandler);
         };
-    }, []);
+    }, [itemsByZone, zoneId]);
 
     useEffect(() => {
         eventBus.dispatchEvent(new CustomEvent('layout-preview-update', { detail: { items } }));
@@ -61,15 +95,17 @@ export function LayoutEditor({ mode = 'floating' }: { mode?: 'floating' | 'docke
         const newItem: FurnitureItem = {
             id: `item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
             type: selected,
-            x: Math.floor(Math.random() * 35) + 2,
-            y: Math.floor(Math.random() * 35) + 2,
+            x: Math.floor(Math.random() * (ZONE_BOUNDS[zoneId].max - ZONE_BOUNDS[zoneId].min + 1)) + ZONE_BOUNDS[zoneId].min,
+            y: Math.floor(Math.random() * (ZONE_BOUNDS[zoneId].maxY - ZONE_BOUNDS[zoneId].minY + 1)) + ZONE_BOUNDS[zoneId].minY,
             label: FURNITURE_PALETTE.find(f => f.type === selected)?.label
         };
         setItems(prev => [...prev, newItem]);
+        setItemsByZone(prev => ({ ...prev, [zoneId]: [...(prev[zoneId] || []), newItem] }));
     };
 
     const removeItem = (id: string) => {
         setItems(prev => prev.filter(i => i.id !== id));
+        setItemsByZone(prev => ({ ...prev, [zoneId]: (prev[zoneId] || []).filter(i => i.id !== id) }));
     };
 
     const nudgeItem = (id: string, dx: number, dy: number) => {
@@ -77,16 +113,24 @@ export function LayoutEditor({ mode = 'floating' }: { mode?: 'floating' | 'docke
             if (item.id !== id) return item;
             return {
                 ...item,
-                x: Math.max(2, Math.min(36, item.x + dx)),
-                y: Math.max(2, Math.min(36, item.y + dy))
+                x: Math.max(ZONE_BOUNDS[zoneId].min, Math.min(ZONE_BOUNDS[zoneId].max, item.x + dx)),
+                y: Math.max(ZONE_BOUNDS[zoneId].minY, Math.min(ZONE_BOUNDS[zoneId].maxY, item.y + dy))
             };
+        }));
+        setItemsByZone(prev => ({
+            ...prev,
+            [zoneId]: (prev[zoneId] || []).map((item) => item.id === id ? {
+                ...item,
+                x: Math.max(ZONE_BOUNDS[zoneId].min, Math.min(ZONE_BOUNDS[zoneId].max, item.x + dx)),
+                y: Math.max(ZONE_BOUNDS[zoneId].minY, Math.min(ZONE_BOUNDS[zoneId].maxY, item.y + dy))
+            } : item)
         }));
     };
 
     const saveLayout = () => {
         const room = getColyseusRoom();
         if (room) {
-            room.send('save-layout', { name: 'default', layout: items });
+            room.send('save-layout', { name: 'default', zoneId, layout: items, layoutByZone: itemsByZone });
         }
     };
 
@@ -122,6 +166,9 @@ export function LayoutEditor({ mode = 'floating' }: { mode?: 'floating' | 'docke
                 <h3 style={{ margin: 0, fontSize: '14px' }}>🏗️ Office Layout Editor</h3>
                 <button onClick={() => setIsOpen(false)} style={{ background: 'none', border: 'none', color: '#888', cursor: 'pointer', fontSize: '16px' }}>✕</button>
             </div>
+            <p style={{ margin: '0 0 8px', fontSize: '11px', color: '#9aa3cf' }}>
+                Editing zone: <strong style={{ color: '#fff' }}>{zoneId === 'main' ? 'Main Floor' : 'CEO Office'}</strong>
+            </p>
 
             <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '11px', marginBottom: 8, color: '#c9cff8' }}>
                 <input type="checkbox" checked={moveMode} onChange={(e) => setMoveMode(e.target.checked)} />

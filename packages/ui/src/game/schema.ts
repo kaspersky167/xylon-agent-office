@@ -5,6 +5,7 @@ export class AgentState extends Schema {
     declare name: string;
     declare x: number;
     declare y: number;
+    declare zoneId: string;
     declare direction: string;
     declare action: string;
     declare currentTask: string;
@@ -19,6 +20,7 @@ type("string")(AgentState.prototype, "id");
 type("string")(AgentState.prototype, "name");
 type("number")(AgentState.prototype, "x");
 type("number")(AgentState.prototype, "y");
+type("string")(AgentState.prototype, "zoneId");
 type("string")(AgentState.prototype, "direction");
 type("string")(AgentState.prototype, "action");
 type("string")(AgentState.prototype, "currentTask");

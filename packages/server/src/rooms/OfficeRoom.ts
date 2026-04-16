@@ -99,6 +99,11 @@ interface ChatAttachment {
     createdAt: string;
 }
 
+type ZoneId = 'main' | 'ceo_office';
+type ZoneBounds = { minX: number; maxX: number; minY: number; maxY: number };
+type LayoutItem = { id: string; type: string; x: number; y: number; label?: string; zoneId: ZoneId };
+type FurnitureTarget = { x: number; y: number; type: string };
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -133,7 +138,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
     private relationships: Map<string, RelationshipEdge> = new Map();
     private audienceVotes: Record<string, number> = {};
-    private currentLayout: any[] = [];
+    private currentLayoutByZone: Record<ZoneId, LayoutItem[]> = { main: [], ceo_office: [] };
     private approvals: Map<string, ApprovalRequest> = new Map();
     private meetingActive = false;
     private meetingEndsAt = 0;
@@ -225,15 +230,108 @@ export class OfficeRoom extends Room<OfficeState> {
             .filter((item): item is ChatAttachment => Boolean(item));
     }
 
-    // Furniture interaction points: named locations agents can walk to
-    private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {};
+    private zoneBounds: Record<ZoneId, ZoneBounds> = {
+        main: { minX: 2, maxX: 36, minY: 2, maxY: 36 },
+        ceo_office: { minX: 28, maxX: 35, minY: 27, maxY: 33 },
+    };
+
+    // Furniture interaction points keyed by zone.
+    private furnitureTargets: Record<ZoneId, Record<string, FurnitureTarget>> = {
+        main: {
+        // ─── ENGINEERING POD (pod of 4, left side) ───
+        // Pair: Frontend + Backend / Pair: DevOps + Security
+        'frontend-desk':    { x: 5,  y: 10, type: 'desk' },
+        'backend-desk':     { x: 8,  y: 10, type: 'desk' },
+        'devops-desk':      { x: 5,  y: 14, type: 'desk' },
+        'security-desk':    { x: 8,  y: 14, type: 'desk' },
+
+        // ─── OPS / STRATEGY POD (pod of 4, center) ───
+        // Pair: Shepherd + Reality / Pair: Evidence + SEO
+        'shepherd-desk':    { x: 17, y: 10, type: 'desk' },
+        'reality-desk':     { x: 20, y: 10, type: 'desk' },
+        'evidence-desk':    { x: 17, y: 14, type: 'desk' },
+        'seo-desk':         { x: 20, y: 14, type: 'desk' },
+
+        // ─── GROWTH POD (small pod of 2, right side) ───
+        // Pair: Sales + Proposal
+        'sales-desk':       { x: 29, y: 10, type: 'desk' },
+        'proposal-desk':    { x: 32, y: 10, type: 'desk' },
+
+        // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
+        // ─── SHARED FURNITURE ───
+        'meeting-table':  { x: 20, y: 22, type: 'table' },
+        'coffee-machine': { x: 5,  y: 30, type: 'appliance' },
+        'whiteboard':     { x: 20, y: 5,  type: 'board' },
+        'water-cooler':   { x: 12, y: 30, type: 'appliance' },
+        'bookshelf':      { x: 17, y: 30, type: 'furniture' },
+        'beanbag':        { x: 24, y: 30, type: 'seating' },
+        // Extra desks for dynamically hired agents
+        'hire_0-desk': { x: 22, y: 18, type: 'desk' },
+        'hire_1-desk': { x: 22, y: 23, type: 'desk' },
+        'hire_2-desk': { x: 25, y: 18, type: 'desk' },
+        'hire_3-desk': { x: 25, y: 8,  type: 'desk' },
+        'hire_4-desk': { x: 32, y: 18, type: 'desk' },
+        },
+        ceo_office: {
+            'ceo-desk':         { x: 32, y: 30, type: 'desk' },
+            'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
+            'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
+            'ceo-office-door':  { x: 28, y: 30, type: 'door' },
+        }
+    };
 
     static getActiveRoom(): OfficeRoom | null {
         return OfficeRoom.activeRoom;
     }
 
-    static setExtensionRegistry(registry: ExtensionRegistry) {
-        OfficeRoom.extensionRegistry = registry;
+    private normalizeZoneId(zoneId: unknown): ZoneId {
+        return zoneId === 'ceo_office' ? 'ceo_office' : 'main';
+    }
+
+    private clampToZone(agent: { x: number; y: number; zoneId?: string }, zoneId?: ZoneId) {
+        const resolvedZone = zoneId || this.normalizeZoneId(agent.zoneId);
+        const bounds = this.zoneBounds[resolvedZone];
+        agent.x = Math.max(bounds.minX, Math.min(bounds.maxX, agent.x));
+        agent.y = Math.max(bounds.minY, Math.min(bounds.maxY, agent.y));
+        agent.zoneId = resolvedZone;
+    }
+
+    private normalizeLayoutByZone(raw: unknown): Record<ZoneId, LayoutItem[]> {
+        const empty: Record<ZoneId, LayoutItem[]> = { main: [], ceo_office: [] };
+        if (Array.isArray(raw)) {
+            return {
+                main: raw.map((item, idx) => {
+                    const src = (item && typeof item === 'object') ? item as Record<string, unknown> : {};
+                    return {
+                        id: String(src.id || `item_main_${idx}`),
+                        type: String(src.type || 'desk'),
+                        x: Math.max(2, Math.min(36, Number(src.x) || 2)),
+                        y: Math.max(2, Math.min(36, Number(src.y) || 2)),
+                        label: typeof src.label === 'string' ? src.label : undefined,
+                        zoneId: 'main' as ZoneId
+                    };
+                }),
+                ceo_office: []
+            };
+        }
+        if (!raw || typeof raw !== 'object') return empty;
+        const root = raw as Record<string, unknown>;
+        const toItems = (zone: ZoneId) => {
+            const source = root[zone];
+            if (!Array.isArray(source)) return [] as LayoutItem[];
+            return source.map((item, idx) => {
+                const src = (item && typeof item === 'object') ? item as Record<string, unknown> : {};
+                return {
+                    id: String(src.id || `item_${zone}_${idx}`),
+                    type: String(src.type || 'desk'),
+                    x: Math.max(2, Math.min(36, Number(src.x) || 2)),
+                    y: Math.max(2, Math.min(36, Number(src.y) || 2)),
+                    label: typeof src.label === 'string' ? src.label : undefined,
+                    zoneId: zone
+                };
+            });
+        };
+        return { main: toItems('main'), ceo_office: toItems('ceo_office') };
     }
 
     private configureInferenceProvider() {
@@ -279,18 +377,32 @@ export class OfficeRoom extends Room<OfficeState> {
         this.office = new Office(config);
         this.configureInferenceProvider();
 
-        const setupCoreAgent = async (agentTemplate: OfficeTemplate['defaultAgents'][number]) => {
-            const { id, name, role, position, systemPrompt, personality, capabilities } = agentTemplate;
-            const model = agentTemplate.modelEnv
-                ? process.env[agentTemplate.modelEnv] || this.defaultModel
-                : this.defaultModel;
-
+        // Setup Core Agents with AI capabilities
+        type Traits = { openness: number; conscientiousness: number; extraversion: number; agreeableness: number; neuroticism: number };
+        type Capability = { name: string; description: string };
+        const setupCoreAgent = async (
+            id: string,
+            name: string,
+            role: string,
+            x: number,
+            y: number,
+            zoneId: ZoneId,
+            systemPrompt: string,
+            personality: {
+                traits: Traits;
+                communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
+            },
+            capabilities: Capability[],
+            model: string = this.defaultModel
+        ) => {
             this.state.createAgent(id, name);
             this.broadcastRoster();
             const state = this.state.agents.get(id);
             if (state) {
-                state.x = position.x;
-                state.y = position.y;
+                state.x = x;
+                state.y = y;
+                state.zoneId = zoneId;
+                this.clampToZone(state, zoneId);
             }
 
             const coreAgent = new Agent({
@@ -328,15 +440,182 @@ export class OfficeRoom extends Room<OfficeState> {
             this.thinkingLocks.set(id, false);
         };
 
-        for (const agentTemplate of this.officeTemplate.defaultAgents) {
-            await setupCoreAgent(agentTemplate);
-        }
+        // ─── SHARED CAPABILITY SETS ───
+        // Read-only: can inspect files and search, nothing writes or executes
+        const READ_ONLY: Capability[] = [
+            { name: 'read_file',   description: 'Read a file from the workspace' },
+            { name: 'list_files',  description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',   description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
+            { name: 'web_search',  description: 'Search the web for information' },
+            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
+            { name: 'write_note',  description: 'Save a note or observation' },
+            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
+        ];
 
-        this.broadcast('chat', this.officeTemplate.scenarios.startupBroadcast);
+        // Coordinator: task flow + notes, no file access
+        const COORDINATOR: Capability[] = [
+            { name: 'create_task', description: 'Create a task and assign it to an agent' },
+            { name: 'write_note',  description: 'Save a note or memo' },
+            { name: 'web_search',  description: 'Search the web for information' },
+            { name: 'fetch_url',   description: 'Fetch and read the visible text of a public URL' },
+            { name: 'check_health',description: 'HTTP HEAD check on a URL' },
+        ];
+
+        // Builder: file edits + safe shell commands + web search + research
+        const BUILDER: Capability[] = [
+            { name: 'read_file',    description: 'Read a file from the workspace' },
+            { name: 'list_files',   description: 'List files in the workspace (optionally recursive)' },
+            { name: 'stat_file',    description: 'Get file metadata such as size and timestamps' },
+            { name: 'read_file_chunk', description: 'Read a chunk of a file for large files' },
+            { name: 'write_file',   description: 'Write or update a file in the workspace' },
+            { name: 'run_command',  description: 'Run an allowlisted shell command (ls, git status, docker ps, etc.)' },
+            { name: 'code_execute', description: 'Execute a small JavaScript snippet' },
+            { name: 'web_search',   description: 'Search the web for information' },
+            { name: 'fetch_url',    description: 'Fetch and read the visible text of a public URL' },
+            { name: 'write_note',   description: 'Save a note or memo' },
+            { name: 'create_task',  description: 'Create a task and assign it to an agent' },
+        ];
+
+        // ─── COLLAB CHARTER (shared across all agents) ───
+        // Keep it short so it doesn't dominate the prompt but nudges real teamwork.
+        const COLLAB = [
+            `You work at Xylon Devs as part of a small agency team.`,
+            `Collaborate often — consult your paired buddy first when a task overlaps.`,
+            `Loop in other pods (engineering / ops-strategy / growth) when it matters.`,
+            `Keep thoughts concise. Propose concrete next actions, not just observations.`,
+            `For MAJOR decisions (hiring, deploys, destructive commands, pricing commitments,`,
+            ` publishing/launch, major reprioritization, or anything tagged "major") you MUST`,
+            ` request CEO approval before executing. Minor work (drafting, research, notes,`,
+            ` internal coordination, proposing tasks) does not need approval.`,
+            `WEB SEARCH BUDGET: the team shares a limited Tavily API budget (1 000 credits total).`,
+            ` Be frugal — only call web_search or fetch_url when the information is not already`,
+            ` available in your memory or recent chat. Combine multiple questions into one query.`,
+            ` Never repeat a search you or a colleague already ran this session.`,
+            ` Prefer fetch_url for xylondevs.com (free, no credit cost) over a search for it.`,
+            ` RECENCY RULE: for volatile topics (news, pricing, specs, policies, releases, outages),`,
+            ` explicitly prioritize fresh evidence. Use web_search to find recent sources, then`,
+            ` verify key claims with fetch_url (and check_health when useful). Include source URLs`,
+            ` in your findings, and do not rely on stale cached assumptions when freshness matters.`,
+        ].join(' ');
+
+        // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
+        // Engineering pod — Frontend + Backend (pair), DevOps + Security (pair)
+        await setupCoreAgent(
+            'frontend', 'Frontend Dev', 'Frontend Developer', 5, 10, 'main',
+            `${COLLAB} Your focus: modern UI, UX clarity, conversion, and front-end implementation. Paired buddy: Backend Architect — sync with them before API shape changes.`,
+            { traits: { openness: 0.9, conscientiousness: 0.8, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'creative' },
+            BUILDER
+        );
+
+        await setupCoreAgent(
+            'backend', 'Backend Architect', 'Backend Architect', 8, 10, 'main',
+            `${COLLAB} Your focus: APIs, architecture, integrations, maintainability. Paired buddy: Frontend Dev — confirm contracts with them. Pull in DevOps for anything deploy-shaped.`,
+            { traits: { openness: 0.8, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.6, neuroticism: 0.1 }, communicationStyle: 'technical' },
+            BUILDER
+        );
+
+        await setupCoreAgent(
+            'devops', 'DevOps Automator', 'DevOps Automator', 5, 14, 'main',
+            `${COLLAB} Your focus: deployment, Docker, scripts, infra safety, repeatable automation. Paired buddy: Security Engineer — always review risky infra with them. Deploys are MAJOR and need CEO approval.`,
+            { traits: { openness: 0.8, conscientiousness: 0.95, extraversion: 0.5, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'technical' },
+            BUILDER
+        );
+
+        await setupCoreAgent(
+            'security', 'Security Eng', 'Security Engineer', 8, 14, 'main',
+            `${COLLAB} Your focus: security reviews, secrets, auth, dependencies, hardening.
+You are ALSO Xylon's enterprise AI governance specialist. You advise clients on deploying AI tools (Microsoft Copilot, ChatGPT Enterprise, Gemini for Workspace, custom RAG) safely inside large organisations. Core expertise:
+ - Oversharing prevention: SharePoint/OneDrive permission hygiene, sensitivity labels, DLP policies, Purview restricted SharePoint search, Copilot semantic index scoping, tenant-wide "just-in-time" access reviews.
+ - Identity & access: Entra ID conditional access, PIM, least-privilege app consent, service principal audits.
+ - Data protection: MIP sensitivity labels, encryption at rest + in transit, customer-managed keys, data residency.
+ - Model governance: prompt logging, content filtering, jailbreak mitigation, hallucination risk notes, evaluations.
+ - Compliance: ISO 27001, SOC 2, Essential Eight (AU), Australian Privacy Principles, NIST AI RMF.
+When asked about "AI rollout", "Copilot security", or "oversharing", give concrete controls + the exact product/setting, not generic advice.
+Paired buddy: DevOps Automator. Flag issues early and recommend concrete fixes.`,
+            { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.3, agreeableness: 0.5, neuroticism: 0.3 }, communicationStyle: 'technical' },
+            READ_ONLY
+        );
+
+        // Ops / Strategy pod — Shepherd + Reality (pair), Evidence + SEO (pair)
+        await setupCoreAgent(
+            'shepherd', 'Project Shepherd', 'Project Shepherd', 17, 10, 'main',
+            `${COLLAB} Your focus: planning, routing, coordination, keeping work moving. Paired buddy: Reality Checker — pressure-test plans with them. Major reprioritization needs CEO approval.`,
+            { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.8, agreeableness: 0.8, neuroticism: 0.15 }, communicationStyle: 'formal' },
+            COORDINATOR
+        );
+
+        await setupCoreAgent(
+            'reality', 'Reality Checker', 'Reality Checker', 20, 10, 'main',
+            `${COLLAB} Your focus: challenge weak ideas, highlight risks, ask "is this really ready?". Paired buddy: Project Shepherd. Be direct but constructive.`,
+            { traits: { openness: 0.8, conscientiousness: 0.9, extraversion: 0.6, agreeableness: 0.4, neuroticism: 0.25 }, communicationStyle: 'technical' },
+            READ_ONLY
+        );
+
+        await setupCoreAgent(
+            'evidence', 'Evidence Collector', 'Evidence Collector', 17, 14, 'main',
+            `${COLLAB} Your focus: proof, validation, screenshots, logs, QA evidence. Paired buddy: SEO Specialist — share validation evidence with them for page launches.`,
+            { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
+            READ_ONLY
+        );
+
+        await setupCoreAgent(
+            'seo', 'SEO Specialist', 'SEO Specialist', 20, 14, 'main',
+            `${COLLAB} Your focus: search visibility, service pages, keyword targeting, metadata. Paired buddy: Evidence Collector. Publishing new pages is MAJOR — request CEO approval.`,
+            { traits: { openness: 0.85, conscientiousness: 0.85, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
+            [
+                { name: 'read_file',  description: 'Read existing page content and context files' },
+                { name: 'write_note', description: 'Save keyword research and recommendations' },
+                { name: 'web_search', description: 'Research keywords and competitor pages' },
+                { name: 'fetch_url',  description: 'Fetch page content to audit for SEO' },
+                { name: 'check_health', description: 'Check if a page URL is live' },
+            ]
+        );
+
+        // Growth pod — Sales + Proposal (pair)
+        await setupCoreAgent(
+            'sales', 'Sales Outreach', 'Sales Outreach', 29, 10, 'main',
+            `${COLLAB} Your focus: outbound messaging, lead gen, prospect qualification for Shopify, Microsoft 365, and cybersecurity clients (AU).
+You know how to PITCH Xylon Devs: lead with the client's pain (oversharing risk, slow deploys, low conversion), then 1–2 proof points, then a clear next step (15-min discovery call). Keep cold emails under 120 words, 1 CTA, plain-text, no buzzwords. For LinkedIn opens: personalise line 1, relevance line 2, ask line 3.
+Qualify with BANT or MEDDIC-lite (Budget, Authority, Need, Timeline). Don't send proposals — hand qualified leads to Proposal Strategist with a one-paragraph brief.
+Paired buddy: Proposal Strategist.`,
+            { traits: { openness: 0.8, conscientiousness: 0.7, extraversion: 0.95, agreeableness: 0.85, neuroticism: 0.2 }, communicationStyle: 'casual' },
+            [
+                { name: 'read_file',  description: 'Read a file from the workspace' },
+                { name: 'write_note', description: 'Save a draft message or note' },
+                { name: 'web_search', description: 'Research a prospect or market' },
+                { name: 'fetch_url',  description: 'Read a prospect website or public page' },
+            ]
+        );
+
+        await setupCoreAgent(
+            'proposal', 'Proposal Strategist', 'Proposal Strategist', 32, 10, 'main',
+            `${COLLAB} Your focus: scope shaping, proposals, packaging, pricing structure drafts.
+You are Xylon's SOW + pitch deck expert. A Statement of Work MUST contain: 1) Background & objectives, 2) In-scope deliverables (itemised), 3) Explicit out-of-scope list, 4) Assumptions & dependencies, 5) Acceptance criteria, 6) Timeline / milestones, 7) Commercials (fixed-fee, T&M, or retainer — state clearly), 8) Change-request process, 9) IP & confidentiality, 10) Payment terms + signature block.
+For pitches: problem → why-now → Xylon's approach → proof (case study / metric) → pricing options (Good / Better / Best, 3 tiers) → next step. Never quote final pricing without CEO approval.
+Paired buddy: Sales Outreach.`,
+            { traits: { openness: 0.8, conscientiousness: 0.9, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'formal' },
+            [
+                { name: 'read_file',  description: 'Read context files and templates' },
+                { name: 'write_file', description: 'Draft a proposal document' },
+                { name: 'write_note', description: 'Save notes and assumptions' },
+                { name: 'web_search', description: 'Research pricing or scope comparables' },
+                { name: 'fetch_url',  description: 'Read a prospect website, case study, or benchmark page' },
+            ]
+        );
+
+        // CEO — private office, strategic oversight, final approver
+        await setupCoreAgent(
+            'ceo', 'Faz (CEO)', 'CEO', 32, 30, 'ceo_office',
+            `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Enforce evidence quality: for volatile topics (news, pricing, specs, policies, releases, outages), require recent sources, require source URLs in findings, and reject stale cached assumptions. Be concise and direct.`,
+            { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
+            COORDINATOR,
+            process.env.CEO_MODEL || this.defaultModel
+        );
 
         this.rebuildRelationshipGraph();
         const savedLayout = await this.memoryStore.loadLayout('default');
-        this.currentLayout = Array.isArray(savedLayout) ? savedLayout : [];
+        this.currentLayoutByZone = this.normalizeLayoutByZone(savedLayout);
 
         // Restore any approval requests that didn't get resolved before a restart
         try {
@@ -764,10 +1043,29 @@ export class OfficeRoom extends Room<OfficeState> {
         // Save office layout from editor
         this.onMessage('save-layout', async (client, message) => {
             const layoutName = message.name || 'default';
-            const layout = Array.isArray(message.layout) ? message.layout : [];
-            await this.memoryStore.saveLayout(layoutName, JSON.stringify(layout));
-            this.currentLayout = layout;
-            this.broadcast('layout-sync', { name: layoutName, layout: this.currentLayout });
+            const providedByZone = message?.layoutByZone;
+            const zoneId = this.normalizeZoneId(message?.zoneId);
+            const nextByZone = providedByZone && typeof providedByZone === 'object'
+                ? this.normalizeLayoutByZone(providedByZone)
+                : {
+                    ...this.currentLayoutByZone,
+                    [zoneId]: Array.isArray(message?.layout)
+                        ? (message.layout as any[]).map((item, idx) => {
+                            const bounds = this.zoneBounds[zoneId];
+                            return {
+                                id: String(item?.id || `item_${zoneId}_${idx}`),
+                                type: String(item?.type || 'desk'),
+                                x: Math.max(bounds.minX, Math.min(bounds.maxX, Number(item?.x) || bounds.minX)),
+                                y: Math.max(bounds.minY, Math.min(bounds.maxY, Number(item?.y) || bounds.minY)),
+                                label: typeof item?.label === 'string' ? item.label : undefined,
+                                zoneId
+                            };
+                        })
+                        : []
+                };
+            this.currentLayoutByZone = this.normalizeLayoutByZone(nextByZone);
+            await this.memoryStore.saveLayout(layoutName, JSON.stringify(this.currentLayoutByZone));
+            this.broadcast('layout-sync', { name: layoutName, layoutByZone: this.currentLayoutByZone, zoneId });
             this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
         });
 
@@ -868,7 +1166,7 @@ export class OfficeRoom extends Room<OfficeState> {
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
-                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: ConversationMessage) => m.from.includes('CEO'))) {
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: any) => m.from.includes('CEO'))) {
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
                                 text: `🗣️ ${decision.message}`
@@ -956,7 +1254,12 @@ export class OfficeRoom extends Room<OfficeState> {
                                 this.state.createAgent(hireId, hireName);
                                 this.broadcastRoster();
                                 const hireState = this.state.agents.get(hireId);
-                                if (hireState) { hireState.x = spawnX; hireState.y = spawnY; }
+                                if (hireState) {
+                                    hireState.x = spawnX;
+                                    hireState.y = spawnY;
+                                    hireState.zoneId = 'main';
+                                    this.clampToZone(hireState, 'main');
+                                }
 
                                 const hireAgent = new Agent({
                                     id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
@@ -1095,12 +1398,7 @@ export class OfficeRoom extends Room<OfficeState> {
         });
 
         // ─── FURNITURE INTERACTION PATHFINDING ───
-        // Office grid boundaries (agents must stay inside)
-        const BOUNDS = { minX: 2, maxX: 36, minY: 2, maxY: 36 };
-        const clamp = (agent: any) => {
-            agent.x = Math.max(BOUNDS.minX, Math.min(BOUNDS.maxX, agent.x));
-            agent.y = Math.max(BOUNDS.minY, Math.min(BOUNDS.maxY, agent.y));
-        };
+        const clamp = (agent: any) => this.clampToZone(agent);
 
         this.demoTickCount++;
         if (this.demoTickCount >= 5) {
@@ -1111,14 +1409,18 @@ export class OfficeRoom extends Room<OfficeState> {
             }
 
             this.state.agents.forEach((agent, key) => {
+                const zoneId = this.normalizeZoneId(agent.zoneId);
+                agent.zoneId = zoneId;
+                const zoneTargets = this.furnitureTargets[zoneId] || this.furnitureTargets.main;
+
                 // Default targets: agent's own desk chair
-                const deskKey = this.officeTemplate.layout.deskBindings[key] || `${key}-desk`;
-                let target = this.furnitureTargets[deskKey] || { x: 5, y: 18 };
+                const deskKey = `${key}-desk`;
+                let target = zoneTargets[deskKey] || zoneTargets['ceo-desk'] || { x: 5, y: 18 };
 
                 // During a meeting, everyone (except CEO who stays in their office
                 // but attends virtually) gathers near the meeting table.
                 if (!this.fastTrackMode && this.meetingActive && key !== 'ceo') {
-                    const table = this.furnitureTargets['meeting-table'];
+                    const table = this.furnitureTargets.main['meeting-table'];
                     // Seats around the table — spread by hashing agent id
                     const hash = Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0));
                     const seatOffsets = [
@@ -1136,6 +1438,7 @@ export class OfficeRoom extends Room<OfficeState> {
                     let minDist = Infinity;
                     this.state.agents.forEach((other, otherKey) => {
                         if (otherKey === key) return;
+                        if (this.normalizeZoneId(other.zoneId) !== zoneId) return;
                         const dist = Math.abs(agent.x - other.x) + Math.abs(agent.y - other.y);
                         if (dist < minDist) { minDist = dist; closest = { x: other.x, y: other.y + 2 }; }
                     });
@@ -2164,7 +2467,7 @@ export class OfficeRoom extends Room<OfficeState> {
             items: this.completedTasks,
             reviewFolder: 'data/workspace/completed-work'
         });
-        client.send('layout-sync', { name: 'default', layout: this.currentLayout });
+        client.send('layout-sync', { name: 'default', layoutByZone: this.currentLayoutByZone, zoneId: 'main' });
         client.send('approvals-sync', this.listApprovals());
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
