@@ -203,15 +203,53 @@ export class MemoryStore {
         }));
     }
 
-    async semanticSearch(agentId: string, query: string, topK: number = 5): Promise<MemoryEntry[]> {
+    private async loadMemoriesByRecencyImportance(agentId: string, limit: number = 20): Promise<MemoryEntry[]> {
         if (!this.db) return [];
+        const rows = await this.db.all(
+            `SELECT content, type, timestamp, importance
+             FROM memories
+             WHERE agent_id = ?
+             ORDER BY datetime(timestamp) DESC, importance DESC, created_at DESC
+             LIMIT ?`,
+            [agentId, limit]
+        );
+        return rows.map((r: any) => ({
+            content: r.content,
+            type: r.type,
+            timestamp: r.timestamp,
+            importance: r.importance
+        }));
+    }
+
+    async semanticSearch(agentId: string, query: string, topK: number = 5): Promise<MemoryEntry[]> {
+        const result = await this.semanticSearchWithFallback(agentId, query, topK);
+        return result.memories;
+    }
+
+    async semanticSearchWithFallback(
+        agentId: string,
+        query: string,
+        topK: number = 5
+    ): Promise<{ memories: MemoryEntry[]; usedSemantic: boolean }> {
+        if (!this.db) return { memories: [], usedSemantic: false };
         const queryEmbedding = await this.generateEmbedding(query);
-        if (!queryEmbedding) return this.loadMemories(agentId, topK);
+        if (!queryEmbedding) {
+            return {
+                memories: await this.loadMemoriesByRecencyImportance(agentId, topK),
+                usedSemantic: false
+            };
+        }
 
         const rows = await this.db.all(
             'SELECT content, type, timestamp, importance, embedding FROM memories WHERE agent_id = ? AND embedding IS NOT NULL',
             [agentId]
         );
+        if (!rows.length) {
+            return {
+                memories: await this.loadMemoriesByRecencyImportance(agentId, topK),
+                usedSemantic: false
+            };
+        }
 
         const scored = rows.map((r: any) => {
             const emb = JSON.parse(r.embedding);
@@ -219,12 +257,15 @@ export class MemoryStore {
             return { content: r.content, type: r.type, timestamp: r.timestamp, importance: r.importance, score };
         }).sort((a, b) => b.score - a.score);
 
-        return scored.slice(0, topK).map(s => ({
-            content: s.content,
-            type: s.type,
-            timestamp: s.timestamp,
-            importance: s.importance
-        }));
+        return {
+            memories: scored.slice(0, topK).map(s => ({
+                content: s.content,
+                type: s.type,
+                timestamp: s.timestamp,
+                importance: s.importance
+            })),
+            usedSemantic: true
+        };
     }
 
     async createTask(input: {

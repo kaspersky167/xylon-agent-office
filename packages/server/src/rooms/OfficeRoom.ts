@@ -117,7 +117,8 @@ const MAJOR_TOOLS = new Set<string>([
 
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
-    private static extensionRegistry: ExtensionRegistry = new ExtensionRegistry([]);
+    private static readonly THINK_MEMORY_TOKEN_BUDGET = 750;
+    private static readonly THINK_MEMORY_LIMIT = 10;
 
     maxClients = 100;
     private office!: Office;
@@ -230,14 +231,52 @@ export class OfficeRoom extends Room<OfficeState> {
             .filter((item): item is ChatAttachment => Boolean(item));
     }
 
-    private zoneBounds: Record<ZoneId, ZoneBounds> = {
-        main: { minX: 2, maxX: 36, minY: 2, maxY: 36 },
-        ceo_office: { minX: 28, maxX: 35, minY: 27, maxY: 33 },
-    };
+    private estimateTokens(text: string): number {
+        const normalized = String(text || '').trim();
+        if (!normalized) return 0;
+        return Math.ceil(normalized.length / 4);
+    }
 
-    // Furniture interaction points keyed by zone.
-    private furnitureTargets: Record<ZoneId, Record<string, FurnitureTarget>> = {
-        main: {
+    private buildMemoryQuery(currentTask: string | null | undefined, recentMessages: ConversationMessage[], recentMemories: any[]): string {
+        const taskPart = currentTask ? `Task: ${currentTask}` : '';
+        const messagePart = recentMessages
+            .slice(-3)
+            .map((m) => `${m.from} -> ${m.to}: ${m.content}`)
+            .join(' | ');
+        const memoryPart = recentMemories
+            .slice(-2)
+            .map((m: any) => m?.content || '')
+            .filter(Boolean)
+            .join(' | ');
+
+        return [taskPart, messagePart, memoryPart]
+            .filter(Boolean)
+            .join(' || ') || 'current priorities and recent context';
+    }
+
+    private mergeMemoriesWithBudget(primary: any[], secondary: any[], limit: number, tokenBudget: number): any[] {
+        const merged: any[] = [];
+        const seen = new Set<string>();
+        let usedTokens = 0;
+
+        const append = (entry: any) => {
+            if (!entry?.content) return;
+            const key = `${entry.type || 'memory'}::${entry.content}`;
+            if (seen.has(key)) return;
+            const entryTokens = this.estimateTokens(entry.content);
+            if (merged.length >= limit || (usedTokens + entryTokens > tokenBudget && merged.length > 0)) return;
+            merged.push(entry);
+            seen.add(key);
+            usedTokens += entryTokens;
+        };
+
+        primary.forEach(append);
+        secondary.forEach(append);
+        return merged;
+    }
+
+    // Furniture interaction points: named locations agents can walk to
+    private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
         // ─── ENGINEERING POD (pod of 4, left side) ───
         // Pair: Frontend + Backend / Pair: DevOps + Security
         'frontend-desk':    { x: 5,  y: 10, type: 'desk' },
@@ -1108,14 +1147,42 @@ Paired buddy: Sales Outreach.`,
                     }
                 });
 
-                coreAgent.think({
-                    time: this.state.officeTime,
-                    location: `${agentState.x},${agentState.y}`,
-                    nearbyAgents,
-                    currentTask: coreAgent.currentTask || null,
-                    recentMessages: coreAgent.getUnreadMessages(),
-                    memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision: any) => {
+                (async () => {
+                    const unreadMessages = coreAgent.getUnreadMessages();
+                    const recentMemories = coreAgent.getRecentMemories(6);
+                    const memoryQuery = this.buildMemoryQuery(coreAgent.currentTask, unreadMessages, recentMemories);
+
+                    let recalledMemories: any[] = [];
+                    let usedSemanticRecall = false;
+                    try {
+                        const recall = await this.memoryStore.semanticSearchWithFallback(id, memoryQuery, 8);
+                        recalledMemories = recall.memories;
+                        usedSemanticRecall = recall.usedSemantic;
+                    } catch {
+                        recalledMemories = [];
+                        usedSemanticRecall = false;
+                    }
+
+                    const thinkMemories = this.mergeMemoriesWithBudget(
+                        recalledMemories,
+                        recentMemories,
+                        OfficeRoom.THINK_MEMORY_LIMIT,
+                        OfficeRoom.THINK_MEMORY_TOKEN_BUDGET
+                    );
+
+                    console.log(
+                        `[ThinkTelemetry] agent=${id} semanticRecallUsed=${usedSemanticRecall} queryLength=${memoryQuery.length} memoryCount=${thinkMemories.length}`
+                    );
+
+                    return coreAgent.think({
+                        time: this.state.officeTime,
+                        location: `${agentState.x},${agentState.y}`,
+                        nearbyAgents,
+                        currentTask: coreAgent.currentTask || null,
+                        recentMessages: unreadMessages,
+                        memories: thinkMemories
+                    });
+                })().then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
@@ -1166,7 +1233,7 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
-                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: any) => m.from.includes('CEO'))) {
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: ConversationMessage) => m.from.includes('CEO'))) {
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
                                 text: `🗣️ ${decision.message}`
