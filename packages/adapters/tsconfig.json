@@ -3,7 +3,13 @@
     "compilerOptions": {
         "outDir": "./dist",
         "rootDir": "./src",
-        "composite": true
+        "composite": true,
+        "baseUrl": ".",
+        "paths": {
+            "@agent-office/core": [
+                "../core/src"
+            ]
+        }
     },
     "references": [
         {
