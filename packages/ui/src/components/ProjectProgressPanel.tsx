@@ -6,7 +6,7 @@ interface TaskItem {
     id: number | string;
     title: string;
     assigned_to?: string;
-    status: string;
+    status: 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
     progress?: number;
 }
 
@@ -70,7 +70,7 @@ export function ProjectProgressPanel() {
                     id: Date.now(),
                     title: data.task,
                     assigned_to: data.agentId,
-                    status: data.status || 'pending',
+                    status: data.status || 'backlog',
                     progress: typeof data.progress === 'number' ? data.progress : undefined
                 }];
             });
@@ -83,7 +83,7 @@ export function ProjectProgressPanel() {
                 id: task.id,
                 title: task.title,
                 assigned_to: task.assigned_to || '',
-                status: task.status || 'pending',
+                status: task.status || 'backlog',
                 progress: typeof task.progress === 'number' ? task.progress : undefined
             })));
         };
@@ -131,9 +131,9 @@ export function ProjectProgressPanel() {
 
     const metrics = useMemo<ProjectMetrics>(() => {
         const total = tasks.length;
-        const completed = tasks.filter((task) => task.status === 'completed').length;
+        const completed = tasks.filter((task) => task.status === 'done').length;
         const inProgress = tasks.filter((task) => task.status === 'in_progress').length;
-        const pending = tasks.filter((task) => task.status !== 'completed' && task.status !== 'in_progress').length;
+        const pending = tasks.filter((task) => task.status === 'backlog').length;
         return { total, completed, inProgress, pending };
     }, [tasks]);
 

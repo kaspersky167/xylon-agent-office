@@ -3,9 +3,10 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus, TaskPriority, TaskStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { ExtensionRegistry } from '../extensions/registry';
 
 interface HighlightEvent {
     type: string;
@@ -32,6 +33,28 @@ interface CompletedTaskRecord {
     completedAt: string;
     summaryPath: string;
 }
+
+interface TaskRecord {
+    id: string;
+    title: string;
+    assigned_to?: string | null;
+    status: TaskStatus;
+    priority: TaskPriority;
+    requires_approval: number;
+    created_by: string;
+    created_at: string;
+    updated_at: string;
+    status_reason?: string | null;
+    completed_at?: string | null;
+}
+
+const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+    backlog: ['in_progress'],
+    in_progress: ['blocked', 'review'],
+    blocked: ['in_progress'],
+    review: ['done', 'in_progress'],
+    done: []
+};
 
 interface ApprovalRequest {
     id: string;
@@ -76,6 +99,11 @@ interface ChatAttachment {
     createdAt: string;
 }
 
+type ZoneId = 'main' | 'ceo_office';
+type ZoneBounds = { minX: number; maxX: number; minY: number; maxY: number };
+type LayoutItem = { id: string; type: string; x: number; y: number; label?: string; zoneId: ZoneId };
+type FurnitureTarget = { x: number; y: number; type: string };
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -106,11 +134,12 @@ export class OfficeRoom extends Room<OfficeState> {
     private memoryStore = new MemoryStore();
     private sessionId = `session_${Date.now()}`;
     private currentScenario = 'Free Play';
+    private officeTemplate: OfficeTemplate = getOfficeTemplate('default');
     private highlights: HighlightEvent[] = [];
     private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
     private relationships: Map<string, RelationshipEdge> = new Map();
     private audienceVotes: Record<string, number> = {};
-    private currentLayout: any[] = [];
+    private currentLayoutByZone: Record<ZoneId, LayoutItem[]> = { main: [], ceo_office: [] };
     private approvals: Map<string, ApprovalRequest> = new Map();
     private meetingActive = false;
     private meetingEndsAt = 0;
@@ -119,6 +148,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
+    private extensionRegistry = OfficeRoom.extensionRegistry;
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -267,11 +297,6 @@ export class OfficeRoom extends Room<OfficeState> {
         'proposal-desk':    { x: 32, y: 10, type: 'desk' },
 
         // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
-        'ceo-desk':         { x: 32, y: 30, type: 'desk' },
-        'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
-        'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
-        'ceo-office-door':  { x: 28, y: 30, type: 'door' },
-
         // ─── SHARED FURNITURE ───
         'meeting-table':  { x: 20, y: 22, type: 'table' },
         'coffee-machine': { x: 5,  y: 30, type: 'appliance' },
@@ -285,10 +310,67 @@ export class OfficeRoom extends Room<OfficeState> {
         'hire_2-desk': { x: 25, y: 18, type: 'desk' },
         'hire_3-desk': { x: 25, y: 8,  type: 'desk' },
         'hire_4-desk': { x: 32, y: 18, type: 'desk' },
+        },
+        ceo_office: {
+            'ceo-desk':         { x: 32, y: 30, type: 'desk' },
+            'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
+            'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
+            'ceo-office-door':  { x: 28, y: 30, type: 'door' },
+        }
     };
 
     static getActiveRoom(): OfficeRoom | null {
         return OfficeRoom.activeRoom;
+    }
+
+    private normalizeZoneId(zoneId: unknown): ZoneId {
+        return zoneId === 'ceo_office' ? 'ceo_office' : 'main';
+    }
+
+    private clampToZone(agent: { x: number; y: number; zoneId?: string }, zoneId?: ZoneId) {
+        const resolvedZone = zoneId || this.normalizeZoneId(agent.zoneId);
+        const bounds = this.zoneBounds[resolvedZone];
+        agent.x = Math.max(bounds.minX, Math.min(bounds.maxX, agent.x));
+        agent.y = Math.max(bounds.minY, Math.min(bounds.maxY, agent.y));
+        agent.zoneId = resolvedZone;
+    }
+
+    private normalizeLayoutByZone(raw: unknown): Record<ZoneId, LayoutItem[]> {
+        const empty: Record<ZoneId, LayoutItem[]> = { main: [], ceo_office: [] };
+        if (Array.isArray(raw)) {
+            return {
+                main: raw.map((item, idx) => {
+                    const src = (item && typeof item === 'object') ? item as Record<string, unknown> : {};
+                    return {
+                        id: String(src.id || `item_main_${idx}`),
+                        type: String(src.type || 'desk'),
+                        x: Math.max(2, Math.min(36, Number(src.x) || 2)),
+                        y: Math.max(2, Math.min(36, Number(src.y) || 2)),
+                        label: typeof src.label === 'string' ? src.label : undefined,
+                        zoneId: 'main' as ZoneId
+                    };
+                }),
+                ceo_office: []
+            };
+        }
+        if (!raw || typeof raw !== 'object') return empty;
+        const root = raw as Record<string, unknown>;
+        const toItems = (zone: ZoneId) => {
+            const source = root[zone];
+            if (!Array.isArray(source)) return [] as LayoutItem[];
+            return source.map((item, idx) => {
+                const src = (item && typeof item === 'object') ? item as Record<string, unknown> : {};
+                return {
+                    id: String(src.id || `item_${zone}_${idx}`),
+                    type: String(src.type || 'desk'),
+                    x: Math.max(2, Math.min(36, Number(src.x) || 2)),
+                    y: Math.max(2, Math.min(36, Number(src.y) || 2)),
+                    label: typeof src.label === 'string' ? src.label : undefined,
+                    zoneId: zone
+                };
+            });
+        };
+        return { main: toItems('main'), ceo_office: toItems('ceo_office') };
     }
 
     private configureInferenceProvider() {
@@ -319,12 +401,16 @@ export class OfficeRoom extends Room<OfficeState> {
         const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
         await this.memoryStore.initialize(dbPath);
 
+        const requestedTemplateId = String(options?.template || options?.templateId || '').trim();
+        this.officeTemplate = getOfficeTemplate(requestedTemplateId || 'default');
+        this.furnitureTargets = { ...this.officeTemplate.layout.furnitureTargets };
+
         const config: OfficeConfig = {
-            name: options.name || 'Startup HQ',
-            grid: { width: 40, height: 40, tileSize: 16 },
+            name: options.name || this.officeTemplate.organization.name || 'Startup HQ',
+            grid: this.officeTemplate.layout.grid,
             rooms: [],
             furniture: [],
-            spawnPoints: [{ x: 10, y: 10 }],
+            spawnPoints: this.officeTemplate.layout.spawnPoints,
             zones: []
         };
         this.office = new Office(config);
@@ -339,6 +425,7 @@ export class OfficeRoom extends Room<OfficeState> {
             role: string,
             x: number,
             y: number,
+            zoneId: ZoneId,
             systemPrompt: string,
             personality: {
                 traits: Traits;
@@ -348,11 +435,20 @@ export class OfficeRoom extends Room<OfficeState> {
             model: string = this.defaultModel
         ) => {
             this.state.createAgent(id, name);
+            this.broadcastRoster();
             const state = this.state.agents.get(id);
-            if (state) { state.x = x; state.y = y; }
+            if (state) {
+                state.x = x;
+                state.y = y;
+                state.zoneId = zoneId;
+                this.clampToZone(state, zoneId);
+            }
 
             const coreAgent = new Agent({
-                id, name, role, avatar: 'sprite.png',
+                id,
+                name,
+                role,
+                avatar: 'sprite.png',
                 inference: {
                     provider: this.inferenceProvider,
                     model,
@@ -371,7 +467,6 @@ export class OfficeRoom extends Room<OfficeState> {
             coreAgent.setInferenceAdapter(this.inferenceAdapter);
             await coreAgent.initialize();
 
-            // Load persistent memories from previous sessions
             const previousMemories = await this.memoryStore.loadMemories(id, 20);
             const agencyMemories = await this.memoryStore.loadMemories('agency:global', 20);
             const mergedMemories = [...previousMemories, ...agencyMemories].slice(-50);
@@ -446,28 +541,28 @@ export class OfficeRoom extends Room<OfficeState> {
         // ─── XYLON DEVS TEAM (10 CORE AGENTS) ───
         // Engineering pod — Frontend + Backend (pair), DevOps + Security (pair)
         await setupCoreAgent(
-            'frontend', 'Frontend Dev', 'Frontend Developer', 5, 10,
+            'frontend', 'Frontend Dev', 'Frontend Developer', 5, 10, 'main',
             `${COLLAB} Your focus: modern UI, UX clarity, conversion, and front-end implementation. Paired buddy: Backend Architect — sync with them before API shape changes.`,
             { traits: { openness: 0.9, conscientiousness: 0.8, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'creative' },
             BUILDER
         );
 
         await setupCoreAgent(
-            'backend', 'Backend Architect', 'Backend Architect', 8, 10,
+            'backend', 'Backend Architect', 'Backend Architect', 8, 10, 'main',
             `${COLLAB} Your focus: APIs, architecture, integrations, maintainability. Paired buddy: Frontend Dev — confirm contracts with them. Pull in DevOps for anything deploy-shaped.`,
             { traits: { openness: 0.8, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.6, neuroticism: 0.1 }, communicationStyle: 'technical' },
             BUILDER
         );
 
         await setupCoreAgent(
-            'devops', 'DevOps Automator', 'DevOps Automator', 5, 14,
+            'devops', 'DevOps Automator', 'DevOps Automator', 5, 14, 'main',
             `${COLLAB} Your focus: deployment, Docker, scripts, infra safety, repeatable automation. Paired buddy: Security Engineer — always review risky infra with them. Deploys are MAJOR and need CEO approval.`,
             { traits: { openness: 0.8, conscientiousness: 0.95, extraversion: 0.5, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'technical' },
             BUILDER
         );
 
         await setupCoreAgent(
-            'security', 'Security Eng', 'Security Engineer', 8, 14,
+            'security', 'Security Eng', 'Security Engineer', 8, 14, 'main',
             `${COLLAB} Your focus: security reviews, secrets, auth, dependencies, hardening.
 You are ALSO Xylon's enterprise AI governance specialist. You advise clients on deploying AI tools (Microsoft Copilot, ChatGPT Enterprise, Gemini for Workspace, custom RAG) safely inside large organisations. Core expertise:
  - Oversharing prevention: SharePoint/OneDrive permission hygiene, sensitivity labels, DLP policies, Purview restricted SharePoint search, Copilot semantic index scoping, tenant-wide "just-in-time" access reviews.
@@ -483,28 +578,28 @@ Paired buddy: DevOps Automator. Flag issues early and recommend concrete fixes.`
 
         // Ops / Strategy pod — Shepherd + Reality (pair), Evidence + SEO (pair)
         await setupCoreAgent(
-            'shepherd', 'Project Shepherd', 'Project Shepherd', 17, 10,
+            'shepherd', 'Project Shepherd', 'Project Shepherd', 17, 10, 'main',
             `${COLLAB} Your focus: planning, routing, coordination, keeping work moving. Paired buddy: Reality Checker — pressure-test plans with them. Major reprioritization needs CEO approval.`,
             { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.8, agreeableness: 0.8, neuroticism: 0.15 }, communicationStyle: 'formal' },
             COORDINATOR
         );
 
         await setupCoreAgent(
-            'reality', 'Reality Checker', 'Reality Checker', 20, 10,
+            'reality', 'Reality Checker', 'Reality Checker', 20, 10, 'main',
             `${COLLAB} Your focus: challenge weak ideas, highlight risks, ask "is this really ready?". Paired buddy: Project Shepherd. Be direct but constructive.`,
             { traits: { openness: 0.8, conscientiousness: 0.9, extraversion: 0.6, agreeableness: 0.4, neuroticism: 0.25 }, communicationStyle: 'technical' },
             READ_ONLY
         );
 
         await setupCoreAgent(
-            'evidence', 'Evidence Collector', 'Evidence Collector', 17, 14,
+            'evidence', 'Evidence Collector', 'Evidence Collector', 17, 14, 'main',
             `${COLLAB} Your focus: proof, validation, screenshots, logs, QA evidence. Paired buddy: SEO Specialist — share validation evidence with them for page launches.`,
             { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
             READ_ONLY
         );
 
         await setupCoreAgent(
-            'seo', 'SEO Specialist', 'SEO Specialist', 20, 14,
+            'seo', 'SEO Specialist', 'SEO Specialist', 20, 14, 'main',
             `${COLLAB} Your focus: search visibility, service pages, keyword targeting, metadata. Paired buddy: Evidence Collector. Publishing new pages is MAJOR — request CEO approval.`,
             { traits: { openness: 0.85, conscientiousness: 0.85, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
             [
@@ -518,7 +613,7 @@ Paired buddy: DevOps Automator. Flag issues early and recommend concrete fixes.`
 
         // Growth pod — Sales + Proposal (pair)
         await setupCoreAgent(
-            'sales', 'Sales Outreach', 'Sales Outreach', 29, 10,
+            'sales', 'Sales Outreach', 'Sales Outreach', 29, 10, 'main',
             `${COLLAB} Your focus: outbound messaging, lead gen, prospect qualification for Shopify, Microsoft 365, and cybersecurity clients (AU).
 You know how to PITCH Xylon Devs: lead with the client's pain (oversharing risk, slow deploys, low conversion), then 1–2 proof points, then a clear next step (15-min discovery call). Keep cold emails under 120 words, 1 CTA, plain-text, no buzzwords. For LinkedIn opens: personalise line 1, relevance line 2, ask line 3.
 Qualify with BANT or MEDDIC-lite (Budget, Authority, Need, Timeline). Don't send proposals — hand qualified leads to Proposal Strategist with a one-paragraph brief.
@@ -533,7 +628,7 @@ Paired buddy: Proposal Strategist.`,
         );
 
         await setupCoreAgent(
-            'proposal', 'Proposal Strategist', 'Proposal Strategist', 32, 10,
+            'proposal', 'Proposal Strategist', 'Proposal Strategist', 32, 10, 'main',
             `${COLLAB} Your focus: scope shaping, proposals, packaging, pricing structure drafts.
 You are Xylon's SOW + pitch deck expert. A Statement of Work MUST contain: 1) Background & objectives, 2) In-scope deliverables (itemised), 3) Explicit out-of-scope list, 4) Assumptions & dependencies, 5) Acceptance criteria, 6) Timeline / milestones, 7) Commercials (fixed-fee, T&M, or retainer — state clearly), 8) Change-request process, 9) IP & confidentiality, 10) Payment terms + signature block.
 For pitches: problem → why-now → Xylon's approach → proof (case study / metric) → pricing options (Good / Better / Best, 3 tiers) → next step. Never quote final pricing without CEO approval.
@@ -550,7 +645,7 @@ Paired buddy: Sales Outreach.`,
 
         // CEO — private office, strategic oversight, final approver
         await setupCoreAgent(
-            'ceo', 'Faz (CEO)', 'CEO', 32, 30,
+            'ceo', 'Faz (CEO)', 'CEO', 32, 30, 'ceo_office',
             `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Enforce evidence quality: for volatile topics (news, pricing, specs, policies, releases, outages), require recent sources, require source URLs in findings, and reject stale cached assumptions. Be concise and direct.`,
             { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
             COORDINATOR,
@@ -559,7 +654,7 @@ Paired buddy: Sales Outreach.`,
 
         this.rebuildRelationshipGraph();
         const savedLayout = await this.memoryStore.loadLayout('default');
-        this.currentLayout = Array.isArray(savedLayout) ? savedLayout : [];
+        this.currentLayoutByZone = this.normalizeLayoutByZone(savedLayout);
 
         // Restore any approval requests that didn't get resolved before a restart
         try {
@@ -646,37 +741,98 @@ Paired buddy: Sales Outreach.`,
         });
 
         // UI-driven task assignment
-        this.onMessage('assign-task', (client, message) => {
+        this.onMessage('assign-task', async (client, message) => {
             const { title, agentId } = message;
             console.log(`[TaskBoard] Assigning "${title}" to ${agentId || 'auto'}`);
 
             // Pick agent: explicit or auto-assign to least busy
-            const targetId = agentId || this.autoAssignAgent();
+            const targetId = agentId && this.state.agents.has(agentId) ? agentId : this.autoAssignAgent();
             const agent = this.coreAgents.get(targetId);
             const agentState = this.state.agents.get(targetId);
+            const cleanedTitle = String(title || '').trim();
 
-            if (agent && agentState) {
-                agent.currentTask = title;
-                agentState.currentTask = title;
+            if (agent && agentState && cleanedTitle) {
+                agent.currentTask = cleanedTitle;
+                agentState.currentTask = cleanedTitle;
                 agentState.action = 'work';
 
                 // Persist task
-                this.memoryStore.createTask(title, targetId);
+                const priority = this.resolvePriority(message?.priority);
+                const requiresApproval = Boolean(message?.requiresApproval);
+                const createdBy = String(message?.createdBy || client.sessionId || 'ceo');
+                const taskId = await this.memoryStore.createTask({
+                    title: cleanedTitle,
+                    assignedTo: targetId,
+                    createdBy,
+                    priority,
+                    requiresApproval,
+                    status: 'in_progress'
+                });
 
                 this.broadcast('chat', {
                     sender: 'System',
-                    text: `📋 Task "${title}" assigned to ${agentState.name}`
+                    text: `📋 Task "${cleanedTitle}" assigned to ${agentState.name}`
                 });
 
                 this.broadcast('task-update', {
+                    id: taskId,
                     agentId: targetId,
                     agentName: agentState.name,
-                    task: title,
+                    task: cleanedTitle,
                     status: 'in_progress',
+                    priority,
+                    requiresApproval,
                     fastTrackMode: this.fastTrackMode
                 });
                 this.seedTaskProgress(targetId, title);
+                this.extensionRegistry.onTaskCreated({
+                    title,
+                    assigneeId: targetId,
+                    assigneeName: agentState.name,
+                    createdById: 'system-ui',
+                    createdByName: 'System',
+                    source: 'ui',
+                }).catch((error) => console.error('[Extensions] onTaskCreated failed', error));
             }
+        });
+
+        this.onMessage('task-transition', async (client, message) => {
+            const taskId = String(message?.id || '').trim();
+            const nextStatus = String(message?.status || '').trim().toLowerCase() as TaskStatus;
+            const reason = String(message?.statusReason || '').trim();
+            const validStatuses: TaskStatus[] = ['backlog', 'in_progress', 'blocked', 'review', 'done'];
+            if (!taskId || !validStatuses.includes(nextStatus)) {
+                return;
+            }
+
+            const task = await this.memoryStore.getTask(taskId) as TaskRecord | null;
+            if (!task) {
+                client.send('task-transition-error', { id: taskId, error: 'task not found' });
+                return;
+            }
+            const currentStatus = String(task.status || 'backlog') as TaskStatus;
+            if (!this.canTransitionTask(currentStatus, nextStatus)) {
+                client.send('task-transition-error', {
+                    id: taskId,
+                    error: `invalid transition ${currentStatus} -> ${nextStatus}`
+                });
+                return;
+            }
+
+            await this.memoryStore.updateTaskStatus(taskId, nextStatus, reason || null);
+            const agentState = task.assigned_to ? this.state.agents.get(task.assigned_to) : null;
+            this.broadcast('task-update', {
+                id: taskId,
+                agentId: task.assigned_to || '',
+                agentName: agentState?.name || task.assigned_to || 'Unassigned',
+                task: task.title,
+                status: nextStatus,
+                statusReason: reason || null,
+                priority: task.priority,
+                requiresApproval: Boolean(task.requires_approval),
+                progress: nextStatus === 'done' ? 1 : undefined,
+                fastTrackMode: this.fastTrackMode
+            });
         });
 
         this.onMessage('set-fast-track', (_client, message) => {
@@ -926,10 +1082,29 @@ Paired buddy: Sales Outreach.`,
         // Save office layout from editor
         this.onMessage('save-layout', async (client, message) => {
             const layoutName = message.name || 'default';
-            const layout = Array.isArray(message.layout) ? message.layout : [];
-            await this.memoryStore.saveLayout(layoutName, JSON.stringify(layout));
-            this.currentLayout = layout;
-            this.broadcast('layout-sync', { name: layoutName, layout: this.currentLayout });
+            const providedByZone = message?.layoutByZone;
+            const zoneId = this.normalizeZoneId(message?.zoneId);
+            const nextByZone = providedByZone && typeof providedByZone === 'object'
+                ? this.normalizeLayoutByZone(providedByZone)
+                : {
+                    ...this.currentLayoutByZone,
+                    [zoneId]: Array.isArray(message?.layout)
+                        ? (message.layout as any[]).map((item, idx) => {
+                            const bounds = this.zoneBounds[zoneId];
+                            return {
+                                id: String(item?.id || `item_${zoneId}_${idx}`),
+                                type: String(item?.type || 'desk'),
+                                x: Math.max(bounds.minX, Math.min(bounds.maxX, Number(item?.x) || bounds.minX)),
+                                y: Math.max(bounds.minY, Math.min(bounds.maxY, Number(item?.y) || bounds.minY)),
+                                label: typeof item?.label === 'string' ? item.label : undefined,
+                                zoneId
+                            };
+                        })
+                        : []
+                };
+            this.currentLayoutByZone = this.normalizeLayoutByZone(nextByZone);
+            await this.memoryStore.saveLayout(layoutName, JSON.stringify(this.currentLayoutByZone));
+            this.broadcast('layout-sync', { name: layoutName, layoutByZone: this.currentLayoutByZone, zoneId });
             this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
         });
 
@@ -1086,13 +1261,19 @@ Paired buddy: Sales Outreach.`,
                             if (targetAgent && targetState) {
                                 targetAgent.currentTask = title;
                                 targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
+                                const taskId = await this.memoryStore.createTask({
+                                    title,
+                                    assignedTo: targetId,
+                                    createdBy: id,
+                                    status: 'in_progress'
+                                });
 
                                 this.broadcast('chat', {
                                     sender: coreAgent.config.name,
                                     text: `📋 Created task "${title}" for ${targetAgent.config.name}`
                                 });
                                 this.broadcast('task-update', {
+                                    id: taskId,
                                     agentId: targetId,
                                     agentName: targetAgent.config.name,
                                     task: title,
@@ -1100,6 +1281,14 @@ Paired buddy: Sales Outreach.`,
                                     fastTrackMode: this.fastTrackMode
                                 });
                                 this.seedTaskProgress(targetId, title);
+                                await this.extensionRegistry.onTaskCreated({
+                                    title,
+                                    assigneeId: targetId,
+                                    assigneeName: targetAgent.config.name,
+                                    createdById: id,
+                                    createdByName: coreAgent.config.name,
+                                    source: 'tool',
+                                });
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1130,8 +1319,14 @@ Paired buddy: Sales Outreach.`,
                                 const spawnY = 2;
 
                                 this.state.createAgent(hireId, hireName);
+                                this.broadcastRoster();
                                 const hireState = this.state.agents.get(hireId);
-                                if (hireState) { hireState.x = spawnX; hireState.y = spawnY; }
+                                if (hireState) {
+                                    hireState.x = spawnX;
+                                    hireState.y = spawnY;
+                                    hireState.zoneId = 'main';
+                                    this.clampToZone(hireState, 'main');
+                                }
 
                                 const hireAgent = new Agent({
                                     id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
@@ -1187,57 +1382,67 @@ Paired buddy: Sales Outreach.`,
                                     text: `⚠️ ${coreAgent.config.name} tried to hire but the office is full! (Max 7 agents)`
                                 });
                             }
-                        } else if (id !== 'ceo' && this.isMajorToolCall(decision.toolCall.name, decision.toolCall.params)) {
-                            // ─── MAJOR ACTION → CEO APPROVAL GATE ───
-                            this.createApproval({
-                                requestedBy: id,
-                                requestedByName: coreAgent.config.name,
-                                requestedAction: `${decision.toolCall.name}`,
-                                rationale: decision.thought || 'No rationale provided — please supply more context.',
-                                isMajor: true,
-                                pending: { toolName: decision.toolCall.name, params: decision.toolCall.params },
-                            });
                         } else {
-                            const result = await this.toolExecutor.execute(
-                                decision.toolCall.name,
-                                decision.toolCall.params
-                            );
-
-                            this.broadcast('chat', {
-                                sender: coreAgent.config.name,
-                                text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                            const beforeToolCall = await this.extensionRegistry.beforeToolCall({
+                                agentId: id,
+                                agentName: coreAgent.config.name,
+                                toolName: decision.toolCall.name,
+                                params: decision.toolCall.params,
+                                thought: decision.thought,
+                                requestApproval: (input) => this.createApproval(input),
+                                isMajorToolCall: (name, params) => this.isMajorToolCall(name, params),
                             });
-                            this.emitHighlight(
-                                'tool',
-                                `${coreAgent.config.name} used ${decision.toolCall.name}`,
-                                (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
-                                id
-                            );
-
-                            coreAgent.addMemory({
-                                content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            });
-                            await this.memoryStore.saveMemory('agency:global', {
-                                content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            }, this.sessionId);
-
-                            if (
-                                decision.toolCall.name === 'write_file' &&
-                                String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
-                            ) {
-                                await this.queueFileReviewApproval({
-                                    sharedByAgentId: id,
-                                    sharedByAgentName: coreAgent.config.name,
-                                    filePath: String(decision.toolCall.params?.path || ''),
-                                    summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
-                                    fileId: decision.toolCall.params?.fileId,
+                            if (!beforeToolCall.handled) {
+                                const result = await this.toolExecutor.execute(
+                                    decision.toolCall.name,
+                                    decision.toolCall.params
+                                );
+                                await this.extensionRegistry.afterToolCall({
+                                    agentId: id,
+                                    agentName: coreAgent.config.name,
+                                    toolName: decision.toolCall.name,
+                                    params: decision.toolCall.params,
+                                    success: result.success,
+                                    output: result.output,
+                                    error: result.error,
                                 });
+
+                                this.broadcast('chat', {
+                                    sender: coreAgent.config.name,
+                                    text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                                });
+                                this.emitHighlight(
+                                    'tool',
+                                    `${coreAgent.config.name} used ${decision.toolCall.name}`,
+                                    (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
+                                    id
+                                );
+
+                                coreAgent.addMemory({
+                                    content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                });
+                                await this.memoryStore.saveMemory('agency:global', {
+                                    content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                }, this.sessionId);
+
+                                if (
+                                    decision.toolCall.name === 'write_file' &&
+                                    String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
+                                ) {
+                                    await this.queueFileReviewApproval({
+                                        sharedByAgentId: id,
+                                        sharedByAgentName: coreAgent.config.name,
+                                        filePath: String(decision.toolCall.params?.path || ''),
+                                        summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
+                                        fileId: decision.toolCall.params?.fileId,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1260,12 +1465,7 @@ Paired buddy: Sales Outreach.`,
         });
 
         // ─── FURNITURE INTERACTION PATHFINDING ───
-        // Office grid boundaries (agents must stay inside)
-        const BOUNDS = { minX: 2, maxX: 36, minY: 2, maxY: 36 };
-        const clamp = (agent: any) => {
-            agent.x = Math.max(BOUNDS.minX, Math.min(BOUNDS.maxX, agent.x));
-            agent.y = Math.max(BOUNDS.minY, Math.min(BOUNDS.maxY, agent.y));
-        };
+        const clamp = (agent: any) => this.clampToZone(agent);
 
         this.demoTickCount++;
         if (this.demoTickCount >= 5) {
@@ -1276,14 +1476,18 @@ Paired buddy: Sales Outreach.`,
             }
 
             this.state.agents.forEach((agent, key) => {
+                const zoneId = this.normalizeZoneId(agent.zoneId);
+                agent.zoneId = zoneId;
+                const zoneTargets = this.furnitureTargets[zoneId] || this.furnitureTargets.main;
+
                 // Default targets: agent's own desk chair
                 const deskKey = `${key}-desk`;
-                let target = this.furnitureTargets[deskKey] || { x: 5, y: 18 };
+                let target = zoneTargets[deskKey] || zoneTargets['ceo-desk'] || { x: 5, y: 18 };
 
                 // During a meeting, everyone (except CEO who stays in their office
                 // but attends virtually) gathers near the meeting table.
                 if (!this.fastTrackMode && this.meetingActive && key !== 'ceo') {
-                    const table = this.furnitureTargets['meeting-table'];
+                    const table = this.furnitureTargets.main['meeting-table'];
                     // Seats around the table — spread by hashing agent id
                     const hash = Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0));
                     const seatOffsets = [
@@ -1301,6 +1505,7 @@ Paired buddy: Sales Outreach.`,
                     let minDist = Infinity;
                     this.state.agents.forEach((other, otherKey) => {
                         if (otherKey === key) return;
+                        if (this.normalizeZoneId(other.zoneId) !== zoneId) return;
                         const dist = Math.abs(agent.x - other.x) + Math.abs(agent.y - other.y);
                         if (dist < minDist) { minDist = dist; closest = { x: other.x, y: other.y + 2 }; }
                     });
@@ -1433,13 +1638,19 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95
             });
-            this.memoryStore.createTask(task, agentId).catch(() => {});
+            this.memoryStore.createTask({
+                title: task,
+                assignedTo: agentId,
+                createdBy: 'ceo',
+                priority: 'high',
+                status: 'in_progress'
+            }).catch(() => {});
             this.broadcast('chat', {
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
             });
             this.broadcast('task-update', {
-                agentId, agentName: agent.config.name, task, status: 'in_progress'
+                agentId, agentName: agent.config.name, task, status: 'in_progress', priority: 'high'
             });
             this.seedTaskProgress(agentId, task);
             return true;
@@ -1473,6 +1684,29 @@ Paired buddy: Sales Outreach.`,
         return `${agentId}:${taskTitle}`;
     }
 
+    private getLiveRoster() {
+        return Array.from(this.state.agents.entries()).map(([id, agent]) => ({
+            id,
+            name: agent.name
+        }));
+    }
+
+    private broadcastRoster() {
+        this.broadcast('agent-roster-sync', this.getLiveRoster());
+    }
+
+    private resolvePriority(value: unknown): TaskPriority {
+        const normalized = String(value || '').toLowerCase();
+        if (normalized === 'low' || normalized === 'medium' || normalized === 'high' || normalized === 'critical') {
+            return normalized;
+        }
+        return 'medium';
+    }
+
+    private canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {
+        return TASK_TRANSITIONS[from]?.includes(to) ?? false;
+    }
+
     private seedTaskProgress(agentId: string, taskTitle: string) {
         if (!taskTitle) return;
         this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
@@ -1503,7 +1737,7 @@ Paired buddy: Sales Outreach.`,
             agentId,
             agentName: agent.config.name,
             task: taskTitle,
-            status: next >= 1 ? 'completed' : 'in_progress',
+            status: next >= 1 ? 'done' : 'in_progress',
             progress: next,
             fastTrackMode: this.fastTrackMode
         });
@@ -1516,8 +1750,8 @@ Paired buddy: Sales Outreach.`,
 
         try {
             const tasks = await this.memoryStore.getTasks();
-            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
-            if (match?.id) await this.memoryStore.completeTask(match.id);
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'done');
+            if (match?.id) await this.memoryStore.updateTaskStatus(String(match.id), 'done');
         } catch {
             // Best-effort persistence only; task completion is still reflected in broadcast updates.
         }
@@ -1737,6 +1971,16 @@ Paired buddy: Sales Outreach.`,
         });
         this.broadcast('approvals-sync', this.listApprovals());
         this.emitHighlight('approval', `Approval requested: ${req.requestedAction}`, req.rationale.slice(0, 120), req.requestedBy);
+        this.extensionRegistry.onApprovalRequested({
+            id: req.id,
+            requestedBy: req.requestedBy,
+            requestedByName: req.requestedByName,
+            requestedAction: req.requestedAction,
+            rationale: req.rationale,
+            isMajor: req.isMajor,
+            status: req.status,
+            createdAt: req.createdAt,
+        }).catch((error) => console.error('[Extensions] onApprovalRequested failed', error));
 
         // CEO auto-triage: if the rationale is obviously weak, auto-reject with
         // a "please provide rationale" note so the queue doesn't flood.
@@ -1977,6 +2221,11 @@ Paired buddy: Sales Outreach.`,
     }
 
     private applyScenarioKickoff(scenarioName: string) {
+        this.extensionRegistry.onScenarioStart({
+            scenario: scenarioName,
+            startedAt: this.state.officeTime,
+        }).catch((error) => console.error('[Extensions] onScenarioStart failed', error));
+
         this.broadcast('scenario-event', {
             type: 'scenario-started',
             scenario: scenarioName,
@@ -2007,100 +2256,24 @@ Paired buddy: Sales Outreach.`,
             }
         });
 
-        // Structured project scenarios that actually route work across the whole agency
+        // Structured project scenarios loaded from template scripts.
         const normalized = scenarioName.toLowerCase();
-        if (normalized.includes('xylon growth sprint') || normalized.includes('acme')) {
-            this.kickoffXylonGrowthSprint();
+        const script = Object.values(this.officeTemplate.scenarios.scripts).find((candidate) =>
+            candidate.aliases.some((alias) => normalized.includes(alias.toLowerCase()))
+        );
+        if (script) {
+            this.kickoffScenario(script);
         }
     }
 
-    // ─── REAL-WORLD PROJECT: XYLON GROWTH SPRINT (ACME MANUFACTURING) ───
-    //
-    // This scenario forces the whole agency to collaborate. The CEO is the gate
-    // on pricing and launch. Each agent gets a specific brief that references
-    // the others', so they must consult their paired buddy and cross-pod peers.
-    //
-    // Real business value mirror: Xylon Devs sells exactly this — a Microsoft 365
-    // Copilot rollout with oversharing remediation, a landing page to capture
-    // the lead, and a Statement of Work. Running this scenario exercises the
-    // exact muscles the real company uses to win work.
-    private kickoffXylonGrowthSprint() {
-        const project = 'ACME Manufacturing — M365 Copilot rollout + oversharing remediation + landing page + SOW';
-        const brief = [
-            `NEW PROJECT: ${project}.`,
-            `Client: ACME Manufacturing (fictional mid-market AU manufacturer, ~800 staff, Microsoft 365 E3).`,
-            `Client pain: wants to roll out Microsoft 365 Copilot but worried about oversharing across SharePoint/OneDrive.`,
-            `Deliverables Xylon must produce this sprint: (1) prospect research brief, (2) oversharing remediation plan,`,
-            ` (3) landing page at xylondevs.com/copilot-rollout to capture similar leads, (4) backend intake form API,`,
-            ` (5) deploy plan, (6) final Statement of Work with 3 pricing tiers, (7) QA evidence + live-URL checks.`,
-            `Every agent consults their paired buddy first, then loops in other pods. MAJOR gates: final SOW pricing,`,
-            ` deploy, and publish all need CEO approval. Read xylondevs.com first so your work matches our current brand.`,
-        ].join(' ');
-
+    private kickoffScenario(script: ScenarioScript) {
         this.broadcast('chat', {
             sender: '📣 Project Kickoff',
-            text: `🚀 ${project}. Everyone has a specific brief in their inbox — check it, then start executing.`
+            text: script.kickoffChat
         });
-        this.emitHighlight('scenario', 'Xylon Growth Sprint kicked off', project, 'shepherd');
+        this.emitHighlight('scenario', script.highlightTitle, script.project, 'shepherd');
 
-        const assignments: Array<{
-            id: string;
-            task: string;
-            inbox: string;
-        }> = [
-            {
-                id: 'shepherd',
-                task: 'Coordinate ACME sprint: break work into milestones, route to specialists, track blockers',
-                inbox: `${brief} You are the coordinator. Produce a milestone plan (Discovery → Research → Design → Build → Security review → QA → CEO gate → Launch), create tasks for each specialist via create_task, and chase blockers. Pair with Reality Checker to pressure-test the plan before assigning.`,
-            },
-            {
-                id: 'reality',
-                task: 'Pressure-test the ACME plan and every deliverable as they arrive',
-                inbox: `${brief} Your job: challenge scope creep, thin rationale, and "is this really launch-ready?" checks. Pair with Project Shepherd on the milestone plan. Read xylondevs.com and flag any claim in the SOW we cannot back up with the current site.`,
-            },
-            {
-                id: 'sales',
-                task: 'Research ACME, qualify the opportunity, write outreach, brief Proposal Strategist',
-                inbox: `${brief} Use web_search to research ACME Manufacturing (AU manufacturing sector, M365 adoption, Copilot pilots). Use fetch_url on xylondevs.com to match our positioning. Draft a 120-word outbound email and a 3-line LinkedIn opener. When qualified, brief Proposal Strategist with BANT/MEDDIC-lite notes. DO NOT commit pricing — that is the CEO's call.`,
-            },
-            {
-                id: 'proposal',
-                task: 'Draft the Statement of Work with 3 pricing tiers (Good/Better/Best) — pricing is MAJOR',
-                inbox: `${brief} Build the 10-part SOW. Pair with Sales Outreach for qualification inputs, Security for the remediation scope, DevOps for deploy effort, and Frontend for landing-page scope. Write the SOW via write_file to data/workspace/acme-sow.md. Propose Good/Better/Best pricing but REQUEST CEO APPROVAL before finalising numbers or sending to client. Also read xylondevs.com to mirror tone.`,
-            },
-            {
-                id: 'seo',
-                task: 'Audit xylondevs.com and propose keyword/meta plan for /copilot-rollout landing page',
-                inbox: `${brief} fetch_url https://xylondevs.com and audit: title tags, H1s, meta description, internal linking, any existing Copilot/AI content. web_search for Australian buyer-intent keywords around "Microsoft Copilot rollout", "Copilot oversharing", "Purview restricted SharePoint search". Hand the keyword + metadata brief to Frontend Dev. Pair with Evidence Collector so they can verify the new page ranks the right terms.`,
-            },
-            {
-                id: 'frontend',
-                task: 'Build landing page mockup at data/workspace/copilot-rollout-landing.html',
-                inbox: `${brief} fetch_url https://xylondevs.com to match the current brand look. Take SEO's keyword+metadata brief and Proposal's scope. write_file an HTML landing page to data/workspace/copilot-rollout-landing.html with hero, pain statement, 3-tier pricing placeholder, intake form pointing at Backend Architect's API, and a clear CTA. Pair with Backend Architect on the form fields.`,
-            },
-            {
-                id: 'backend',
-                task: 'Design intake form API contract for the landing page',
-                inbox: `${brief} Design a minimal POST /api/leads endpoint: fields (company, contact, email, staff_count, current_m365_plan, message, utm_source). Return 202 + lead id. Define validation + rate limiting. write_note the contract and share with Frontend Dev. Loop in Security Engineer for auth + Purview-aligned data handling.`,
-            },
-            {
-                id: 'devops',
-                task: 'Propose a safe deploy plan for the landing page + API — deploy is MAJOR',
-                inbox: `${brief} Draft a deploy plan: static hosting for the landing page, containerised API, env vars, rollback plan, DNS for xylondevs.com/copilot-rollout. The actual deploy is MAJOR — do not execute it. File an approval request to the CEO with rationale (why now, rollback, blast radius). Pair with Security for any secret handling.`,
-            },
-            {
-                id: 'security',
-                task: 'Write the Copilot oversharing remediation plan for the ACME SOW',
-                inbox: `${brief} This is the centrepiece. Produce a concrete remediation plan ACME can adopt pre-Copilot rollout: (1) SharePoint/OneDrive permission hygiene sweep, (2) sensitivity labels + DLP via Purview, (3) restricted SharePoint search, (4) Copilot semantic index scoping, (5) Entra ID conditional access + PIM, (6) content filtering + prompt logging, (7) audit cadence. Map each to the exact M365 setting. Hand to Proposal Strategist for the SOW. Pair with DevOps on any secrets handling.`,
-            },
-            {
-                id: 'evidence',
-                task: 'Capture proof: SOW complete, landing page file exists, API contract noted, site 200 OK',
-                inbox: `${brief} Verify each deliverable: read_file data/workspace/acme-sow.md, read_file data/workspace/copilot-rollout-landing.html, check_health https://xylondevs.com and the deploy URL once live. Post an evidence summary in chat before the CEO's final approval. Pair with SEO for post-launch keyword verification.`,
-            },
-        ];
-
-        for (const a of assignments) {
+        for (const a of script.assignments) {
             const agent = this.coreAgents.get(a.id);
             const state = this.state.agents.get(a.id);
             if (!agent || !state) continue;
@@ -2119,20 +2292,24 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95,
             });
-            this.memoryStore.createTask(a.task, a.id).catch(() => {});
+            this.memoryStore.createTask({
+                title: a.task,
+                assignedTo: a.id,
+                createdBy: 'scenario',
+                status: 'in_progress'
+            }).catch(() => {});
             this.broadcast('task-update', {
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
             this.seedTaskProgress(a.id, a.task);
         }
 
-        // CEO brief (no approval gate, just awareness)
         const ceo = this.coreAgents.get('ceo');
         if (ceo) {
             ceo.receiveMessage({
                 from: 'Faz (CEO)',
                 to: ceo.config.name,
-                content: `You kicked off "${project}". You are the final gate on SOW pricing, the deploy, and the public launch. Watch the approval queue. Stay strategic — do not micromanage. Ask for rationale if a request is weak.`,
+                content: script.ceoBrief,
                 timestamp: this.state.officeTime,
             });
         }
@@ -2350,13 +2527,14 @@ Paired buddy: Sales Outreach.`,
         this.memoryStore.getTasks().then(tasks => {
             client.send('tasks-sync', tasks);
         });
+        client.send('agent-roster-sync', this.getLiveRoster());
         client.send('relationship-update', this.buildRelationshipPayload());
         client.send('fast-track-state', { enabled: this.fastTrackMode });
         client.send('completed-work-sync', {
             items: this.completedTasks,
             reviewFolder: 'data/workspace/completed-work'
         });
-        client.send('layout-sync', { name: 'default', layout: this.currentLayout });
+        client.send('layout-sync', { name: 'default', layoutByZone: this.currentLayoutByZone, zoneId: 'main' });
         client.send('approvals-sync', this.listApprovals());
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }

@@ -4,6 +4,7 @@ import { createServer } from 'http';
 import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { OfficeRoom } from './rooms/OfficeRoom';
+import { ExtensionRegistry } from './extensions/registry';
 
 // Setup Express
 const app = express();
@@ -153,17 +154,30 @@ app.post('/api/workspace-files/upload', async (req, res) => {
     }
 });
 
-// Create HTTP and Colyseus server
-const httpServer = createServer(app);
-const colyseusServer = new Server({
-    server: httpServer,
-});
+const bootstrap = async () => {
+    const configuredExtensionFolder = process.env.AGENT_EXTENSION_DIR
+        ? path.resolve(process.cwd(), process.env.AGENT_EXTENSION_DIR)
+        : path.resolve(__dirname, 'extensions', 'builtin');
+    const extensionRegistry = await ExtensionRegistry.loadFromFolder(configuredExtensionFolder);
+    OfficeRoom.setExtensionRegistry(extensionRegistry);
+    console.log(`[Extensions] Active hooks: ${extensionRegistry.list().join(', ') || 'none'}`);
 
-// Define Rooms
-colyseusServer.define('office', OfficeRoom);
+    // Create HTTP and Colyseus server
+    const httpServer = createServer(app);
+    const colyseusServer = new Server({
+        server: httpServer,
+    });
 
-// Start listening
-const PORT = Number(process.env.PORT || 3000);
-colyseusServer.listen(PORT).then(() => {
+    // Define Rooms
+    colyseusServer.define('office', OfficeRoom);
+
+    // Start listening
+    const PORT = Number(process.env.PORT || 3000);
+    await colyseusServer.listen(PORT);
     console.log(`[Server] AgentOffice Engine listening on ws://localhost:${PORT}`);
+};
+
+bootstrap().catch((error) => {
+    console.error('[Server] Failed to bootstrap', error);
+    process.exit(1);
 });
