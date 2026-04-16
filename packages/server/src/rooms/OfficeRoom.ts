@@ -5,6 +5,7 @@ import {
   Office,
   OfficeConfig,
   ConversationMessage,
+  type InferenceConfig,
 } from "@agent-office/core";
 import { OllamaAdapter, OpenAICompatibleAdapter } from "@agent-office/adapters";
 import { ToolExecutor } from "../tools/ToolExecutor";
@@ -15,6 +16,12 @@ import {
 } from "../memory/MemoryStore";
 import path from "path";
 import { readFile, stat, mkdir, writeFile } from "fs/promises";
+import type { ExtensionRegistry } from "../extensions/registry";
+
+
+
+type TaskStatus = "backlog" | "in_progress" | "blocked" | "review" | "done";
+type TaskPriority = "low" | "medium" | "high" | "urgent";
 
 interface HighlightEvent {
   type: string;
@@ -125,6 +132,11 @@ const MAJOR_TOOLS = new Set<string>([
 
 export class OfficeRoom extends Room<OfficeState> {
   private static activeRoom: OfficeRoom | null = null;
+  private static extensionRegistry: ExtensionRegistry | null = null;
+
+  static setExtensionRegistry(extensionRegistry: ExtensionRegistry): void {
+    OfficeRoom.extensionRegistry = extensionRegistry;
+  }
 
   maxClients = 100;
   private office!: Office;
@@ -134,7 +146,7 @@ export class OfficeRoom extends Room<OfficeState> {
   private ollamaAdapter = new OllamaAdapter("http://localhost:11434");
   private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter =
     this.ollamaAdapter;
-  private inferenceProvider = "ollama";
+  private inferenceProvider: InferenceConfig["provider"] = "ollama";
   private defaultModel =
     process.env.AGENT_MODEL ||
     process.env.CLAUDE_MODEL ||
@@ -335,9 +347,9 @@ export class OfficeRoom extends Room<OfficeState> {
         this.inferenceAdapter = new OpenAICompatibleAdapter(
           baseUrl,
           apiKey,
-          "claude",
+          "openai",
         );
-        this.inferenceProvider = "claude";
+        this.inferenceProvider = "openai";
         this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
         console.log(
           `[Inference] Claude/OpenAI-compatible adapter enabled (${this.defaultModel}) @ ${baseUrl}`,

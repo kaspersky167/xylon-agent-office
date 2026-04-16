@@ -53,9 +53,7 @@ export function FloatingPanel({
         } catch {
             // Ignore corrupt state.
         }
-        const dockX = defaultDock === 'right'
-            ? Math.max(8, window.innerWidth - width - 24)
-            : 24;
+        const dockX = defaultDock === 'right' ? Math.max(8, window.innerWidth - width - 24) : 24;
         return { x: dockX, y: defaultY };
     });
 
@@ -84,10 +82,7 @@ export function FloatingPanel({
         if (!dragOffset) return;
 
         const onMove = (event: MouseEvent) => {
-            const next = clampPosition(
-                { x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy },
-                width
-            );
+            const next = clampPosition({ x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy }, width);
             setPosition(next);
         };
 
@@ -112,7 +107,17 @@ export function FloatingPanel({
             borderRadius: tokens.radius.lg,
             overflow: 'hidden',
             ...controlRoomStyles.panel
-        }}>
+        }
+        : {
+            position: 'relative',
+            width: '100%',
+            borderRadius: tokens.radius.lg,
+            overflow: 'hidden',
+            ...controlRoomStyles.panel
+        };
+
+    return (
+        <div className={className} style={floatingStyle}>
             <div
                 onMouseDown={(event) => {
                     if (mode !== 'floating') return;
@@ -156,11 +161,7 @@ export function FloatingPanel({
                 </button>
             </div>
 
-            {!minimized && (
-                <div style={{ padding: 10 }}>
-                    {children}
-                </div>
-            )}
+            {!minimized && <div style={{ padding: 10 }}>{children}</div>}
         </div>
     );
 }

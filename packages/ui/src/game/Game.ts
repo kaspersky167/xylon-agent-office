@@ -61,6 +61,8 @@ export class OfficeScene extends Phaser.Scene {
     private gridSize = GRID_SIZE_PX;
     private heldMoveKeys: Set<'left' | 'right' | 'up' | 'down'> = new Set();
     private agentNameToSessionId: Map<string, string> = new Map();
+    private agentSelectionRing: Map<string, Phaser.GameObjects.Graphics> = new Map();
+    private agentUiSnapshot: Map<string, { name: string; action: string; status: string }> = new Map();
     private onFocusAgentRequest?: (event: Event) => void;
 
     constructor() {
