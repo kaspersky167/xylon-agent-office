@@ -6,6 +6,10 @@ import { Panel } from './ui/Panel';
 import { SectionHeader } from './ui/SectionHeader';
 import { Toolbar } from './ui/Toolbar';
 import { controlRoomStyles, tokens } from '../theme/tokens';
+import { eventBus } from '../events';
+
+type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+type TaskPriority = 'low' | 'medium' | 'high';
 
 interface TaskItem {
     id: string;

@@ -1,5 +1,4 @@
-import React, { useEffect, useState } from 'react';
-import { FloatingPanel } from './FloatingPanel';
+import React, { useEffect, useRef, useState } from 'react';
 import { eventBus } from '../events';
 import { Button } from './ui/Button';
 import { Panel } from './ui/Panel';
@@ -11,9 +10,8 @@ type LogEntry = {
     time: string;
     agent: string;
     action: string;
-    thought: string;
-    time: string;
-}
+    thought?: string;
+};
 
 const actionIcons: Record<string, string> = {
     work: '💻', talk: '💬', idle: '😌',
@@ -22,20 +20,40 @@ const actionIcons: Record<string, string> = {
 
 export function SystemLog() {
     const [logs, setLogs] = useState<LogEntry[]>([]);
+    const [isOpen, setIsOpen] = useState(true);
+    const idRef = useRef(0);
+    const lastEntryPerAgent = useRef<Record<string, string>>({});
+    const scrollRef = useRef<HTMLDivElement | null>(null);
 
     useEffect(() => {
         const handler = (e: Event) => {
-            const detail = (e as CustomEvent).detail;
+            const detail = ((e as CustomEvent).detail || {}) as Partial<LogEntry>;
             const key = `${detail.agent}:${detail.action}:${detail.thought}`;
-            if (lastEntryPerAgent.current[detail.agent] === key) return;
-            lastEntryPerAgent.current[detail.agent] = key;
+            const agentKey = detail.agent || 'System';
+            if (lastEntryPerAgent.current[agentKey] === key) return;
+            lastEntryPerAgent.current[agentKey] = key;
 
             setLogs(prev => {
-                const newLog: LogEntry = { id: idRef.current++, ...detail };
+                const newLog: LogEntry = {
+                    id: String(idRef.current++),
+                    time: detail.time || new Date().toLocaleTimeString(),
+                    agent: detail.agent || 'System',
+                    action: detail.action || 'event',
+                    thought: detail.thought
+                };
                 const updated = [...prev, newLog];
                 return updated.slice(-30);
             });
         };
+
+        eventBus.addEventListener('activity-log', handler);
+        return () => eventBus.removeEventListener('activity-log', handler);
+    }, []);
+
+    useEffect(() => {
+        if (!scrollRef.current) return;
+        scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }, [logs]);
 
     if (!isOpen) {
         return (
