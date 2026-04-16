@@ -9,6 +9,7 @@ type Edge = {
     bName: string;
     score: number;
     status: 'alliance' | 'neutral' | 'rivalry';
+    label?: string;
 };
 
 export function RelationshipGraph() {
@@ -32,7 +33,7 @@ export function RelationshipGraph() {
         <FloatingPanel
             id="relationship-graph"
             title="Relationship Graph"
-            subtitle="Alliances and rivalries"
+            subtitle="0–100% = strength of collaboration/conflict"
             width={300}
             defaultDock="right"
             defaultY={220}
@@ -53,7 +54,7 @@ export function RelationshipGraph() {
                             {edge.aName} {isAlliance ? '🤝' : '⚔️'} {edge.bName}
                         </div>
                         <div style={{ fontSize: 10, color: '#f9e7d0' }}>
-                            {edge.status} ({Math.round(Math.abs(edge.score) * 100)} intensity)
+                            {edge.label || edge.status} ({Math.round(Math.abs(edge.score) * 100)}%)
                         </div>
                     </div>
                 );

@@ -101,11 +101,27 @@ const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
 
 app.get('/api/workspace-files', async (_req, res) => {
     try {
+        await mkdir(workspaceRoot, { recursive: true });
         const files = await listWorkspaceFiles(workspaceRoot);
         res.json({ ok: true, files });
     } catch (error) {
         console.error('[workspace-files] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list workspace files.' });
+    }
+});
+
+app.get('/api/completed-work', async (_req, res) => {
+    try {
+        await mkdir(path.join(workspaceRoot, 'completed-work'), { recursive: true });
+        const files = await listWorkspaceFiles(path.join(workspaceRoot, 'completed-work'));
+        res.json({
+            ok: true,
+            folder: 'data/workspace/completed-work',
+            files
+        });
+    } catch (error) {
+        console.error('[completed-work] Failed to list files', error);
+        res.status(500).json({ ok: false, error: 'Unable to list completed work files.' });
     }
 });
 
