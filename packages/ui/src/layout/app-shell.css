@@ -1,0 +1,113 @@
+.app-shell {
+    position: fixed;
+    inset: 0;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: minmax(280px, 22vw) minmax(520px, 1fr) minmax(300px, 24vw);
+    grid-template-rows: 92px minmax(0, 1fr) minmax(220px, 30vh);
+    grid-template-areas:
+        "hud hud hud"
+        "left center right"
+        "drawer drawer drawer";
+    gap: 10px;
+    pointer-events: none;
+    color: #eef2ff;
+    z-index: 9;
+}
+
+.app-shell-zone {
+    pointer-events: auto;
+    min-height: 0;
+    border-radius: 12px;
+    border: 1px solid rgba(147, 160, 255, 0.22);
+    background: rgba(10, 14, 28, 0.76);
+    backdrop-filter: blur(6px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.app-shell-zone__header {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #c9d2ff;
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.app-shell-zone__content {
+    min-height: 0;
+    overflow: auto;
+    padding: 8px;
+    display: grid;
+    gap: 8px;
+}
+
+.app-shell-zone--hud { grid-area: hud; }
+.app-shell-zone--rail { grid-area: left; }
+.app-shell-zone--viewport { grid-area: center; }
+.app-shell-zone--inspector { grid-area: right; }
+.app-shell-zone--drawer { grid-area: drawer; }
+
+.app-shell-top-hud {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.app-shell-brand h1 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.app-shell-brand p {
+    margin: 4px 0 0;
+    opacity: 0.7;
+    font-size: 11px;
+}
+
+.app-shell-actions,
+.app-shell-kpis {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.app-shell-kpi {
+    border: 1px solid rgba(164, 180, 255, 0.22);
+    border-radius: 8px;
+    padding: 7px 10px;
+    min-width: 110px;
+    background: rgba(22, 27, 49, 0.8);
+    font-size: 11px;
+}
+
+.app-shell-kpi strong {
+    display: block;
+    font-size: 13px;
+    margin-top: 2px;
+}
+
+.app-shell-btn {
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    background: rgba(120, 165, 255, 0.24);
+    color: #fff;
+    padding: 6px 10px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.app-shell-viewport-card {
+    height: 100%;
+    border: 1px dashed rgba(160, 182, 255, 0.45);
+    border-radius: 10px;
+    background: rgba(9, 14, 30, 0.35);
+    display: grid;
+    place-items: center;
+    text-align: center;
+    font-size: 12px;
+    color: #d8e2ff;
+}

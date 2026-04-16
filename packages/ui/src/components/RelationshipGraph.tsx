@@ -1,6 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { eventBus } from '../events';
 import { FloatingPanel } from './FloatingPanel';
+import { Chip } from './ui/Chip';
+import { Toolbar } from './ui/Toolbar';
+import { tokens } from '../theme/tokens';
 
 type Edge = {
     a: string;
@@ -12,7 +15,7 @@ type Edge = {
     label?: string;
 };
 
-export function RelationshipGraph() {
+export function RelationshipGraph({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [edges, setEdges] = useState<Edge[]>([]);
 
     useEffect(() => {
@@ -34,28 +37,28 @@ export function RelationshipGraph() {
             id="relationship-graph"
             title="Relationship Graph"
             subtitle="0–100% = strength of collaboration/conflict"
-            width={300}
+            width={320}
             defaultDock="right"
             defaultY={220}
             zIndex={16}
+            mode={mode}
         >
             {visible.length === 0 && (
-                <div style={{ fontSize: 11, color: '#cdbca4' }}>No strong alliances or rivalries yet.</div>
+                <div style={{ fontSize: tokens.typography.caption, color: tokens.color.textMuted }}>No strong alliances or rivalries yet.</div>
             )}
             {visible.map((edge, idx) => {
                 const isAlliance = edge.status === 'alliance';
                 return (
-                    <div key={idx} style={{
-                        marginBottom: 7,
-                        paddingBottom: 7,
-                        borderBottom: '1px solid rgba(255,255,255,0.08)'
-                    }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: isAlliance ? '#b9fbc0' : '#ffadad' }}>
+                    <div key={idx} style={{ marginBottom: tokens.spacing.sm, paddingBottom: tokens.spacing.sm, borderBottom: `1px solid ${tokens.color.borderSoft}` }}>
+                        <div style={{ fontSize: tokens.typography.caption, fontWeight: 700, color: isAlliance ? tokens.color.success : tokens.color.danger }}>
                             {edge.aName} {isAlliance ? '🤝' : '⚔️'} {edge.bName}
                         </div>
-                        <div style={{ fontSize: 10, color: '#f9e7d0' }}>
-                            {edge.label || edge.status} ({Math.round(Math.abs(edge.score) * 100)}%)
-                        </div>
+                        <Toolbar style={{ marginTop: 4 }}>
+                            <Chip tone={isAlliance ? 'success' : 'danger'}>{edge.status}</Chip>
+                            <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>
+                                {edge.label || edge.status} ({Math.round(Math.abs(edge.score) * 100)}%)
+                            </div>
+                        </Toolbar>
                     </div>
                 );
             })}
