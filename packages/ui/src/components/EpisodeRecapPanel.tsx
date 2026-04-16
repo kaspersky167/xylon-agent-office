@@ -8,7 +8,7 @@ type RecapPayload = {
     outcomeCard: { title: string; summary: string; activeRelationships: number };
 };
 
-export function EpisodeRecapPanel() {
+export function EpisodeRecapPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [recap, setRecap] = useState<RecapPayload | null>(null);
     const [status, setStatus] = useState('');
 
@@ -48,6 +48,7 @@ export function EpisodeRecapPanel() {
             defaultDock="left"
             defaultY={220}
             zIndex={15}
+            mode={mode}
         >
             <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
                 <button onClick={loadRecap} style={{

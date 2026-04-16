@@ -14,7 +14,7 @@ const actionIcons: Record<string, string> = {
     'use_tool': '🔧', 'move': '🚶', 'think': '💡'
 };
 
-export function SystemLog() {
+export function SystemLog({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [logs, setLogs] = useState<LogEntry[]>([]);
     const [isOpen, setIsOpen] = useState(true);
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -52,10 +52,10 @@ export function SystemLog() {
             <button
                 onClick={() => setIsOpen(true)}
                 style={{
-                    position: 'absolute', right: 20, top: 20,
+                    position: mode === 'floating' ? 'absolute' : 'relative', right: mode === 'floating' ? 20 : undefined, top: mode === 'floating' ? 20 : undefined,
                     padding: '6px 12px', borderRadius: 8, border: 'none',
                     backgroundColor: '#2d3436', color: '#aaa',
-                    cursor: 'pointer', fontSize: '11px', zIndex: 10
+                    cursor: 'pointer', fontSize: '11px', zIndex: mode === 'floating' ? 10 : undefined
                 }}
             >
                 📊 Activity Log
@@ -65,13 +65,13 @@ export function SystemLog() {
 
     return (
         <div style={{
-            position: 'absolute', right: 20, top: 20, width: 260,
+            position: mode === 'floating' ? 'absolute' : 'relative', right: mode === 'floating' ? 20 : undefined, top: mode === 'floating' ? 20 : undefined, width: mode === 'floating' ? 260 : '100%',
             backgroundColor: 'rgba(10,10,30,0.92)', color: 'white',
             padding: 12, borderRadius: 12,
             boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
             border: '1px solid rgba(108,92,231,0.3)',
             maxHeight: '35vh', display: 'flex', flexDirection: 'column',
-            zIndex: 10
+            zIndex: mode === 'floating' ? 10 : undefined
         }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                 <h3 style={{ margin: 0, fontSize: '13px' }}>📊 System Activity Log</h3>

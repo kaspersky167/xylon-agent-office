@@ -28,7 +28,7 @@ type CompletedWorkItem = {
     summaryPath: string;
 };
 
-export function CeoOperationsPanel() {
+export function CeoOperationsPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [tasks, setTasks] = useState<TaskItem[]>([]);
     const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
     const [meeting, setMeeting] = useState<{ active: boolean; topic?: string; endsAt?: number } | null>(null);
@@ -149,7 +149,7 @@ export function CeoOperationsPanel() {
     };
 
     return (
-        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26}>
+        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26} mode={mode}>
             <div style={{ display: 'grid', gap: 10, fontSize: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                     <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
