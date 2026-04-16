@@ -240,6 +240,9 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('approvals-sync', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('approvals-sync', { detail: message }));
                 });
+                this.room!.onMessage('agent-roster-sync', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('agent-roster-sync', { detail: message }));
+                });
                 this.room!.onMessage('meeting-state', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('meeting-state', { detail: message }));
                 });

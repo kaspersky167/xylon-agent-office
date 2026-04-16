@@ -1,22 +1,130 @@
 import React, { useMemo, useState } from 'react';
 import { FloatingPanel } from './FloatingPanel';
-import { useUIStore } from '../store/uiStore';
+
+type TaskItem = {
+    id: number | string;
+    title: string;
+    assigned_to?: string;
+    status: 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+    progress?: number;
+};
+
+type ApprovalRequest = {
+    id: string;
+    requestedByName: string;
+    requestedAction: string;
+    rationale: string;
+    isMajor: boolean;
+    status: 'pending' | 'approved' | 'rejected';
+};
+
+type CompletedWorkItem = {
+    id: string;
+    task: string;
+    agentName: string;
+    completedAt: string;
+    summaryPath: string;
+};
 
 export function CeoOperationsPanel() {
     const [newTask, setNewTask] = useState('');
     const [targetAgent, setTargetAgent] = useState('auto');
-    const { state, filteredTasks, actions } = useUIStore();
-    const { approvals, simulation, completedWork, reviewFolder, filters } = state;
+    const [roster, setRoster] = useState<Array<{ id: string; name: string }>>([]);
+    const [completedWork, setCompletedWork] = useState<CompletedWorkItem[]>([]);
+    const [reviewFolder, setReviewFolder] = useState('data/workspace/completed-work');
+
+    useEffect(() => {
+        const onTaskUpdate = (event: Event) => {
+            const data = (event as CustomEvent).detail || {};
+            if (!data?.task) return;
+            setTasks((prev) => {
+                const existing = prev.find((t) => t.title === data.task);
+                if (existing) {
+                    return prev.map((t) => t.title === data.task
+                        ? { ...t, status: data.status, assigned_to: data.agentId, progress: typeof data.progress === 'number' ? data.progress : t.progress }
+                        : t);
+                }
+                return [...prev, {
+                    id: Date.now(),
+                    title: data.task,
+                    assigned_to: data.agentId,
+                    status: data.status || 'backlog',
+                    progress: typeof data.progress === 'number' ? data.progress : undefined
+                }];
+            });
+        };
+        const onTasksSync = (event: Event) => {
+            const list = (event as CustomEvent).detail;
+            if (!Array.isArray(list)) return;
+            setTasks(list.map((task: any) => ({
+                id: task.id,
+                title: task.title,
+                assigned_to: task.assigned_to || '',
+                status: task.status || 'backlog',
+                progress: typeof task.progress === 'number' ? task.progress : undefined
+            })));
+        };
+        const onApprovals = (event: Event) => {
+            const list = (event as CustomEvent).detail;
+            setApprovals(Array.isArray(list) ? list : []);
+        };
+        const onRosterSync = (event: Event) => {
+            const list = (event as CustomEvent).detail;
+            if (!Array.isArray(list)) return;
+            setRoster(list.map((entry: any) => ({ id: String(entry.id), name: String(entry.name || entry.id) })));
+        };
+        const onMeeting = (event: Event) => setMeeting((event as CustomEvent).detail || null);
+        const onFastTrack = (event: Event) => setFastTrackEnabled(Boolean((event as CustomEvent).detail?.enabled));
+        const onCompletedWork = (event: Event) => {
+            const detail = (event as CustomEvent).detail || {};
+            setCompletedWork(Array.isArray(detail.items) ? detail.items : []);
+            if (typeof detail.reviewFolder === 'string' && detail.reviewFolder.trim()) {
+                setReviewFolder(detail.reviewFolder.trim());
+            }
+        };
+
+        eventBus.addEventListener('task-update', onTaskUpdate);
+        eventBus.addEventListener('tasks-sync', onTasksSync);
+        eventBus.addEventListener('approvals-sync', onApprovals);
+        eventBus.addEventListener('agent-roster-sync', onRosterSync);
+        eventBus.addEventListener('meeting-state', onMeeting);
+        eventBus.addEventListener('fast-track-state', onFastTrack);
+        eventBus.addEventListener('completed-work-sync', onCompletedWork);
+
+        const requestTimer = setInterval(() => {
+            const room = getColyseusRoom();
+            if (!room) return;
+            room.send('request-approvals', {});
+            room.send('request-completed-work', {});
+            clearInterval(requestTimer);
+        }, 400);
+
+        return () => {
+            clearInterval(requestTimer);
+            eventBus.removeEventListener('task-update', onTaskUpdate);
+            eventBus.removeEventListener('tasks-sync', onTasksSync);
+            eventBus.removeEventListener('approvals-sync', onApprovals);
+            eventBus.removeEventListener('agent-roster-sync', onRosterSync);
+            eventBus.removeEventListener('meeting-state', onMeeting);
+            eventBus.removeEventListener('fast-track-state', onFastTrack);
+            eventBus.removeEventListener('completed-work-sync', onCompletedWork);
+        };
+    }, []);
 
     const metrics = useMemo(() => {
-        const total = filteredTasks.length;
-        const completed = filteredTasks.filter((t) => t.status === 'completed').length;
-        const inProgress = filteredTasks.filter((t) => t.status === 'in_progress').length;
-        const pending = filteredTasks.filter((t) => t.status !== 'completed' && t.status !== 'in_progress').length;
+        const total = tasks.length;
+        const completed = tasks.filter((t) => t.status === 'done').length;
+        const inProgress = tasks.filter((t) => t.status === 'in_progress').length;
+        const pending = tasks.filter((t) => t.status === 'backlog').length;
         return { total, completed, inProgress, pending, completionPct: total === 0 ? 0 : Math.round((completed / total) * 100) };
     }, [filteredTasks]);
 
     const pendingApprovals = approvals.filter((a) => a.status === 'pending');
+
+    const transitionTask = (id: string | number, status: 'in_progress' | 'blocked' | 'review' | 'done') => {
+        const room = getColyseusRoom();
+        room?.send('task-transition', { id: String(id), status });
+    };
 
     const assignTask = () => {
         if (!newTask.trim()) return;
@@ -73,16 +181,9 @@ export function CeoOperationsPanel() {
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 6 }}>
                         <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)}>
                             <option value="auto">Auto-assign</option>
-                            <option value="frontend">Frontend</option>
-                            <option value="backend">Backend</option>
-                            <option value="devops">DevOps</option>
-                            <option value="security">Security</option>
-                            <option value="shepherd">Shepherd</option>
-                            <option value="reality">Reality</option>
-                            <option value="evidence">Evidence</option>
-                            <option value="seo">SEO</option>
-                            <option value="sales">Sales</option>
-                            <option value="proposal">Proposal</option>
+                            {roster.map((agent) => (
+                                <option key={agent.id} value={agent.id}>{agent.name}</option>
+                            ))}
                         </select>
                         <button onClick={assignTask}>Assign</button>
                         <input value={newTask} onChange={(e) => setNewTask(e.target.value)} placeholder="Define work item..." style={{ gridColumn: '1 / -1' }} />
@@ -93,6 +194,20 @@ export function CeoOperationsPanel() {
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Progress</div>
                     <div>Total: <strong>{metrics.total}</strong> · Completed: <strong style={{ color: '#55efc4' }}>{metrics.completed}</strong> · In progress: <strong>{metrics.inProgress}</strong> · Pending: <strong>{metrics.pending}</strong></div>
                     <div style={{ marginTop: 4 }}>Completion: <strong>{metrics.completionPct}%</strong></div>
+                    <div style={{ marginTop: 8, display: 'grid', gap: 4, maxHeight: 120, overflowY: 'auto' }}>
+                        {tasks.slice(0, 5).map((task) => (
+                            <div key={task.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6 }}>
+                                <span style={{ fontSize: 11, opacity: 0.85 }}>{task.title} ({task.status})</span>
+                                <div style={{ display: 'flex', gap: 4 }}>
+                                    {task.status === 'backlog' && <button onClick={() => transitionTask(task.id, 'in_progress')} style={{ borderRadius: 6 }}>Start</button>}
+                                    {task.status === 'in_progress' && <button onClick={() => transitionTask(task.id, 'blocked')} style={{ borderRadius: 6 }}>Block</button>}
+                                    {task.status === 'in_progress' && <button onClick={() => transitionTask(task.id, 'review')} style={{ borderRadius: 6 }}>Review</button>}
+                                    {task.status === 'blocked' && <button onClick={() => transitionTask(task.id, 'in_progress')} style={{ borderRadius: 6 }}>Resume</button>}
+                                    {task.status === 'review' && <button onClick={() => transitionTask(task.id, 'done')} style={{ borderRadius: 6 }}>Done</button>}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
                 </div>
 
                 <div ref={approvalsSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>

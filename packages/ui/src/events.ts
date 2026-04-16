@@ -8,6 +8,7 @@ export const UIEvents = {
     scenarioEvent: 'scenario-event',
     relationshipUpdate: 'relationship-update',
     approvalsSync: 'approvals-sync',
+    agentRosterSync: 'agent-roster-sync',
     meetingState: 'meeting-state',
     agentState: 'agent-state',
     agentSelected: 'agent-selected',
