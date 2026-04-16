@@ -12,6 +12,8 @@ interface FloatingPanelProps {
     zIndex?: number;
     children: React.ReactNode;
     subtitle?: string;
+    mode?: 'floating' | 'docked';
+    className?: string;
 }
 
 function clampPosition(pos: Position, width: number): Position {
@@ -33,7 +35,9 @@ export function FloatingPanel({
     defaultMinimized = false,
     zIndex = 14,
     subtitle,
-    children
+    children,
+    mode = 'floating',
+    className
 }: FloatingPanelProps) {
     const storageKey = useMemo(() => `panel:${id}:state`, [id]);
 
@@ -97,13 +101,22 @@ export function FloatingPanel({
         };
     }, [dragOffset, width]);
 
-    return (
-        <div style={{
+    const floatingStyle: React.CSSProperties = mode === 'floating'
+        ? {
             position: 'absolute',
             left: position.x,
             top: position.y,
             width,
-            zIndex,
+            zIndex
+        }
+        : {
+            position: 'relative',
+            width: '100%'
+        };
+
+    return (
+        <div className={className} style={{
+            ...floatingStyle,
             borderRadius: 12,
             overflow: 'hidden',
             border: '1px solid rgba(255,255,255,0.2)',
@@ -114,6 +127,7 @@ export function FloatingPanel({
         }}>
             <div
                 onMouseDown={(event) => {
+                    if (mode !== 'floating') return;
                     const target = event.target as HTMLElement;
                     if (target.closest('button') || target.closest('input') || target.closest('select')) {
                         return;
@@ -124,7 +138,7 @@ export function FloatingPanel({
                     });
                 }}
                 style={{
-                    cursor: 'grab',
+                    cursor: mode === 'floating' ? 'grab' : 'default',
                     padding: '9px 10px',
                     display: 'flex',
                     alignItems: 'center',
