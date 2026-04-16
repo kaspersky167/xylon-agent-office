@@ -16,7 +16,7 @@ function pct(value: number): string {
     return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
 }
 
-export function AgentPulseBoard() {
+export function AgentPulseBoard({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [agents, setAgents] = useState<Record<string, AgentPulse>>({});
 
     useEffect(() => {
@@ -44,6 +44,7 @@ export function AgentPulseBoard() {
             defaultDock="left"
             defaultY={420}
             zIndex={14}
+            mode={mode}
         >
             {sortedAgents.length === 0 && (
                 <div style={{ fontSize: 11, color: '#86c6b5' }}>Waiting for live telemetry...</div>

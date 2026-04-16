@@ -20,7 +20,7 @@ const FURNITURE_PALETTE: { type: FurnitureItem['type']; emoji: string; label: st
     { type: 'whiteboard', emoji: '📝', label: 'Board' },
 ];
 
-export function LayoutEditor() {
+export function LayoutEditor({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [isOpen, setIsOpen] = useState(false);
     const [items, setItems] = useState<FurnitureItem[]>([]);
     const [selected, setSelected] = useState<FurnitureItem['type']>('desk');
@@ -95,12 +95,12 @@ export function LayoutEditor() {
             <button
                 onClick={() => setIsOpen(true)}
                 style={{
-                    position: 'absolute', left: 20, bottom: 80,
+                    position: mode === 'floating' ? 'absolute' : 'relative', left: mode === 'floating' ? 20 : undefined, bottom: mode === 'floating' ? 80 : undefined,
                     padding: '8px 16px', borderRadius: 8, border: 'none',
                     backgroundColor: '#6c5ce7', color: 'white',
                     cursor: 'pointer', fontSize: '12px', fontWeight: 'bold',
                     boxShadow: '0 4px 12px rgba(108,92,231,0.4)',
-                    zIndex: 10
+                    zIndex: mode === 'floating' ? 10 : undefined
                 }}
             >
                 🏗️ Layout Editor
@@ -110,13 +110,13 @@ export function LayoutEditor() {
 
     return (
         <div style={{
-            position: 'absolute', left: 20, bottom: 20, width: 280,
+            position: mode === 'floating' ? 'absolute' : 'relative', left: mode === 'floating' ? 20 : undefined, bottom: mode === 'floating' ? 20 : undefined, width: mode === 'floating' ? 280 : '100%',
             backgroundColor: 'rgba(10,10,30,0.95)', color: 'white',
             padding: 16, borderRadius: 12,
             boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
             border: '1px solid rgba(108,92,231,0.3)',
             maxHeight: '40vh', display: 'flex', flexDirection: 'column',
-            zIndex: 20
+            zIndex: mode === 'floating' ? 20 : undefined
         }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
                 <h3 style={{ margin: 0, fontSize: '14px' }}>🏗️ Office Layout Editor</h3>
