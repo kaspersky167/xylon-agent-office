@@ -687,6 +687,18 @@ export class OfficeScene extends Phaser.Scene {
                     container.setSize(32, 48);
                     container.setInteractive();
                     this.agentSprites.set(sessionId, container);
+                    eventBus.dispatchEvent(new CustomEvent('agent-state', {
+                        detail: {
+                            id: sessionId,
+                            name: agent.name,
+                            action: agent.action,
+                            currentTask: agent.currentTask || '',
+                            mood: Number(agent.mood || 0),
+                            reputation: Number(agent.reputation || 0),
+                            riskLevel: Number(agent.riskLevel || 0),
+                            momentum: Number(agent.momentum || 0)
+                        }
+                    }));
 
                     // --- FOCUS MODE: Click to follow ---
                     container.on('pointerdown', () => {
@@ -695,6 +707,7 @@ export class OfficeScene extends Phaser.Scene {
                             this.followTarget = null;
                             focusRing.setVisible(false);
                             eventBus.dispatchEvent(new CustomEvent('agent-focus', { detail: null }));
+                            eventBus.dispatchEvent(new CustomEvent('agent-selected', { detail: null }));
                         } else {
                             // Unfollow previous
                             if (this.followTarget) {
@@ -704,6 +717,7 @@ export class OfficeScene extends Phaser.Scene {
                             this.followTarget = container;
                             focusRing.setVisible(true);
                             eventBus.dispatchEvent(new CustomEvent('agent-focus', { detail: { name: agent.name, id: sessionId } }));
+                            eventBus.dispatchEvent(new CustomEvent('agent-selected', { detail: { name: agent.name, id: sessionId } }));
                         }
                     });
 
@@ -776,6 +790,18 @@ export class OfficeScene extends Phaser.Scene {
                                 action: agent.action
                             }
                         }));
+                        eventBus.dispatchEvent(new CustomEvent('agent-state', {
+                            detail: {
+                                id: sessionId,
+                                name: agent.name,
+                                action: agent.action,
+                                currentTask: agent.currentTask || '',
+                                mood: Number(agent.mood || 0),
+                                reputation: Number(agent.reputation || 0),
+                                riskLevel: Number(agent.riskLevel || 0),
+                                momentum: Number(agent.momentum || 0)
+                            }
+                        }));
 
                         lastAction = agent.action;
                         prevX = agent.x;
@@ -789,6 +815,12 @@ export class OfficeScene extends Phaser.Scene {
                         sprite.destroy();
                         this.agentSprites.delete(sessionId);
                     }
+                    eventBus.dispatchEvent(new CustomEvent('agent-removed', {
+                        detail: {
+                            id: sessionId,
+                            name: agent.name
+                        }
+                    }));
                 });
             });
 
