@@ -5,7 +5,7 @@ import { OllamaAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
-import { readFile, stat } from 'fs/promises';
+import { readFile, stat, mkdir, writeFile } from 'fs/promises';
 
 interface HighlightEvent {
     type: string;
@@ -22,6 +22,15 @@ interface RelationshipEdge {
     score: number;
     status: 'alliance' | 'neutral' | 'rivalry';
     updatedAt: string;
+}
+
+interface CompletedTaskRecord {
+    id: string;
+    task: string;
+    agentId: string;
+    agentName: string;
+    completedAt: string;
+    summaryPath: string;
 }
 
 interface ApprovalRequest {
@@ -103,6 +112,8 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+    private completedTasks: CompletedTaskRecord[] = [];
+    private fastTrackMode = true;
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -587,10 +598,29 @@ Paired buddy: Sales Outreach.`,
                     agentId: targetId,
                     agentName: agentState.name,
                     task: title,
-                    status: 'in_progress'
+                    status: 'in_progress',
+                    fastTrackMode: this.fastTrackMode
                 });
                 this.seedTaskProgress(targetId, title);
             }
+        });
+
+        this.onMessage('set-fast-track', (_client, message) => {
+            this.fastTrackMode = Boolean(message?.enabled);
+            this.broadcast('fast-track-state', { enabled: this.fastTrackMode });
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: this.fastTrackMode
+                    ? '⚡ Fast-track mode enabled: fewer interruptions, higher task throughput.'
+                    : '🧭 Fast-track mode disabled: collaboration cadence restored.'
+            });
+        });
+
+        this.onMessage('request-completed-work', (client) => {
+            client.send('completed-work-sync', {
+                items: this.completedTasks,
+                reviewFolder: 'data/workspace/completed-work'
+            });
         });
 
         // User-triggered workspace read-only tools
@@ -953,7 +983,8 @@ Paired buddy: Sales Outreach.`,
                                     agentId: targetId,
                                     agentName: targetAgent.config.name,
                                     task: title,
-                                    status: 'in_progress'
+                                    status: 'in_progress',
+                                    fastTrackMode: this.fastTrackMode
                                 });
                                 this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
@@ -1106,11 +1137,11 @@ Paired buddy: Sales Outreach.`,
 
                     await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
 
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
 
                 }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
             }
         });
@@ -1138,7 +1169,7 @@ Paired buddy: Sales Outreach.`,
 
                 // During a meeting, everyone (except CEO who stays in their office
                 // but attends virtually) gathers near the meeting table.
-                if (this.meetingActive && key !== 'ceo') {
+                if (!this.fastTrackMode && this.meetingActive && key !== 'ceo') {
                     const table = this.furnitureTargets['meeting-table'];
                     // Seats around the table — spread by hashing agent id
                     const hash = Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0));
@@ -1152,7 +1183,7 @@ Paired buddy: Sales Outreach.`,
                 }
 
                 // If agent action is 'talk', move towards the other agent instead
-                if (agent.action === 'talk') {
+                if (!this.fastTrackMode && agent.action === 'talk') {
                     let closest: { x: number; y: number } | null = null;
                     let minDist = Infinity;
                     this.state.agents.forEach((other, otherKey) => {
@@ -1340,12 +1371,15 @@ Paired buddy: Sales Outreach.`,
 
         const key = this.progressKey(agentId, taskTitle);
         const current = this.taskProgress.get(key) ?? 0;
+        const baseWorkDelta = this.fastTrackMode ? 0.45 : 0.2;
+        const baseToolDelta = this.fastTrackMode ? 0.5 : 0.3;
+        const baseTalkDelta = this.fastTrackMode ? 0.02 : 0.08;
         const delta = action === 'work'
-            ? 0.2
+            ? baseWorkDelta
             : action === 'use_tool'
-                ? 0.3
+                ? baseToolDelta
                 : action === 'talk'
-                    ? 0.08
+                    ? baseTalkDelta
                     : 0;
         if (delta <= 0) return;
 
@@ -1357,7 +1391,8 @@ Paired buddy: Sales Outreach.`,
             agentName: agent.config.name,
             task: taskTitle,
             status: next >= 1 ? 'completed' : 'in_progress',
-            progress: next
+            progress: next,
+            fastTrackMode: this.fastTrackMode
         });
 
         if (next < 1) return;
@@ -1380,6 +1415,48 @@ Paired buddy: Sales Outreach.`,
             `"${taskTitle}" is complete.`,
             agentId
         );
+
+        const completion = await this.persistCompletedWork(taskTitle, agentId, agent.config.name);
+        this.completedTasks = [completion, ...this.completedTasks].slice(0, 50);
+        this.broadcast('completed-work-sync', {
+            items: this.completedTasks,
+            reviewFolder: 'data/workspace/completed-work'
+        });
+    }
+
+    private async persistCompletedWork(taskTitle: string, agentId: string, agentName: string): Promise<CompletedTaskRecord> {
+        const completedAt = this.state.officeTime || new Date().toISOString();
+        const dateStamp = completedAt.slice(0, 10);
+        const slug = taskTitle
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 48) || 'task';
+        const folder = path.join(this.workspaceRoot, 'completed-work');
+        const filename = `${dateStamp}-${agentId}-${slug}.md`;
+        const absolutePath = path.join(folder, filename);
+        await mkdir(folder, { recursive: true });
+        const content = [
+            `# Completed Work`,
+            ``,
+            `- Task: ${taskTitle}`,
+            `- Agent: ${agentName} (${agentId})`,
+            `- Completed At: ${completedAt}`,
+            `- Fast Track Mode: ${this.fastTrackMode ? 'enabled' : 'disabled'}`,
+            ``,
+            `## Review Notes`,
+            `- Replace this section with detailed output updates and requested revisions.`,
+            ``
+        ].join('\n');
+        await writeFile(absolutePath, content, 'utf-8');
+        return {
+            id: `${agentId}:${taskTitle}:${completedAt}`,
+            task: taskTitle,
+            agentId,
+            agentName,
+            completedAt,
+            summaryPath: path.posix.join('completed-work', filename)
+        };
     }
 
     // ─── MEETINGS ───
@@ -2027,11 +2104,21 @@ Paired buddy: Sales Outreach.`,
         return {
             edges: Array.from(this.relationships.values()).map((edge) => ({
                 ...edge,
+                label: this.relationshipLabel(edge.score),
                 aName: idToName[edge.a] || edge.a,
                 bName: idToName[edge.b] || edge.b
             })),
             time: this.state.officeTime
         };
+    }
+
+    private relationshipLabel(score: number): string {
+        const abs = Math.abs(score);
+        if (score >= 0.75) return 'Trusted partner';
+        if (score >= 0.35) return 'Active collaborators';
+        if (abs < 0.35) return 'Neutral / low signal';
+        if (score <= -0.75) return 'Escalated conflict';
+        return 'Constructive tension';
     }
 
     public registerAudienceVote(eventName: string, voterId?: string) {
@@ -2113,6 +2200,11 @@ Paired buddy: Sales Outreach.`,
             client.send('tasks-sync', tasks);
         });
         client.send('relationship-update', this.buildRelationshipPayload());
+        client.send('fast-track-state', { enabled: this.fastTrackMode });
+        client.send('completed-work-sync', {
+            items: this.completedTasks,
+            reviewFolder: 'data/workspace/completed-work'
+        });
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
         client.send('approvals-sync', this.listApprovals());
         client.send('meeting-state', this.meetingActive
