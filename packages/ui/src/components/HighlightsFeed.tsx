@@ -10,7 +10,7 @@ interface HighlightItem {
     time: string;
 }
 
-export function HighlightsFeed() {
+export function HighlightsFeed({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [items, setItems] = useState<HighlightItem[]>([]);
     const idRef = useRef(1);
 
@@ -42,6 +42,7 @@ export function HighlightsFeed() {
             defaultDock="right"
             defaultY={430}
             zIndex={15}
+            mode={mode}
         >
             {items.length === 0 && (
                 <div style={{ fontSize: 11, color: '#8ca4d6' }}>Waiting for dramatic moments...</div>

@@ -10,17 +10,42 @@ AgentOffice uses WebSocket (Colyseus) for real-time state sync and message passi
 
 | Message Type | Payload | Description |
 |-------------|---------|-------------|
-| `chat` | `{ text: string }` | Send a chat message to the office |
+| `chat` | `{ text: string, attachments?: ChatAttachment[] }` | Send a chat message to the office |
 | `assign-task` | `{ title: string, agentId?: string }` | Assign a task (auto-assign if no agentId) |
 | `save-layout` | `{ name: string, layout: object[] }` | Save a custom office layout |
+| `file-share` | `{ id?: string, path: string, name: string, mimeType: string, sizeBytes?: number, createdBy?: string, sharedWith?: string[], status?: 'draft'\|'shared'\|'needs_review'\|'approved' }` | Create or upsert a shared file record |
+| `file-list` | `{ status?: 'draft'\|'shared'\|'needs_review'\|'approved', createdBy?: string, sharedWith?: string }` | Fetch shared file records (optionally filtered) |
+| `file-open` | `{ id: string }` | Fetch a single shared file by id |
+| `file-status-update` | `{ id: string, status: 'draft'\|'shared'\|'needs_review'\|'approved' }` | Update file status (auto-creates approval when `needs_review`) |
 
 ### Server → Client
 
 | Message Type | Payload | Description |
 |-------------|---------|-------------|
-| `chat` | `{ sender: string, text: string }` | Chat message (from agent or system) |
+| `chat` | `{ sender: string, text: string, attachments?: ChatAttachment[] }` | Chat message (from user, agent, or system) |
 | `task-update` | `{ agentId, agentName, task, status }` | Task status change |
 | `tasks-sync` | `TaskItem[]` | Full task list on client join |
+| `file-list` | `SharedFile[]` | Shared file list response/sync payload |
+| `file-open` | `SharedFile \| null` | Single shared file response |
+| `file-status-update` | `SharedFile \| null` | Shared file status update broadcast |
+| `file-share-ack` | `{ id: string }` | Acknowledgement for a `file-share` upsert |
+| `file-share-error` | `{ error: string }` | Validation error for `file-share` |
+| `file-status-update-error` | `{ error: string }` | Validation error for `file-status-update` |
+
+### `ChatAttachment` Schema
+
+```typescript
+type ChatAttachment = {
+    id: string
+    path: string
+    name: string
+    mimeType: string
+    size: number
+    sharedBy: string
+    sharedWith: string[]
+    createdAt: string // ISO timestamp
+}
+```
 
 ### Colyseus State Schema
 
@@ -66,7 +91,7 @@ The Phaser game and React components communicate via `eventBus`:
 
 | Event | Detail | Source → Target |
 |-------|--------|----------------|
-| `chat-message` | `{ sender, text }` | Colyseus → ChatPanel |
+| `chat-message` | `{ sender, text, attachments? }` | Colyseus → ChatPanel |
 | `activity-log` | `{ agent, action, thought, time }` | Phaser → SystemLog |
 | `agent-focus` | `{ name, id } \| null` | Phaser → React (focus mode) |
 
@@ -104,5 +129,20 @@ CREATE TABLE office_layout (
     layout_json TEXT NOT NULL,
     name TEXT DEFAULT 'default',
     updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- Shared files and review status
+CREATE TABLE shared_files (
+    id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    shared_with TEXT NOT NULL DEFAULT '[]', -- JSON string array of user/agent ids
+    status TEXT NOT NULL DEFAULT 'draft',   -- draft|shared|needs_review|approved
+    approval_request_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 ```

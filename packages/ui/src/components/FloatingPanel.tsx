@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 type Position = { x: number; y: number };
 
@@ -12,6 +13,8 @@ interface FloatingPanelProps {
     zIndex?: number;
     children: React.ReactNode;
     subtitle?: string;
+    mode?: 'floating' | 'docked';
+    className?: string;
 }
 
 function clampPosition(pos: Position, width: number): Position {
@@ -33,7 +36,9 @@ export function FloatingPanel({
     defaultMinimized = false,
     zIndex = 14,
     subtitle,
-    children
+    children,
+    mode = 'floating',
+    className
 }: FloatingPanelProps) {
     const storageKey = useMemo(() => `panel:${id}:state`, [id]);
 
@@ -48,9 +53,7 @@ export function FloatingPanel({
         } catch {
             // Ignore corrupt state.
         }
-        const dockX = defaultDock === 'right'
-            ? Math.max(8, window.innerWidth - width - 24)
-            : 24;
+        const dockX = defaultDock === 'right' ? Math.max(8, window.innerWidth - width - 24) : 24;
         return { x: dockX, y: defaultY };
     });
 
@@ -79,10 +82,7 @@ export function FloatingPanel({
         if (!dragOffset) return;
 
         const onMove = (event: MouseEvent) => {
-            const next = clampPosition(
-                { x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy },
-                width
-            );
+            const next = clampPosition({ x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy }, width);
             setPosition(next);
         };
 
@@ -97,23 +97,30 @@ export function FloatingPanel({
         };
     }, [dragOffset, width]);
 
-    return (
-        <div style={{
+    const floatingStyle: React.CSSProperties = mode === 'floating'
+        ? {
             position: 'absolute',
             left: position.x,
             top: position.y,
             width,
             zIndex,
-            borderRadius: 12,
+            borderRadius: tokens.radius.lg,
             overflow: 'hidden',
-            border: '1px solid rgba(255,255,255,0.2)',
-            backgroundColor: 'rgba(7, 10, 20, 0.86)',
-            color: '#f4f8ff',
-            boxShadow: '0 10px 26px rgba(0,0,0,0.42)',
-            backdropFilter: 'blur(6px)'
-        }}>
+            ...controlRoomStyles.panel
+        }
+        : {
+            position: 'relative',
+            width: '100%',
+            borderRadius: tokens.radius.lg,
+            overflow: 'hidden',
+            ...controlRoomStyles.panel
+        };
+
+    return (
+        <div className={className} style={floatingStyle}>
             <div
                 onMouseDown={(event) => {
+                    if (mode !== 'floating') return;
                     const target = event.target as HTMLElement;
                     if (target.closest('button') || target.closest('input') || target.closest('select')) {
                         return;
@@ -124,29 +131,29 @@ export function FloatingPanel({
                     });
                 }}
                 style={{
-                    cursor: 'grab',
+                    cursor: mode === 'floating' ? 'grab' : 'default',
                     padding: '9px 10px',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
-                    borderBottom: minimized ? 'none' : '1px solid rgba(255,255,255,0.1)',
-                    background: 'linear-gradient(90deg, rgba(28,33,71,0.8), rgba(72,31,51,0.65))'
+                    borderBottom: minimized ? 'none' : `1px solid ${tokens.color.borderSoft}`,
+                    background: 'linear-gradient(90deg, rgba(33,44,86,0.82), rgba(78,46,106,0.70))'
                 }}
             >
                 <div>
-                    <div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div>
-                    {subtitle && <div style={{ fontSize: 10, opacity: 0.75 }}>{subtitle}</div>}
+                    <div style={{ fontSize: tokens.typography.heading, fontWeight: 700 }}>{title}</div>
+                    {subtitle && <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>{subtitle}</div>}
                 </div>
                 <button
                     onClick={() => setMinimized((value) => !value)}
                     style={{
-                        border: '1px solid rgba(255,255,255,0.2)',
-                        borderRadius: 6,
+                        border: `1px solid ${tokens.color.border}`,
+                        borderRadius: tokens.radius.sm,
                         width: 24,
                         height: 22,
                         cursor: 'pointer',
-                        color: '#f4f8ff',
-                        background: 'rgba(255,255,255,0.08)'
+                        color: tokens.color.textPrimary,
+                        background: tokens.color.accentSoft
                     }}
                     title={minimized ? 'Expand panel' : 'Minimize panel'}
                 >
@@ -154,11 +161,7 @@ export function FloatingPanel({
                 </button>
             </div>
 
-            {!minimized && (
-                <div style={{ padding: 10 }}>
-                    {children}
-                </div>
-            )}
+            {!minimized && <div style={{ padding: 10 }}>{children}</div>}
         </div>
     );
 }
