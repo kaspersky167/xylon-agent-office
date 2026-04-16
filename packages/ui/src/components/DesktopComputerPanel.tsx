@@ -90,11 +90,9 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
     const [preview, setPreview] = useState<DesktopFilePreview | null>(null);
     const [loadingPreview, setLoadingPreview] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [completedFiles, setCompletedFiles] = useState<DesktopFileItem[]>([]);
 
-    const groupedFiles = useMemo(() => {
-        return [...files].sort((a, b) => a.path.localeCompare(b.path));
-    }, [files]);
-
+    const groupedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
     const selectedFile = selectedPath ? files.find((item) => item.path === selectedPath) : undefined;
 
     useEffect(() => {
@@ -155,9 +153,21 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
         room.send('file-list', { request: true });
     };
 
+    const loadCompletedFiles = async () => {
+        try {
+            const response = await fetch('/api/completed-work');
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+            setCompletedFiles(Array.isArray(payload?.files) ? payload.files : []);
+        } catch (err: any) {
+            setError(err?.message || 'Could not load completed work files.');
+        }
+    };
+
     useEffect(() => {
         if (!isOpen) return;
         requestFileList();
+        loadCompletedFiles();
     }, [isOpen]);
 
     const openFile = (path: string) => {
@@ -186,31 +196,36 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
 
         const messageType = action === 'mark-review' ? 'file-mark-review' : 'file-share';
         const audience = action === 'share-agent' ? 'agent' : action === 'share-ceo' ? 'ceo' : undefined;
-        room.send(messageType, {
-            path: selectedPath,
-            ...(audience ? { audience } : {})
-        });
+        room.send(messageType, { path: selectedPath, ...(audience ? { audience } : {}) });
     };
 
     if (!isOpen) return null;
 
     return (
-        <FloatingPanel
-            id="desktop-computer"
-            title="Desk Computer"
-            subtitle="Workspace files"
-            width={760}
-            defaultDock="right"
-            defaultY={72}
-            zIndex={22}
-        >
+        <FloatingPanel id="desktop-computer" title="Desk Computer" subtitle="Workspace files" width={760} defaultDock="right" defaultY={72} zIndex={22}>
             <div style={{ display: 'grid', gap: 10 }}>
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                     <button onClick={() => sendTopAction('share-agent')}>Share with agent</button>
                     <button onClick={() => sendTopAction('share-ceo')}>Share with CEO</button>
                     <button onClick={() => sendTopAction('mark-review')}>Mark for review</button>
-                    <button onClick={requestFileList}>Refresh</button>
+                    <button onClick={requestFileList}>Refresh Files</button>
+                    <button onClick={loadCompletedFiles}>Refresh Completed Work</button>
                     <button onClick={onClose}>Close</button>
+                </div>
+
+                <div style={{ border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, padding: 10, background: 'rgba(10, 12, 28, 0.55)' }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>
+                        Completed Work ({completedFiles.length})
+                    </div>
+                    {completedFiles.length === 0 ? (
+                        <div style={{ fontSize: 11, opacity: 0.7 }}>No completed snapshots yet.</div>
+                    ) : (
+                        <div style={{ display: 'grid', gap: 5, maxHeight: 120, overflowY: 'auto' }}>
+                            {completedFiles.slice(0, 8).map((item) => (
+                                <div key={item.path} style={{ fontSize: 11, opacity: 0.85 }}>📄 {item.path}</div>
+                            ))}
+                        </div>
+                    )}
                 </div>
 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 10, minHeight: 350 }}>
@@ -226,21 +241,14 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
                                         key={file.path}
                                         onClick={() => !isFolder && openFile(file.path)}
                                         style={{
-                                            width: '100%',
-                                            textAlign: 'left',
-                                            padding: '7px 10px',
-                                            border: 'none',
+                                            width: '100%', textAlign: 'left', padding: '7px 10px', border: 'none',
                                             borderBottom: '1px solid rgba(255,255,255,0.08)',
                                             background: isSelected ? 'rgba(130, 167, 255, 0.25)' : 'transparent',
-                                            color: '#f2f7ff',
-                                            cursor: isFolder ? 'default' : 'pointer',
-                                            opacity: isFolder ? 0.8 : 1
+                                            color: '#f2f7ff', cursor: isFolder ? 'default' : 'pointer', opacity: isFolder ? 0.8 : 1
                                         }}
                                     >
                                         <div style={{ fontSize: 12 }}>{isFolder ? '📁' : '📄'} {file.path}</div>
-                                        {file.size !== undefined && !isFolder && (
-                                            <div style={{ fontSize: 10, opacity: 0.65 }}>{file.size} bytes</div>
-                                        )}
+                                        {file.size !== undefined && !isFolder && <div style={{ fontSize: 10, opacity: 0.65 }}>{file.size} bytes</div>}
                                     </button>
                                 );
                             })

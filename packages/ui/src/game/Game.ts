@@ -50,14 +50,12 @@ export class OfficeScene extends Phaser.Scene {
     }
 
     preload() {
-        this.load.spritesheet('char_0', '/assets/characters/char_0.png', {
-            frameWidth: 16,
-            frameHeight: 32
-        });
-        this.load.spritesheet('char_1', '/assets/characters/char_1.png', {
-            frameWidth: 16,
-            frameHeight: 32
-        });
+        for (let i = 0; i <= 5; i++) {
+            this.load.spritesheet(`char_${i}`, `/assets/characters/char_${i}.png`, {
+                frameWidth: 16,
+                frameHeight: 32
+            });
+        }
         // Phaser supports SVG via `load.svg`
         this.load.svg('xylon-logo', '/xylon-logo.svg', { width: 300, height: 62 });
     }
@@ -71,20 +69,14 @@ export class OfficeScene extends Phaser.Scene {
 
             let hasAnims = false;
 
-            // Create animations for character 0
-            if (this.textures.exists('char_0')) {
-                const anims = this.anims;
-                anims.create({ key: 'char_0-walk-down', frames: anims.generateFrameNumbers('char_0', { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_0-walk-up', frames: anims.generateFrameNumbers('char_0', { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_0-walk-right', frames: anims.generateFrameNumbers('char_0', { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
+            const anims = this.anims;
+            for (let i = 0; i <= 5; i++) {
+                const charKey = `char_${i}`;
+                if (!this.textures.exists(charKey)) continue;
+                anims.create({ key: `${charKey}-walk-down`, frames: anims.generateFrameNumbers(charKey, { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
+                anims.create({ key: `${charKey}-walk-up`, frames: anims.generateFrameNumbers(charKey, { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
+                anims.create({ key: `${charKey}-walk-right`, frames: anims.generateFrameNumbers(charKey, { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
                 hasAnims = true;
-            }
-            // Create animations for character 1
-            if (this.textures.exists('char_1')) {
-                const anims = this.anims;
-                anims.create({ key: 'char_1-walk-down', frames: anims.generateFrameNumbers('char_1', { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_1-walk-up', frames: anims.generateFrameNumbers('char_1', { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_1-walk-right', frames: anims.generateFrameNumbers('char_1', { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
             }
 
             console.log("Animations created: ", hasAnims);
@@ -623,6 +615,12 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('meeting-state', (message: any) => {
                     eventBus.dispatchEvent(new CustomEvent('meeting-state', { detail: message }));
                 });
+                this.room!.onMessage('fast-track-state', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('fast-track-state', { detail: message }));
+                });
+                this.room!.onMessage('completed-work-sync', (message: any) => {
+                    eventBus.dispatchEvent(new CustomEvent('completed-work-sync', { detail: message }));
+                });
                 this.room!.onMessage('layout-sync', (message: any) => {
                     this.layoutItems = Array.isArray(message?.layout) ? message.layout : [];
                     this.renderCustomLayout(this.layoutItems);
@@ -639,14 +637,16 @@ export class OfficeScene extends Phaser.Scene {
                 });
 
                 this.room!.send('file-list', { request: true });
+                this.room!.send('request-completed-work', {});
 
                 state.agents.onAdd((agent: AgentState, sessionId: string) => {
                     console.log(`[Colyseus] Agent added: ${agent.name} at (${agent.x}, ${agent.y})`);
                     const container = this.add.container(agent.x * 16, agent.y * 16);
 
                     let sprite;
-                    let charKey = 'char_0';
-                    if (agent.name.includes('Bob')) charKey = 'char_1';
+                    const hash = Math.abs((sessionId || agent.name).split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0));
+                    const charKey = `char_${hash % 6}`;
+                    const labelColor = ['#60a5fa', '#c4b5fd', '#34d399', '#f472b6', '#f59e0b', '#f87171'][hash % 6];
 
                     if (this.textures.exists(charKey)) {
                         sprite = this.add.sprite(0, -8, charKey, 0);
@@ -674,7 +674,7 @@ export class OfficeScene extends Phaser.Scene {
                     // Name label
                     const label = this.add.text(0, 16, agent.name, {
                         fontSize: '10px', color: '#ffffff',
-                        backgroundColor: '#00000088', padding: { x: 2, y: 1 }
+                        backgroundColor: `${labelColor}66`, padding: { x: 3, y: 1 }
                     }).setOrigin(0.5, 0);
 
                     // Focus highlight ring (hidden by default)

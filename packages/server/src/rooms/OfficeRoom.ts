@@ -1,11 +1,11 @@
 import { Room, Client } from 'colyseus';
 import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
-import { OllamaAdapter } from '@agent-office/adapters';
+import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
-import { readFile, stat } from 'fs/promises';
+import { readFile, stat, mkdir, writeFile } from 'fs/promises';
 
 interface HighlightEvent {
     type: string;
@@ -22,6 +22,15 @@ interface RelationshipEdge {
     score: number;
     status: 'alliance' | 'neutral' | 'rivalry';
     updatedAt: string;
+}
+
+interface CompletedTaskRecord {
+    id: string;
+    task: string;
+    agentId: string;
+    agentName: string;
+    completedAt: string;
+    summaryPath: string;
 }
 
 interface ApprovalRequest {
@@ -87,6 +96,9 @@ export class OfficeRoom extends Room<OfficeState> {
     private coreAgents: Map<string, Agent> = new Map();
     private thinkingLocks: Map<string, boolean> = new Map();
     private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
+    private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
+    private inferenceProvider = 'ollama';
+    private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
     private hireCount = 0; // Counter for generating unique IDs
     private toolExecutor = new ToolExecutor();
     private memoryStore = new MemoryStore();
@@ -103,6 +115,8 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+    private completedTasks: CompletedTaskRecord[] = [];
+    private fastTrackMode = true;
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -231,6 +245,26 @@ export class OfficeRoom extends Room<OfficeState> {
         return OfficeRoom.activeRoom;
     }
 
+    private configureInferenceProvider() {
+        const provider = (process.env.AGENT_INFERENCE_PROVIDER || '').toLowerCase().trim();
+        if (provider === 'claude' || provider === 'openai-compatible') {
+            const baseUrl = process.env.CLAUDE_BASE_URL || process.env.OPENAI_COMPAT_BASE_URL || 'https://openrouter.ai/api';
+            const apiKey = process.env.CLAUDE_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || '';
+            if (apiKey) {
+                this.inferenceAdapter = new OpenAICompatibleAdapter(baseUrl, apiKey, 'claude');
+                this.inferenceProvider = 'claude';
+                this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
+                console.log(`[Inference] Claude/OpenAI-compatible adapter enabled (${this.defaultModel}) @ ${baseUrl}`);
+                return;
+            }
+            console.warn('[Inference] Claude requested but no API key found; falling back to local Ollama.');
+        }
+        this.inferenceAdapter = this.ollamaAdapter;
+        this.inferenceProvider = 'ollama';
+        this.defaultModel = process.env.AGENT_MODEL || 'llama3.2:latest';
+        console.log(`[Inference] Using Ollama adapter (${this.defaultModel}).`);
+    }
+
     async onCreate(options: any) {
         OfficeRoom.activeRoom = this;
         this.setState(new OfficeState());
@@ -248,6 +282,7 @@ export class OfficeRoom extends Room<OfficeState> {
             zones: []
         };
         this.office = new Office(config);
+        this.configureInferenceProvider();
 
         // Setup Core Agents with AI capabilities
         type Traits = { openness: number; conscientiousness: number; extraversion: number; agreeableness: number; neuroticism: number };
@@ -264,7 +299,7 @@ export class OfficeRoom extends Room<OfficeState> {
                 communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
             },
             capabilities: Capability[],
-            model: string = 'llama3.2:latest'
+            model: string = this.defaultModel
         ) => {
             this.state.createAgent(id, name);
             const state = this.state.agents.get(id);
@@ -273,7 +308,7 @@ export class OfficeRoom extends Room<OfficeState> {
             const coreAgent = new Agent({
                 id, name, role, avatar: 'sprite.png',
                 inference: {
-                    provider: 'ollama',
+                    provider: this.inferenceProvider,
                     model,
                     systemPrompt,
                 },
@@ -287,7 +322,7 @@ export class OfficeRoom extends Room<OfficeState> {
                 memory: { shortTermLimit: 50 }
             });
 
-            coreAgent.setInferenceAdapter(this.ollamaAdapter);
+            coreAgent.setInferenceAdapter(this.inferenceAdapter);
             await coreAgent.initialize();
 
             // Load persistent memories from previous sessions
@@ -473,7 +508,7 @@ Paired buddy: Sales Outreach.`,
             `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Enforce evidence quality: for volatile topics (news, pricing, specs, policies, releases, outages), require recent sources, require source URLs in findings, and reject stale cached assumptions. Be concise and direct.`,
             { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
             COORDINATOR,
-            process.env.CEO_MODEL || 'llama3.1:70b'
+            process.env.CEO_MODEL || this.defaultModel
         );
 
         this.rebuildRelationshipGraph();
@@ -528,6 +563,10 @@ Paired buddy: Sales Outreach.`,
             if (text.startsWith('/')) {
                 const handled = this.handleSlashCommand(text);
                 if (handled) return;
+            }
+
+            if (this.handleDirectMentions(text)) {
+                return;
             }
 
             // Fallback: fuzzy name-matching priority routing.
@@ -587,10 +626,29 @@ Paired buddy: Sales Outreach.`,
                     agentId: targetId,
                     agentName: agentState.name,
                     task: title,
-                    status: 'in_progress'
+                    status: 'in_progress',
+                    fastTrackMode: this.fastTrackMode
                 });
                 this.seedTaskProgress(targetId, title);
             }
+        });
+
+        this.onMessage('set-fast-track', (_client, message) => {
+            this.fastTrackMode = Boolean(message?.enabled);
+            this.broadcast('fast-track-state', { enabled: this.fastTrackMode });
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: this.fastTrackMode
+                    ? '⚡ Fast-track mode enabled: fewer interruptions, higher task throughput.'
+                    : '🧭 Fast-track mode disabled: collaboration cadence restored.'
+            });
+        });
+
+        this.onMessage('request-completed-work', (client) => {
+            client.send('completed-work-sync', {
+                items: this.completedTasks,
+                reviewFolder: 'data/workspace/completed-work'
+            });
         });
 
         // User-triggered workspace read-only tools
@@ -926,6 +984,17 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m) => m.from.includes('CEO'))) {
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `🗣️ ${decision.message}`
+                            });
+                            this.emitHighlight(
+                                'conversation',
+                                `${coreAgent.config.name} replied to CEO`,
+                                decision.message.slice(0, 120),
+                                id
+                            );
                         }
 
                         coreAgent.clearInbox(); // Clear after processing
@@ -953,7 +1022,8 @@ Paired buddy: Sales Outreach.`,
                                     agentId: targetId,
                                     agentName: targetAgent.config.name,
                                     task: title,
-                                    status: 'in_progress'
+                                    status: 'in_progress',
+                                    fastTrackMode: this.fastTrackMode
                                 });
                                 this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
@@ -992,8 +1062,8 @@ Paired buddy: Sales Outreach.`,
                                 const hireAgent = new Agent({
                                     id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
                                     inference: {
-                                        provider: 'ollama',
-                                        model: 'llama3.2:latest',
+                                        provider: this.inferenceProvider,
+                                        model: this.defaultModel,
                                         systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
                                     },
                                     personality: {
@@ -1011,7 +1081,7 @@ Paired buddy: Sales Outreach.`,
                                     memory: { shortTermLimit: 50 }
                                 });
 
-                                hireAgent.setInferenceAdapter(this.ollamaAdapter);
+                                hireAgent.setInferenceAdapter(this.inferenceAdapter);
                                 await hireAgent.initialize();
                                 this.coreAgents.set(hireId, hireAgent);
                                 this.thinkingLocks.set(hireId, false);
@@ -1106,11 +1176,11 @@ Paired buddy: Sales Outreach.`,
 
                     await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
 
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
 
                 }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
-                    setTimeout(() => this.thinkingLocks.set(id, false), 15000);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
             }
         });
@@ -1138,7 +1208,7 @@ Paired buddy: Sales Outreach.`,
 
                 // During a meeting, everyone (except CEO who stays in their office
                 // but attends virtually) gathers near the meeting table.
-                if (this.meetingActive && key !== 'ceo') {
+                if (!this.fastTrackMode && this.meetingActive && key !== 'ceo') {
                     const table = this.furnitureTargets['meeting-table'];
                     // Seats around the table — spread by hashing agent id
                     const hash = Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0));
@@ -1152,7 +1222,7 @@ Paired buddy: Sales Outreach.`,
                 }
 
                 // If agent action is 'talk', move towards the other agent instead
-                if (agent.action === 'talk') {
+                if (!this.fastTrackMode && agent.action === 'talk') {
                     let closest: { x: number; y: number } | null = null;
                     let minDist = Infinity;
                     this.state.agents.forEach((other, otherKey) => {
@@ -1340,12 +1410,15 @@ Paired buddy: Sales Outreach.`,
 
         const key = this.progressKey(agentId, taskTitle);
         const current = this.taskProgress.get(key) ?? 0;
+        const baseWorkDelta = this.fastTrackMode ? 0.45 : 0.2;
+        const baseToolDelta = this.fastTrackMode ? 0.5 : 0.3;
+        const baseTalkDelta = this.fastTrackMode ? 0.02 : 0.08;
         const delta = action === 'work'
-            ? 0.2
+            ? baseWorkDelta
             : action === 'use_tool'
-                ? 0.3
+                ? baseToolDelta
                 : action === 'talk'
-                    ? 0.08
+                    ? baseTalkDelta
                     : 0;
         if (delta <= 0) return;
 
@@ -1357,7 +1430,8 @@ Paired buddy: Sales Outreach.`,
             agentName: agent.config.name,
             task: taskTitle,
             status: next >= 1 ? 'completed' : 'in_progress',
-            progress: next
+            progress: next,
+            fastTrackMode: this.fastTrackMode
         });
 
         if (next < 1) return;
@@ -1380,6 +1454,48 @@ Paired buddy: Sales Outreach.`,
             `"${taskTitle}" is complete.`,
             agentId
         );
+
+        const completion = await this.persistCompletedWork(taskTitle, agentId, agent.config.name);
+        this.completedTasks = [completion, ...this.completedTasks].slice(0, 50);
+        this.broadcast('completed-work-sync', {
+            items: this.completedTasks,
+            reviewFolder: 'data/workspace/completed-work'
+        });
+    }
+
+    private async persistCompletedWork(taskTitle: string, agentId: string, agentName: string): Promise<CompletedTaskRecord> {
+        const completedAt = this.state.officeTime || new Date().toISOString();
+        const dateStamp = completedAt.slice(0, 10);
+        const slug = taskTitle
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 48) || 'task';
+        const folder = path.join(this.workspaceRoot, 'completed-work');
+        const filename = `${dateStamp}-${agentId}-${slug}.md`;
+        const absolutePath = path.join(folder, filename);
+        await mkdir(folder, { recursive: true });
+        const content = [
+            `# Completed Work`,
+            ``,
+            `- Task: ${taskTitle}`,
+            `- Agent: ${agentName} (${agentId})`,
+            `- Completed At: ${completedAt}`,
+            `- Fast Track Mode: ${this.fastTrackMode ? 'enabled' : 'disabled'}`,
+            ``,
+            `## Review Notes`,
+            `- Replace this section with detailed output updates and requested revisions.`,
+            ``
+        ].join('\n');
+        await writeFile(absolutePath, content, 'utf-8');
+        return {
+            id: `${agentId}:${taskTitle}:${completedAt}`,
+            task: taskTitle,
+            agentId,
+            agentName,
+            completedAt,
+            summaryPath: path.posix.join('completed-work', filename)
+        };
     }
 
     // ─── MEETINGS ───
@@ -1472,6 +1588,44 @@ Paired buddy: Sales Outreach.`,
             sender: '🏢 Office',
             text: `⚡ CEO priority routed to: ${targets.map((t) => this.coreAgents.get(t)?.config.name || t).join(', ')}`
         });
+    }
+
+    private handleDirectMentions(text: string): boolean {
+        if (!text.trim()) return false;
+        const handles = Array.from(text.matchAll(/@([a-z0-9_-]+)/gi))
+            .map((match) => (match[1] || '').toLowerCase())
+            .filter(Boolean);
+        if (handles.length === 0) return false;
+
+        const routed: string[] = [];
+        for (const handle of handles) {
+            const agentId = this.resolveAgentHandle(handle);
+            if (!agentId) continue;
+            const agent = this.coreAgents.get(agentId);
+            const state = this.state.agents.get(agentId);
+            if (!agent || !state) continue;
+
+            routed.push(agent.config.name);
+            const mentionTask = `Respond to CEO mention: ${text.slice(0, 110)}`;
+            agent.currentTask = mentionTask;
+            state.currentTask = mentionTask;
+            state.action = 'talk';
+            agent.receiveMessage({
+                from: 'Faz (CEO)',
+                to: agent.config.name,
+                content: `DIRECT MENTION from CEO: "${text}". Reply in office chat with a concrete answer. If you produce artifacts, save them under data/workspace/completed-work and include the file path.`,
+                timestamp: this.state.officeTime
+            });
+        }
+
+        if (routed.length > 0) {
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: `🎯 Direct mention routed to: ${routed.join(', ')}`
+            });
+            return true;
+        }
+        return false;
     }
 
     // ─── CEO APPROVAL QUEUE ───
@@ -2027,11 +2181,21 @@ Paired buddy: Sales Outreach.`,
         return {
             edges: Array.from(this.relationships.values()).map((edge) => ({
                 ...edge,
+                label: this.relationshipLabel(edge.score),
                 aName: idToName[edge.a] || edge.a,
                 bName: idToName[edge.b] || edge.b
             })),
             time: this.state.officeTime
         };
+    }
+
+    private relationshipLabel(score: number): string {
+        const abs = Math.abs(score);
+        if (score >= 0.75) return 'Trusted partner';
+        if (score >= 0.35) return 'Active collaborators';
+        if (abs < 0.35) return 'Neutral / low signal';
+        if (score <= -0.75) return 'Escalated conflict';
+        return 'Constructive tension';
     }
 
     public registerAudienceVote(eventName: string, voterId?: string) {
@@ -2113,6 +2277,11 @@ Paired buddy: Sales Outreach.`,
             client.send('tasks-sync', tasks);
         });
         client.send('relationship-update', this.buildRelationshipPayload());
+        client.send('fast-track-state', { enabled: this.fastTrackMode });
+        client.send('completed-work-sync', {
+            items: this.completedTasks,
+            reviewFolder: 'data/workspace/completed-work'
+        });
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
         client.send('approvals-sync', this.listApprovals());
         client.send('meeting-state', this.meetingActive
