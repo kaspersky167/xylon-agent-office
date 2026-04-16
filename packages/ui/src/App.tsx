@@ -1,11 +1,5 @@
 import React, { useState } from 'react';
 import { ChatPanel } from './components/ChatPanel';
-import { TaskBoard } from './components/TaskBoard';
-import { AgentInspector } from './components/AgentInspector';
-import { LayoutEditor } from './components/LayoutEditor';
-import { SystemLog } from './components/SystemLog';
-import { ViralControlPanel } from './components/ViralControlPanel';
-import { HighlightsFeed } from './components/HighlightsFeed';
 import { AgentPulseBoard } from './components/AgentPulseBoard';
 import { RelationshipGraph } from './components/RelationshipGraph';
 import { EpisodeRecapPanel } from './components/EpisodeRecapPanel';
@@ -42,5 +36,13 @@ export function App() {
             <ProjectProgressPanel />
             <DesktopComputerPanel isOpen={desktopPanelOpen} onClose={() => setDesktopPanelOpen(false)} />
         </>
+    );
+}
+
+export function App() {
+    return (
+        <UIStoreProvider>
+            <AppContent />
+        </UIStoreProvider>
     );
 }

@@ -1,36 +1,73 @@
-import sqlite3 from 'sqlite3';
-import { open, Database } from 'sqlite';
-import { MemoryEntry } from '@agent-office/core';
+import sqlite3 from "sqlite3";
+import { open, Database } from "sqlite";
+import { MemoryEntry } from "@agent-office/core";
+
+export type SharedFileStatus =
+  | "draft"
+  | "shared"
+  | "needs_review"
+  | "approved"
+  | "rejected";
+
+export interface ToolAuditRecord {
+  actorId: string;
+  actorRole: string;
+  toolName: string;
+  paramsHash: string;
+  result: string;
+  approvalId?: string | null;
+  createdAt?: string;
+}
+
+export interface SharedFileRecord {
+  id: string;
+  path: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  createdBy: string;
+  sharedWith: string[];
+  status: SharedFileStatus;
+  createdAt?: string;
+  updatedAt?: string;
+  approvalRequestId?: string | null;
+}
+
+export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+export type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
 
 function cosineSimilarity(a: number[], b: number[]): number {
-    if (a.length !== b.length) return 0;
-    let dot = 0, magA = 0, magB = 0;
-    for (let i = 0; i < a.length; i++) {
-        dot += a[i] * b[i]; magA += a[i] * a[i]; magB += b[i] * b[i];
-    }
-    return dot / (Math.sqrt(magA) * Math.sqrt(magB) || 1);
+  if (a.length !== b.length) return 0;
+  let dot = 0,
+    magA = 0,
+    magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB) || 1);
 }
 
 export class MemoryStore {
-    private db?: Database;
-    private ollamaUrl: string;
+  private db?: Database;
+  private ollamaUrl: string;
 
-    constructor(ollamaUrl: string = 'http://localhost:11434') {
-        this.ollamaUrl = ollamaUrl;
-    }
+  constructor(ollamaUrl: string = "http://localhost:11434") {
+    this.ollamaUrl = ollamaUrl;
+  }
 
-    async initialize(dbPath: string = './data/office-memory.db') {
-        // Ensure data directory exists
-        const { mkdir } = await import('fs/promises');
-        const path = await import('path');
-        await mkdir(path.dirname(dbPath), { recursive: true });
+  async initialize(dbPath: string = "./data/office-memory.db") {
+    const { mkdir } = await import("fs/promises");
+    const path = await import("path");
+    await mkdir(path.dirname(dbPath), { recursive: true });
 
-        this.db = await open({
-            filename: dbPath,
-            driver: sqlite3.Database
-        });
+    this.db = await open({
+      filename: dbPath,
+      driver: sqlite3.Database,
+    });
 
-        await this.db.exec(`
+    await this.db.exec(`
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_id TEXT NOT NULL,
@@ -46,11 +83,16 @@ export class MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance DESC);
 
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 assigned_to TEXT,
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'backlog',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                requires_approval INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL DEFAULT 'system',
+                status_reason TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
                 completed_at TEXT
             );
 
@@ -71,197 +113,504 @@ export class MemoryStore {
                 status TEXT NOT NULL DEFAULT 'pending',
                 pending_tool TEXT,
                 pending_params TEXT,
+                file_id TEXT,
+                file_path TEXT,
+                file_name TEXT,
+                file_shared_by_agent_id TEXT,
+                file_shared_by_agent_name TEXT,
+                file_summary_note TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS shared_files (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                mime_type TEXT,
+                size_bytes INTEGER DEFAULT 0,
+                shared_by_agent_id TEXT NOT NULL,
+                shared_by_agent_name TEXT NOT NULL,
+                shared_with TEXT,
+                summary_note TEXT,
+                status TEXT NOT NULL DEFAULT 'shared',
+                approval_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS share_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id TEXT NOT NULL,
+                actor_role TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                params_hash TEXT NOT NULL,
+                result TEXT NOT NULL,
+                approval_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_actor ON tool_audit_logs(actor_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_tool ON tool_audit_logs(tool_name, created_at DESC);
         `);
 
-        // Migration: add embedding column to existing databases
-        try {
-            await this.db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT');
-        } catch {
-            // Column already exists — ignore
-        }
+    try {
+      await this.db.exec("ALTER TABLE memories ADD COLUMN embedding TEXT");
+    } catch {}
+    try {
+      await this.db.exec("ALTER TABLE approvals ADD COLUMN file_id TEXT");
+    } catch {}
+    try {
+      await this.db.exec("ALTER TABLE approvals ADD COLUMN file_path TEXT");
+    } catch {}
+    try {
+      await this.db.exec("ALTER TABLE approvals ADD COLUMN file_name TEXT");
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE approvals ADD COLUMN file_shared_by_agent_id TEXT",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE approvals ADD COLUMN file_shared_by_agent_name TEXT",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE approvals ADD COLUMN file_summary_note TEXT",
+      );
+    } catch {}
+    try {
+      await this.db.exec("ALTER TABLE shared_files ADD COLUMN mime_type TEXT");
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE shared_files ADD COLUMN size_bytes INTEGER DEFAULT 0",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE shared_files ADD COLUMN shared_with TEXT",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE shared_files ADD COLUMN created_at TEXT DEFAULT (datetime('now'))",
+      );
+    } catch {}
 
-        console.log('[MemoryStore] SQLite initialized at', dbPath);
+    console.log("[MemoryStore] SQLite initialized at", dbPath);
+  }
+
+  private async generateEmbedding(text: string): Promise<number[] | null> {
+    try {
+      const res = await fetch(`${this.ollamaUrl}/api/embeddings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "llama3.2:latest", prompt: text }),
+      });
+      const data = await res.json();
+      return data.embedding || null;
+    } catch {
+      return null;
     }
+  }
 
-    // --- Embedding Generation ---
-
-    private async generateEmbedding(text: string): Promise<number[] | null> {
-        try {
-            const res = await fetch(`${this.ollamaUrl}/api/embeddings`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model: 'llama3.2:latest', prompt: text })
-            });
-            const data = await res.json();
-            return data.embedding || null;
-        } catch {
-            return null;
-        }
+  async saveMemory(
+    agentId: string,
+    entry: MemoryEntry,
+    sessionId?: string,
+  ): Promise<void> {
+    if (!this.db) return;
+    let embeddingStr: string | null = null;
+    if (entry.importance >= 0.5) {
+      const embedding = await this.generateEmbedding(entry.content);
+      if (embedding) embeddingStr = JSON.stringify(embedding);
     }
+    await this.db.run(
+      "INSERT INTO memories (agent_id, content, type, timestamp, importance, embedding, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [
+        agentId,
+        entry.content,
+        entry.type,
+        entry.timestamp,
+        entry.importance,
+        embeddingStr,
+        sessionId || null,
+      ],
+    );
+  }
 
-    // --- Memory Operations ---
-
-    async saveMemory(agentId: string, entry: MemoryEntry, sessionId?: string): Promise<void> {
-        if (!this.db) return;
-        // Generate embedding for semantic search (async, non-blocking)
-        let embeddingStr: string | null = null;
-        if (entry.importance >= 0.5) {
-            const embedding = await this.generateEmbedding(entry.content);
-            if (embedding) embeddingStr = JSON.stringify(embedding);
-        }
-        await this.db.run(
-            'INSERT INTO memories (agent_id, content, type, timestamp, importance, embedding, session_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [agentId, entry.content, entry.type, entry.timestamp, entry.importance, embeddingStr, sessionId || null]
-        );
+  async saveMemories(
+    agentId: string,
+    entries: MemoryEntry[],
+    sessionId?: string,
+  ): Promise<void> {
+    for (const entry of entries) {
+      await this.saveMemory(agentId, entry, sessionId);
     }
+  }
 
-    async saveMemories(agentId: string, entries: MemoryEntry[], sessionId?: string): Promise<void> {
-        for (const entry of entries) {
-            await this.saveMemory(agentId, entry, sessionId);
-        }
+  async loadMemories(
+    agentId: string,
+    limit: number = 20,
+  ): Promise<MemoryEntry[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT content, type, timestamp, importance FROM memories WHERE agent_id = ? ORDER BY importance DESC, created_at DESC LIMIT ?",
+      [agentId, limit],
+    );
+    return rows.map((r: any) => ({
+      content: r.content,
+      type: r.type,
+      timestamp: r.timestamp,
+      importance: r.importance,
+    }));
+  }
+
+  async semanticSearch(
+    agentId: string,
+    query: string,
+    topK: number = 5,
+  ): Promise<MemoryEntry[]> {
+    if (!this.db) return [];
+    const queryEmbedding = await this.generateEmbedding(query);
+    if (!queryEmbedding) return this.loadMemories(agentId, topK);
+
+    const rows = await this.db.all(
+      "SELECT content, type, timestamp, importance, embedding FROM memories WHERE agent_id = ? AND embedding IS NOT NULL",
+      [agentId],
+    );
+
+    const scored = rows
+      .map((r: any) => {
+        const emb = JSON.parse(r.embedding);
+        const score = cosineSimilarity(queryEmbedding, emb);
+        return {
+          content: r.content,
+          type: r.type,
+          timestamp: r.timestamp,
+          importance: r.importance,
+          score,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    return scored.slice(0, topK).map((s) => ({
+      content: s.content,
+      type: s.type,
+      timestamp: s.timestamp,
+      importance: s.importance,
+    }));
+  }
+
+  async createTask(title: string, assignedTo?: string): Promise<number> {
+    if (!this.db) return -1;
+    const result = await this.db.run(
+      "INSERT INTO tasks (title, assigned_to) VALUES (?, ?)",
+      [title, assignedTo || null],
+    );
+    return result.lastID || -1;
+  }
+
+  async getTasks(): Promise<any[]> {
+    if (!this.db) return [];
+    return this.db.all("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50");
+  }
+
+  async assignTask(taskId: number, agentId: string): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "UPDATE tasks SET assigned_to = ?, status = ? WHERE id = ?",
+      [agentId, "in_progress", taskId],
+    );
+  }
+
+  async completeTask(taskId: number): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+      [taskId],
+    );
+  }
+
+  async saveLayout(name: string, layoutJson: string): Promise<void> {
+    if (!this.db) return;
+    const existing = await this.db.get(
+      "SELECT id FROM office_layout WHERE name = ?",
+      [name],
+    );
+    if (existing) {
+      await this.db.run(
+        "UPDATE office_layout SET layout_json = ?, updated_at = datetime('now') WHERE name = ?",
+        [layoutJson, name],
+      );
+    } else {
+      await this.db.run(
+        "INSERT INTO office_layout (name, layout_json) VALUES (?, ?)",
+        [name, layoutJson],
+      );
     }
+  }
 
-    async loadMemories(agentId: string, limit: number = 20): Promise<MemoryEntry[]> {
-        if (!this.db) return [];
-        const rows = await this.db.all(
-            'SELECT content, type, timestamp, importance FROM memories WHERE agent_id = ? ORDER BY importance DESC, created_at DESC LIMIT ?',
-            [agentId, limit]
-        );
-        return rows.map((r: any) => ({
-            content: r.content,
-            type: r.type,
-            timestamp: r.timestamp,
-            importance: r.importance
-        }));
+  async loadLayout(name: string = "default"): Promise<any | null> {
+    if (!this.db) return null;
+    const row = await this.db.get(
+      "SELECT layout_json FROM office_layout WHERE name = ?",
+      [name],
+    );
+    return row ? JSON.parse(row.layout_json) : null;
+  }
+
+  async saveApproval(a: {
+    id: string;
+    requestedBy: string;
+    requestedByName: string;
+    requestedAction: string;
+    rationale: string;
+    isMajor: boolean;
+    status: "pending" | "approved" | "rejected";
+    pending?: { toolName: string; params: any } | null;
+    fileContext?: {
+      fileId: string;
+      filePath: string;
+      fileName: string;
+      sharedByAgentId: string;
+      sharedByAgentName: string;
+      summaryNote: string;
+    } | null;
+    createdAt: string;
+  }): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      `INSERT OR REPLACE INTO approvals
+             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, file_id, file_path, file_name, file_shared_by_agent_id, file_shared_by_agent_name, file_summary_note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        a.id,
+        a.requestedBy,
+        a.requestedByName,
+        a.requestedAction,
+        a.rationale,
+        a.isMajor ? 1 : 0,
+        a.status,
+        a.pending?.toolName || null,
+        a.pending ? JSON.stringify(a.pending.params ?? {}) : null,
+        a.fileContext?.fileId || null,
+        a.fileContext?.filePath || null,
+        a.fileContext?.fileName || null,
+        a.fileContext?.sharedByAgentId || null,
+        a.fileContext?.sharedByAgentName || null,
+        a.fileContext?.summaryNote || null,
+        a.createdAt,
+      ],
+    );
+  }
+
+  async updateApprovalStatus(
+    id: string,
+    status: "approved" | "rejected",
+  ): Promise<void> {
+    if (!this.db) return;
+    await this.db.run("UPDATE approvals SET status = ? WHERE id = ?", [
+      status,
+      id,
+    ]);
+  }
+
+  async deleteApproval(id: string): Promise<void> {
+    if (!this.db) return;
+    await this.db.run("DELETE FROM approvals WHERE id = ?", [id]);
+  }
+
+  async loadApprovals(): Promise<any[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM approvals ORDER BY created_at ASC",
+    );
+    return rows.map((r: any) => ({
+      id: r.id,
+      requestedBy: r.requested_by,
+      requestedByName: r.requested_by_name,
+      requestedAction: r.requested_action,
+      rationale: r.rationale || "",
+      isMajor: r.is_major === 1,
+      status: r.status,
+      createdAt: r.created_at,
+      pending: r.pending_tool
+        ? {
+            toolName: r.pending_tool,
+            params: r.pending_params ? JSON.parse(r.pending_params) : {},
+          }
+        : null,
+      fileContext: r.file_id
+        ? {
+            fileId: r.file_id,
+            filePath: r.file_path || "",
+            fileName: r.file_name || "",
+            sharedByAgentId: r.file_shared_by_agent_id || "",
+            sharedByAgentName: r.file_shared_by_agent_name || "",
+            summaryNote: r.file_summary_note || "",
+          }
+        : null,
+    }));
+  }
+
+  async upsertSharedFile(
+    file: Partial<SharedFileRecord> & {
+      id: string;
+      filePath?: string;
+      fileName?: string;
+      sharedByAgentId?: string;
+      sharedByAgentName?: string;
+      summaryNote?: string;
+      approvalId?: string | null;
+      updatedAt?: string;
+    },
+  ): Promise<void> {
+    if (!this.db) return;
+
+    const path = file.path || file.filePath || "";
+    const name = file.name || file.fileName || "";
+    const createdBy = file.createdBy || file.sharedByAgentId || "unknown";
+    const sharedByName = file.sharedByAgentName || file.createdBy || "Unknown";
+    const status = file.status || "shared";
+    const updatedAt = file.updatedAt || new Date().toISOString();
+    const createdAt = file.createdAt || updatedAt;
+    const mimeType = file.mimeType || "application/octet-stream";
+    const sharedWith = Array.isArray(file.sharedWith) ? file.sharedWith : [];
+
+    await this.db.run(
+      `INSERT OR REPLACE INTO shared_files
+             (id, file_path, file_name, mime_type, size_bytes, shared_by_agent_id, shared_by_agent_name, shared_with, summary_note, status, approval_id, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        file.id,
+        path,
+        name,
+        mimeType,
+        Number(file.sizeBytes || 0),
+        createdBy,
+        sharedByName,
+        JSON.stringify(sharedWith),
+        file.summaryNote || null,
+        status,
+        file.approvalRequestId || file.approvalId || null,
+        createdAt,
+        updatedAt,
+      ],
+    );
+  }
+
+  async listSharedFiles(filter?: {
+    status?: SharedFileStatus;
+    createdBy?: string;
+    sharedWith?: string;
+  }): Promise<SharedFileRecord[]> {
+    if (!this.db) return [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (filter?.status) {
+      clauses.push("status = ?");
+      params.push(filter.status);
     }
-
-    async semanticSearch(agentId: string, query: string, topK: number = 5): Promise<MemoryEntry[]> {
-        if (!this.db) return [];
-        const queryEmbedding = await this.generateEmbedding(query);
-        if (!queryEmbedding) return this.loadMemories(agentId, topK); // Fallback to recency
-
-        const rows = await this.db.all(
-            'SELECT content, type, timestamp, importance, embedding FROM memories WHERE agent_id = ? AND embedding IS NOT NULL',
-            [agentId]
-        );
-
-        const scored = rows.map((r: any) => {
-            const emb = JSON.parse(r.embedding);
-            const score = cosineSimilarity(queryEmbedding, emb);
-            return { content: r.content, type: r.type, timestamp: r.timestamp, importance: r.importance, score };
-        }).sort((a, b) => b.score - a.score);
-
-        return scored.slice(0, topK).map(s => ({
-            content: s.content,
-            type: s.type,
-            timestamp: s.timestamp,
-            importance: s.importance
-        }));
+    if (filter?.createdBy) {
+      clauses.push("shared_by_agent_id = ?");
+      params.push(filter.createdBy);
     }
-
-    // --- Task Operations ---
-
-    async createTask(title: string, assignedTo?: string): Promise<number> {
-        if (!this.db) return -1;
-        const result = await this.db.run(
-            'INSERT INTO tasks (title, assigned_to) VALUES (?, ?)',
-            [title, assignedTo || null]
-        );
-        return result.lastID || -1;
+    if (filter?.sharedWith) {
+      clauses.push("shared_with LIKE ?");
+      params.push(`%${filter.sharedWith}%`);
     }
+    const sql = `SELECT * FROM shared_files ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC`;
+    const rows = await this.db.all(sql, params);
+    return rows.map((row: any) => ({
+      id: row.id,
+      path: row.file_path,
+      name: row.file_name,
+      mimeType: row.mime_type || "application/octet-stream",
+      sizeBytes: Number(row.size_bytes || 0),
+      createdBy: row.shared_by_agent_id,
+      sharedWith: row.shared_with ? JSON.parse(row.shared_with) : [],
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      approvalRequestId: row.approval_id || null,
+    }));
+  }
 
-    async getTasks(): Promise<any[]> {
-        if (!this.db) return [];
-        return this.db.all('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50');
-    }
+  async getSharedFile(id: string): Promise<SharedFileRecord | null> {
+    if (!this.db) return null;
+    const row = await this.db.get("SELECT * FROM shared_files WHERE id = ?", [
+      id,
+    ]);
+    if (!row) return null;
+    return {
+      id: row.id,
+      path: row.file_path,
+      name: row.file_name,
+      mimeType: row.mime_type || "application/octet-stream",
+      sizeBytes: Number(row.size_bytes || 0),
+      createdBy: row.shared_by_agent_id,
+      sharedWith: row.shared_with ? JSON.parse(row.shared_with) : [],
+      status: row.status,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      approvalRequestId: row.approval_id || null,
+    };
+  }
 
-    async assignTask(taskId: number, agentId: string): Promise<void> {
-        if (!this.db) return;
-        await this.db.run('UPDATE tasks SET assigned_to = ?, status = ? WHERE id = ?', [agentId, 'in_progress', taskId]);
-    }
+  async updateSharedFileStatus(
+    fileId: string,
+    status: SharedFileStatus,
+    approvalId?: string | null,
+  ): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "UPDATE shared_files SET status = ?, approval_id = ?, updated_at = datetime('now') WHERE id = ?",
+      [status, approvalId || null, fileId],
+    );
+  }
 
-    async completeTask(taskId: number): Promise<void> {
-        if (!this.db) return;
-        await this.db.run("UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?", [taskId]);
-    }
+  async logShareAction(input: {
+    fileId: string;
+    action: string;
+    actor: string;
+    details?: string;
+  }): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "INSERT INTO share_actions (file_id, action, actor, details) VALUES (?, ?, ?, ?)",
+      [input.fileId, input.action, input.actor, input.details || null],
+    );
+  }
 
-    // --- Layout Operations ---
+  async logToolAudit(input: ToolAuditRecord): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      `INSERT INTO tool_audit_logs
+             (actor_id, actor_role, tool_name, params_hash, result, approval_id)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        input.actorId,
+        input.actorRole,
+        input.toolName,
+        input.paramsHash,
+        input.result,
+        input.approvalId || null,
+      ],
+    );
+  }
 
-    async saveLayout(name: string, layoutJson: string): Promise<void> {
-        if (!this.db) return;
-        const existing = await this.db.get('SELECT id FROM office_layout WHERE name = ?', [name]);
-        if (existing) {
-            await this.db.run("UPDATE office_layout SET layout_json = ?, updated_at = datetime('now') WHERE name = ?", [layoutJson, name]);
-        } else {
-            await this.db.run('INSERT INTO office_layout (name, layout_json) VALUES (?, ?)', [name, layoutJson]);
-        }
-    }
-
-    async loadLayout(name: string = 'default'): Promise<any | null> {
-        if (!this.db) return null;
-        const row = await this.db.get('SELECT layout_json FROM office_layout WHERE name = ?', [name]);
-        return row ? JSON.parse(row.layout_json) : null;
-    }
-
-    // --- Approval Operations ---
-
-    async saveApproval(a: {
-        id: string;
-        requestedBy: string;
-        requestedByName: string;
-        requestedAction: string;
-        rationale: string;
-        isMajor: boolean;
-        status: 'pending' | 'approved' | 'rejected';
-        pending?: { toolName: string; params: any } | null;
-        createdAt: string;
-    }): Promise<void> {
-        if (!this.db) return;
-        await this.db.run(
-            `INSERT OR REPLACE INTO approvals
-             (id, requested_by, requested_by_name, requested_action, rationale, is_major, status, pending_tool, pending_params, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                a.id, a.requestedBy, a.requestedByName, a.requestedAction, a.rationale,
-                a.isMajor ? 1 : 0, a.status,
-                a.pending?.toolName || null,
-                a.pending ? JSON.stringify(a.pending.params ?? {}) : null,
-                a.createdAt,
-            ]
-        );
-    }
-
-    async updateApprovalStatus(id: string, status: 'approved' | 'rejected'): Promise<void> {
-        if (!this.db) return;
-        await this.db.run('UPDATE approvals SET status = ? WHERE id = ?', [status, id]);
-    }
-
-    async deleteApproval(id: string): Promise<void> {
-        if (!this.db) return;
-        await this.db.run('DELETE FROM approvals WHERE id = ?', [id]);
-    }
-
-    async loadApprovals(): Promise<any[]> {
-        if (!this.db) return [];
-        const rows = await this.db.all('SELECT * FROM approvals ORDER BY created_at ASC');
-        return rows.map((r: any) => ({
-            id: r.id,
-            requestedBy: r.requested_by,
-            requestedByName: r.requested_by_name,
-            requestedAction: r.requested_action,
-            rationale: r.rationale || '',
-            isMajor: r.is_major === 1,
-            status: r.status,
-            createdAt: r.created_at,
-            pending: r.pending_tool
-                ? { toolName: r.pending_tool, params: r.pending_params ? JSON.parse(r.pending_params) : {} }
-                : null,
-        }));
-    }
-
-    async close(): Promise<void> {
-        if (this.db) await this.db.close();
-    }
+  async close(): Promise<void> {
+    if (this.db) await this.db.close();
+  }
 }
