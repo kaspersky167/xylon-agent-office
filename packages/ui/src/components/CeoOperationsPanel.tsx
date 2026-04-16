@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
 import { FloatingPanel } from './FloatingPanel';
@@ -28,7 +28,7 @@ type CompletedWorkItem = {
     summaryPath: string;
 };
 
-export function CeoOperationsPanel() {
+export function CeoOperationsPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [tasks, setTasks] = useState<TaskItem[]>([]);
     const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
     const [meeting, setMeeting] = useState<{ active: boolean; topic?: string; endsAt?: number } | null>(null);
@@ -37,6 +37,10 @@ export function CeoOperationsPanel() {
     const [targetAgent, setTargetAgent] = useState('auto');
     const [completedWork, setCompletedWork] = useState<CompletedWorkItem[]>([]);
     const [reviewFolder, setReviewFolder] = useState('data/workspace/completed-work');
+    const [panelPulse, setPanelPulse] = useState(false);
+    const tasksSectionRef = useRef<HTMLDivElement>(null);
+    const approvalsSectionRef = useRef<HTMLDivElement>(null);
+    const activitySectionRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
         const onTaskUpdate = (event: Event) => {
@@ -82,6 +86,22 @@ export function CeoOperationsPanel() {
                 setReviewFolder(detail.reviewFolder.trim());
             }
         };
+        const onOpenContext = (event: Event) => {
+            const detail = (event as CustomEvent).detail || {};
+            if (detail.panel && detail.panel !== 'ceo-operations') return;
+            setPanelPulse(true);
+            window.setTimeout(() => setPanelPulse(false), 700);
+            const section = detail.section;
+            if (section === 'approvals') {
+                approvalsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                return;
+            }
+            if (section === 'tasks') {
+                tasksSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                return;
+            }
+            activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        };
 
         eventBus.addEventListener('task-update', onTaskUpdate);
         eventBus.addEventListener('tasks-sync', onTasksSync);
@@ -89,6 +109,7 @@ export function CeoOperationsPanel() {
         eventBus.addEventListener('meeting-state', onMeeting);
         eventBus.addEventListener('fast-track-state', onFastTrack);
         eventBus.addEventListener('completed-work-sync', onCompletedWork);
+        eventBus.addEventListener('open-context-panel', onOpenContext);
 
         const requestTimer = setInterval(() => {
             const room = getColyseusRoom();
@@ -106,6 +127,7 @@ export function CeoOperationsPanel() {
             eventBus.removeEventListener('meeting-state', onMeeting);
             eventBus.removeEventListener('fast-track-state', onFastTrack);
             eventBus.removeEventListener('completed-work-sync', onCompletedWork);
+            eventBus.removeEventListener('open-context-panel', onOpenContext);
         };
     }, []);
 
@@ -149,16 +171,26 @@ export function CeoOperationsPanel() {
     };
 
     return (
-        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26}>
+        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26} mode={mode}>
             <div style={{ display: 'grid', gap: 10, fontSize: 12 }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                <div
+                    ref={activitySectionRef}
+                    style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1fr 1fr',
+                        gap: 6,
+                        border: panelPulse ? '1px solid rgba(108,92,231,0.75)' : '1px solid transparent',
+                        borderRadius: 8,
+                        padding: 3
+                    }}
+                >
                     <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
                     {meeting?.active
                         ? <button onClick={endMeeting} style={{ borderRadius: 6 }}>🔚 End Meeting</button>
                         : <button onClick={callMeeting} style={{ borderRadius: 6 }}>📣 Call Meeting</button>}
                 </div>
 
-                <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
+                <div ref={tasksSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Task Assignment</div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 6 }}>
                         <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)}>
@@ -185,7 +217,7 @@ export function CeoOperationsPanel() {
                     <div style={{ marginTop: 4 }}>Completion: <strong>{metrics.completionPct}%</strong></div>
                 </div>
 
-                <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
+                <div ref={approvalsSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Pending Approvals ({pendingApprovals.length})</div>
                     {pendingApprovals.length === 0 && <div style={{ opacity: 0.7 }}>No pending approvals.</div>}
                     {pendingApprovals.map((req) => (

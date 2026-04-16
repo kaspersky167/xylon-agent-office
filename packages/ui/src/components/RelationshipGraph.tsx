@@ -15,7 +15,7 @@ type Edge = {
     label?: string;
 };
 
-export function RelationshipGraph() {
+export function RelationshipGraph({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [edges, setEdges] = useState<Edge[]>([]);
 
     useEffect(() => {
@@ -41,6 +41,7 @@ export function RelationshipGraph() {
             defaultDock="right"
             defaultY={220}
             zIndex={16}
+            mode={mode}
         >
             {visible.length === 0 && (
                 <div style={{ fontSize: tokens.typography.caption, color: tokens.color.textMuted }}>No strong alliances or rivalries yet.</div>
