@@ -25,7 +25,7 @@ const actionIcons: Record<string, string> = {
     'use_tool': '🔧', 'move': '🚶', 'think': '💡'
 };
 
-export function SystemLog() {
+export function SystemLog({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [logs, setLogs] = useState<LogEntry[]>([]);
     const [categoryFilter, setCategoryFilter] = useState<Record<EventCategory, boolean>>({
         activity: true,
