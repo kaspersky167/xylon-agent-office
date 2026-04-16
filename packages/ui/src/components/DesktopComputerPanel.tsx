@@ -137,7 +137,6 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
     const [mailBody, setMailBody] = useState('');
     const [mailAttachments, setMailAttachments] = useState<MailAttachment[]>([]);
 
-    const groupedFiles = useMemo(() => [...files].sort((a, b) => a.path.localeCompare(b.path)), [files]);
     const selectedFile = selectedPath ? files.find((item) => item.path === selectedPath) : undefined;
     const filteredMail = useMemo(() => {
         return mailMessages
@@ -176,14 +175,17 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
             const payload = (event as CustomEvent).detail;
             setLoadingPreview(false);
             setError(null);
+            const content = typeof payload?.content === 'string' ? payload.content : '';
             setPreview({
                 path: String(payload?.path ?? selectedPath ?? ''),
                 type: typeof payload?.type === 'string' ? payload.type : undefined,
-                content: typeof payload?.content === 'string' ? payload.content : '',
+                content,
                 encoding: typeof payload?.encoding === 'string' ? payload.encoding : undefined,
                 downloadUrl: typeof payload?.downloadUrl === 'string' ? payload.downloadUrl : undefined,
                 externalUrl: typeof payload?.externalUrl === 'string' ? payload.externalUrl : undefined
             });
+            setEditorValue(content);
+            setIsDirty(false);
         };
 
         const onFileError = (event: Event) => {
