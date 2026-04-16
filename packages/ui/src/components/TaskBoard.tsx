@@ -1,6 +1,12 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
+import { Button } from './ui/Button';
+import { Chip } from './ui/Chip';
+import { Panel } from './ui/Panel';
+import { SectionHeader } from './ui/SectionHeader';
+import { Toolbar } from './ui/Toolbar';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 type LifecycleStage = 'queued' | 'in-progress' | 'blocked' | 'review' | 'completed';
@@ -161,18 +167,11 @@ export function TaskBoard() {
         }
     };
 
-    const tasksByStage = useMemo(() => {
-        const grouped = new Map<LifecycleStage, TaskItem[]>();
-        STAGES.forEach((stage) => grouped.set(stage, []));
-
-        tasks.forEach((task) => {
-            const stage = normalizeStage(task.lifecycleStage || task.status);
-            grouped.get(stage)?.push(task);
-        });
-
-        grouped.forEach((list) => list.sort((a, b) => (a.title > b.title ? 1 : -1)));
-        return grouped;
-    }, [tasks]);
+    const taskTone = (s: string): 'success' | 'warning' | 'default' => {
+        if (s === 'completed') return 'success';
+        if (s === 'in_progress') return 'warning';
+        return 'default';
+    };
 
     const selectedTask = tasks.find((task) => String(task.id) === String(selectedTaskId));
 
@@ -188,41 +187,22 @@ export function TaskBoard() {
     };
 
     return (
-        <div style={{
-            position: 'absolute', left: 20, top: 20, width: 360,
-            backgroundColor: 'rgba(10,10,30,0.92)', color: 'white',
-            padding: 16, borderRadius: 12,
-            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-            backdropFilter: 'blur(8px)',
-            border: '1px solid rgba(108,92,231,0.3)',
-            maxHeight: '72vh', display: 'flex', flexDirection: 'column'
-        }}>
-            <h3 style={{ margin: '0 0 10px 0', fontSize: '14px', display: 'flex', alignItems: 'center', gap: 6 }}>
-                📋 Task Board
-            </h3>
+        <Panel style={{ position: 'absolute', left: 20, top: 20, width: 300, maxHeight: '52vh', display: 'flex', flexDirection: 'column' }}>
+            <SectionHeader title="📋 Task Board" subtitle="Assign, route, and monitor execution" />
 
-            <form onSubmit={handleSubmit} style={{ marginBottom: 10 }}>
+            <form onSubmit={handleSubmit} style={{ marginBottom: tokens.spacing.sm }}>
                 <input
                     type="text"
                     value={newTask}
                     onChange={(e) => setNewTask(e.target.value)}
                     placeholder="Assign a task..."
-                    style={{
-                        width: '100%', padding: '8px 10px', borderRadius: 6,
-                        border: '1px solid #444', backgroundColor: '#1a1a3e',
-                        color: 'white', fontSize: '12px', outline: 'none',
-                        boxSizing: 'border-box', marginBottom: 6
-                    }}
+                    style={{ ...controlRoomStyles.input, marginBottom: tokens.spacing.xs }}
                 />
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 6, marginBottom: 6 }}>
+                <Toolbar>
                     <select
                         value={targetAgent}
                         onChange={(e) => setTargetAgent(e.target.value)}
-                        style={{
-                            padding: '6px', borderRadius: 6,
-                            border: '1px solid #444', backgroundColor: '#1a1a3e',
-                            color: '#aaa', fontSize: '11px'
-                        }}
+                        style={{ ...controlRoomStyles.input, flex: 1, padding: 6, color: tokens.color.textSecondary }}
                     >
                         <option value="auto">🤖 Auto-assign</option>
                         {roster.map((agent) => (
@@ -239,82 +219,37 @@ export function TaskBoard() {
                         <option value="high">High priority</option>
                         <option value="critical">Critical priority</option>
                     </select>
-                    <button type="submit" style={{
-                        padding: '6px 14px', borderRadius: 6, border: 'none',
-                        backgroundColor: '#6c5ce7', color: 'white', fontSize: '11px',
-                        cursor: 'pointer', fontWeight: 'bold'
-                    }}>
-                        Assign
-                    </button>
-                </div>
-                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: '#ccc' }}>
-                    <input
-                        type="checkbox"
-                        checked={approvalRequired}
-                        onChange={(e) => setApprovalRequired(e.target.checked)}
-                    />
-                    Requires approval
-                </label>
+                    <Button type="submit" tone="primary">Assign</Button>
+                </Toolbar>
             </form>
 
-            <div style={{ flex: 1, overflowY: 'auto', fontSize: '12px' }}>
+            <div style={{ flex: 1, overflowY: 'auto', fontSize: tokens.typography.caption, ...controlRoomStyles.scroll }}>
                 {tasks.length === 0 && (
-                    <p style={{ color: '#666', fontStyle: 'italic', margin: 0, fontSize: '11px' }}>
-                        No tasks yet. Type above to assign work to agents!
+                    <p style={{ color: tokens.color.textMuted, fontStyle: 'italic', margin: 0, fontSize: tokens.typography.micro }}>
+                        No tasks yet. Type above to assign work to agents.
                     </p>
                 )}
-
-                {STAGES.map((stage) => {
-                    const stageTasks = tasksByStage.get(stage) || [];
-                    return (
-                        <section key={stage} style={{ marginBottom: 8 }}>
-                            <div style={{ fontSize: 11, fontWeight: 700, color: '#b2bec3', marginBottom: 4, borderBottom: '1px solid rgba(255,255,255,0.09)', paddingBottom: 2 }}>
-                                {STAGE_LABELS[stage]} ({stageTasks.length})
+                {tasks.map(task => (
+                    <div key={task.id} style={{ ...controlRoomStyles.panelMuted, padding: `${tokens.spacing.xs}px ${tokens.spacing.sm}px`, marginBottom: tokens.spacing.xs }}>
+                        <Toolbar>
+                            <div style={{ fontWeight: 700, fontSize: tokens.typography.caption, flex: 1 }}>{statusIcon(task.status)} {task.title}</div>
+                            {/(\bmajor\b|\bdeploy\b|\blaunch\b|\bpublish\b|\bhire\b|\bfire\b|\bpricing\b)/i.test(task.title) && (
+                                <Chip tone="danger">🛂 CEO</Chip>
+                            )}
+                        </Toolbar>
+                        <Toolbar style={{ marginTop: 3 }}>
+                            <Chip tone={taskTone(task.status)}>{task.status.replace('_', ' ')}</Chip>
+                            <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>
+                                → {task.assigned_to || 'Unassigned'}
                             </div>
-                            {stageTasks.length === 0 && <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>No tasks</div>}
-                            {stageTasks.map((task) => {
-                                const assigneeName = roster.find((entry) => entry.id === task.assigneeId)?.name || task.assigneeName || task.assigned_to || 'Unassigned';
-                                return (
-                                    <button
-                                        key={task.id}
-                                        type="button"
-                                        onClick={() => openTaskDetail(task)}
-                                        style={{
-                                            width: '100%', textAlign: 'left', padding: '6px 8px', marginBottom: 4, borderRadius: 6,
-                                            backgroundColor: String(selectedTaskId) === String(task.id) ? 'rgba(108,92,231,0.35)' : 'rgba(255,255,255,0.05)',
-                                            border: `1px solid ${String(selectedTaskId) === String(task.id) ? 'rgba(180,170,255,0.9)' : 'transparent'}`,
-                                            borderLeft: `3px solid ${PRIORITY_COLORS[task.priority]}`,
-                                            color: 'white', cursor: 'pointer'
-                                        }}
-                                    >
-                                        <div style={{ fontWeight: 'bold', fontSize: '11px' }}>
-                                            {task.title}
-                                            {task.approvalRequired && <span style={{ marginLeft: 6, color: '#ff7675', fontSize: 10 }}>🛂 Approval</span>}
-                                        </div>
-                                        <div style={{ fontSize: '10px', color: '#a7b3be', marginTop: 2 }}>
-                                            → {assigneeName} · {task.priority}
-                                        </div>
-                                    </button>
-                                );
-                            })}
-                        </section>
-                    );
-                })}
+                        </Toolbar>
+                    </div>
+                ))}
             </div>
 
-            {selectedTask && (
-                <div style={{ marginTop: 8, fontSize: '10px', color: '#ccd2d8', borderTop: '1px solid #333', paddingTop: 6 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 2 }}>Task detail</div>
-                    <div>{selectedTask.title}</div>
-                    <div>Stage: {STAGE_LABELS[selectedTask.lifecycleStage]}</div>
-                    <div>Priority: {selectedTask.priority}</div>
-                    <div>Approval required: {selectedTask.approvalRequired ? 'Yes' : 'No'}</div>
-                    {selectedTask.createdAt && <div>Created: {new Date(selectedTask.createdAt).toLocaleString()}</div>}
-                    {selectedTask.startedAt && <div>Started: {new Date(selectedTask.startedAt).toLocaleString()}</div>}
-                    {selectedTask.completedAt && <div>Completed: {new Date(selectedTask.completedAt).toLocaleString()}</div>}
-                    {selectedTask.updatedAt && <div>Updated: {new Date(selectedTask.updatedAt).toLocaleString()}</div>}
-                </div>
-            )}
-        </div>
+            <div style={{ marginTop: tokens.spacing.sm, fontSize: tokens.typography.micro, color: tokens.color.textMuted, borderTop: `1px solid ${tokens.color.borderSoft}`, paddingTop: 6 }}>
+                🤖 Engine: Ollama Local • 💾 SQLite Persistence
+            </div>
+        </Panel>
     );
 }

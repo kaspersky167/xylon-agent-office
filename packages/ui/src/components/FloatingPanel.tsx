@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 type Position = { x: number; y: number };
 
@@ -107,23 +108,10 @@ export function FloatingPanel({
             left: position.x,
             top: position.y,
             width,
-            zIndex
-        }
-        : {
-            position: 'relative',
-            width: '100%'
-        };
-
-    return (
-        <div className={className} style={{
-            ...floatingStyle,
-            borderRadius: 12,
+            zIndex,
+            borderRadius: tokens.radius.lg,
             overflow: 'hidden',
-            border: '1px solid rgba(255,255,255,0.2)',
-            backgroundColor: 'rgba(7, 10, 20, 0.86)',
-            color: '#f4f8ff',
-            boxShadow: '0 10px 26px rgba(0,0,0,0.42)',
-            backdropFilter: 'blur(6px)'
+            ...controlRoomStyles.panel
         }}>
             <div
                 onMouseDown={(event) => {
@@ -143,24 +131,24 @@ export function FloatingPanel({
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'space-between',
-                    borderBottom: minimized ? 'none' : '1px solid rgba(255,255,255,0.1)',
-                    background: 'linear-gradient(90deg, rgba(28,33,71,0.8), rgba(72,31,51,0.65))'
+                    borderBottom: minimized ? 'none' : `1px solid ${tokens.color.borderSoft}`,
+                    background: 'linear-gradient(90deg, rgba(33,44,86,0.82), rgba(78,46,106,0.70))'
                 }}
             >
                 <div>
-                    <div style={{ fontSize: 12, fontWeight: 700 }}>{title}</div>
-                    {subtitle && <div style={{ fontSize: 10, opacity: 0.75 }}>{subtitle}</div>}
+                    <div style={{ fontSize: tokens.typography.heading, fontWeight: 700 }}>{title}</div>
+                    {subtitle && <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>{subtitle}</div>}
                 </div>
                 <button
                     onClick={() => setMinimized((value) => !value)}
                     style={{
-                        border: '1px solid rgba(255,255,255,0.2)',
-                        borderRadius: 6,
+                        border: `1px solid ${tokens.color.border}`,
+                        borderRadius: tokens.radius.sm,
                         width: 24,
                         height: 22,
                         cursor: 'pointer',
-                        color: '#f4f8ff',
-                        background: 'rgba(255,255,255,0.08)'
+                        color: tokens.color.textPrimary,
+                        background: tokens.color.accentSoft
                     }}
                     title={minimized ? 'Expand panel' : 'Minimize panel'}
                 >
