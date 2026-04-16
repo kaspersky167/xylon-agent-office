@@ -10,7 +10,13 @@ export const UIEvents = {
     approvalsSync: 'approvals-sync',
     agentRosterSync: 'agent-roster-sync',
     meetingState: 'meeting-state',
+    agentState: 'agent-state',
+    agentSelected: 'agent-selected',
+    agentRemoved: 'agent-removed',
     layoutSync: 'layout-sync',
+    agentHover: 'agent-hover',
+    agentSelect: 'agent-select',
+    agentFocus: 'agent-focus',
     desktopFilesSync: 'desktop-files-sync',
     desktopFilePreview: 'desktop-file-preview',
     desktopFileError: 'desktop-file-error'

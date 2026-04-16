@@ -1,6 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { eventBus } from '../events';
-import { getColyseusRoom } from '../game/Game';
+import React, { useMemo, useState } from 'react';
 import { FloatingPanel } from './FloatingPanel';
 
 type TaskItem = {
@@ -29,10 +27,6 @@ type CompletedWorkItem = {
 };
 
 export function CeoOperationsPanel() {
-    const [tasks, setTasks] = useState<TaskItem[]>([]);
-    const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
-    const [meeting, setMeeting] = useState<{ active: boolean; topic?: string; endsAt?: number } | null>(null);
-    const [fastTrackEnabled, setFastTrackEnabled] = useState(true);
     const [newTask, setNewTask] = useState('');
     const [targetAgent, setTargetAgent] = useState('auto');
     const [roster, setRoster] = useState<Array<{ id: string; name: string }>>([]);
@@ -123,7 +117,7 @@ export function CeoOperationsPanel() {
         const inProgress = tasks.filter((t) => t.status === 'in_progress').length;
         const pending = tasks.filter((t) => t.status === 'backlog').length;
         return { total, completed, inProgress, pending, completionPct: total === 0 ? 0 : Math.round((completed / total) * 100) };
-    }, [tasks]);
+    }, [filteredTasks]);
 
     const pendingApprovals = approvals.filter((a) => a.status === 'pending');
 
@@ -133,42 +127,53 @@ export function CeoOperationsPanel() {
     };
 
     const assignTask = () => {
-        const room = getColyseusRoom();
-        if (!room || !newTask.trim()) return;
-        room.send('assign-task', { title: newTask.trim(), agentId: targetAgent === 'auto' ? undefined : targetAgent });
+        if (!newTask.trim()) return;
+        actions.sendTaskAssignment(newTask, targetAgent === 'auto' ? undefined : targetAgent);
         setNewTask('');
     };
 
     const decide = (id: string, decision: 'approved' | 'rejected') => {
-        const room = getColyseusRoom();
-        room?.send('approval-decision', { id, decision });
+        actions.sendApprovalDecision(id, decision);
     };
 
     const toggleFastTrack = () => {
-        const room = getColyseusRoom();
-        room?.send('set-fast-track', { enabled: !fastTrackEnabled });
+        actions.setFastTrack(!simulation.fastTrackEnabled);
     };
 
     const callMeeting = () => {
-        const room = getColyseusRoom();
-        if (!room) return;
         const topic = window.prompt('Meeting topic?', 'Daily executive sync') || 'All-hands';
-        room.send('call-meeting', { topic, durationSec: 60 });
+        actions.callMeeting(topic, 60);
     };
 
     const endMeeting = () => {
-        const room = getColyseusRoom();
-        room?.send('end-meeting', {});
+        actions.endMeeting();
     };
 
     return (
-        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26}>
+        <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26} mode={mode}>
             <div style={{ display: 'grid', gap: 10, fontSize: 12 }}>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                    <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
-                    {meeting?.active
+                    <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{simulation.fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
+                    {simulation.meeting?.active
                         ? <button onClick={endMeeting} style={{ borderRadius: 6 }}>🔚 End Meeting</button>
                         : <button onClick={callMeeting} style={{ borderRadius: 6 }}>📣 Call Meeting</button>}
+                </div>
+
+                <div style={{ display: 'grid', gap: 6, padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
+                    <div style={{ fontWeight: 700 }}>Filters</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                        <select value={filters.taskStatus} onChange={(e) => actions.setFilters({ taskStatus: e.target.value as any })}>
+                            <option value="all">All statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="in_progress">In progress</option>
+                            <option value="completed">Completed</option>
+                        </select>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <input type="checkbox" checked={filters.approvalsOnly} onChange={(e) => actions.setFilters({ approvalsOnly: e.target.checked })} />
+                            CEO-gated only
+                        </label>
+                    </div>
+                    <input value={filters.search} onChange={(e) => actions.setFilters({ search: e.target.value })} placeholder="Search tasks..." />
                 </div>
 
                 <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
@@ -205,7 +210,7 @@ export function CeoOperationsPanel() {
                     </div>
                 </div>
 
-                <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
+                <div ref={approvalsSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)', maxHeight: 180, overflowY: 'auto' }}>
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Pending Approvals ({pendingApprovals.length})</div>
                     {pendingApprovals.length === 0 && <div style={{ opacity: 0.7 }}>No pending approvals.</div>}
                     {pendingApprovals.map((req) => (
