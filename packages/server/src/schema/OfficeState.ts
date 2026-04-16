@@ -5,6 +5,7 @@ export class AgentState extends Schema {
     @type('string') name: string;
     @type('number') x: number;
     @type('number') y: number;
+    @type('string') zoneId: string;
     @type('string') direction: 'up' | 'down' | 'left' | 'right';
     @type('string') action: string;
     @type('string') currentTask: string;
@@ -20,6 +21,7 @@ export class AgentState extends Schema {
         this.name = name;
         this.x = 0;
         this.y = 0;
+        this.zoneId = 'main';
         this.direction = 'down';
         this.action = 'idle';
         this.currentTask = '';

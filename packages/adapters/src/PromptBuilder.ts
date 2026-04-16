@@ -1,4 +1,4 @@
-import { AgentConfig, Memory, Task } from '@agent-office/core';
+import { AgentConfig, Memory, Task, ToolDefinition } from '@agent-office/core';
 
 export class PromptBuilder {
     static buildSystemPrompt(

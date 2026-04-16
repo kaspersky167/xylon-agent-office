@@ -13,6 +13,8 @@ interface FloatingPanelProps {
     zIndex?: number;
     children: React.ReactNode;
     subtitle?: string;
+    mode?: 'floating' | 'docked';
+    className?: string;
 }
 
 function clampPosition(pos: Position, width: number): Position {
@@ -34,7 +36,9 @@ export function FloatingPanel({
     defaultMinimized = false,
     zIndex = 14,
     subtitle,
-    children
+    children,
+    mode = 'floating',
+    className
 }: FloatingPanelProps) {
     const storageKey = useMemo(() => `panel:${id}:state`, [id]);
 
@@ -49,9 +53,7 @@ export function FloatingPanel({
         } catch {
             // Ignore corrupt state.
         }
-        const dockX = defaultDock === 'right'
-            ? Math.max(8, window.innerWidth - width - 24)
-            : 24;
+        const dockX = defaultDock === 'right' ? Math.max(8, window.innerWidth - width - 24) : 24;
         return { x: dockX, y: defaultY };
     });
 
@@ -80,10 +82,7 @@ export function FloatingPanel({
         if (!dragOffset) return;
 
         const onMove = (event: MouseEvent) => {
-            const next = clampPosition(
-                { x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy },
-                width
-            );
+            const next = clampPosition({ x: event.clientX - dragOffset.dx, y: event.clientY - dragOffset.dy }, width);
             setPosition(next);
         };
 
@@ -98,8 +97,8 @@ export function FloatingPanel({
         };
     }, [dragOffset, width]);
 
-    return (
-        <div style={{
+    const floatingStyle: React.CSSProperties = mode === 'floating'
+        ? {
             position: 'absolute',
             left: position.x,
             top: position.y,
@@ -111,6 +110,7 @@ export function FloatingPanel({
         }}>
             <div
                 onMouseDown={(event) => {
+                    if (mode !== 'floating') return;
                     const target = event.target as HTMLElement;
                     if (target.closest('button') || target.closest('input') || target.closest('select')) {
                         return;
@@ -121,7 +121,7 @@ export function FloatingPanel({
                     });
                 }}
                 style={{
-                    cursor: 'grab',
+                    cursor: mode === 'floating' ? 'grab' : 'default',
                     padding: '9px 10px',
                     display: 'flex',
                     alignItems: 'center',
@@ -151,11 +151,7 @@ export function FloatingPanel({
                 </button>
             </div>
 
-            {!minimized && (
-                <div style={{ padding: 10 }}>
-                    {children}
-                </div>
-            )}
+            {!minimized && <div style={{ padding: 10 }}>{children}</div>}
         </div>
     );
 }

@@ -1,12 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useEffect, useState } from 'react';
+import { FloatingPanel } from './FloatingPanel';
 import { eventBus } from '../events';
 import { Button } from './ui/Button';
 import { Panel } from './ui/Panel';
 import { SectionHeader } from './ui/SectionHeader';
 import { controlRoomStyles, tokens } from '../theme/tokens';
 
-interface LogEntry {
-    id: number;
+type LogEntry = {
+    id: string;
+    time: string;
     agent: string;
     action: string;
     thought: string;
@@ -20,11 +22,6 @@ const actionIcons: Record<string, string> = {
 
 export function SystemLog() {
     const [logs, setLogs] = useState<LogEntry[]>([]);
-    const [isOpen, setIsOpen] = useState(true);
-    const scrollRef = useRef<HTMLDivElement>(null);
-    const idRef = useRef(0);
-
-    const lastEntryPerAgent = useRef<Record<string, string>>({});
 
     useEffect(() => {
         const handler = (e: Event) => {
@@ -39,15 +36,6 @@ export function SystemLog() {
                 return updated.slice(-30);
             });
         };
-        eventBus.addEventListener('activity-log', handler);
-        return () => eventBus.removeEventListener('activity-log', handler);
-    }, []);
-
-    useEffect(() => {
-        if (scrollRef.current) {
-            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-        }
-    }, [logs]);
 
     if (!isOpen) {
         return (

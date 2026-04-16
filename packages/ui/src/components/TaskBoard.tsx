@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { getColyseusRoom } from '../game/Game';
 import { Button } from './ui/Button';
 import { Chip } from './ui/Chip';
@@ -8,51 +8,111 @@ import { Toolbar } from './ui/Toolbar';
 import { controlRoomStyles, tokens } from '../theme/tokens';
 
 interface TaskItem {
-    id: number;
+    id: string;
     title: string;
     assigned_to: string;
-    status: string;
+    status: TaskStatus;
+    priority?: TaskPriority;
+    requires_approval?: boolean;
+    status_reason?: string | null;
 }
+
+interface AgentRosterEntry {
+    id: string;
+    name: string;
+}
+
+const nextTransitions: Record<TaskStatus, TaskStatus[]> = {
+    backlog: ['in_progress'],
+    in_progress: ['blocked', 'review'],
+    blocked: ['in_progress'],
+    review: ['done', 'in_progress'],
+    done: []
+};
 
 export function TaskBoard() {
     const [tasks, setTasks] = useState<TaskItem[]>([]);
     const [newTask, setNewTask] = useState('');
     const [targetAgent, setTargetAgent] = useState('auto');
+    const [priority, setPriority] = useState<TaskPriority>('medium');
+    const [requiresApproval, setRequiresApproval] = useState(false);
+    const [roster, setRoster] = useState<AgentRosterEntry[]>([]);
 
     useEffect(() => {
-        const checkRoom = setInterval(() => {
-            const room = getColyseusRoom();
-            if (room) {
-                room.onMessage('task-update', (data: any) => {
-                    setTasks(prev => {
-                        const existing = prev.find(t => t.title === data.task);
-                        if (existing) {
-                            return prev.map(t => t.title === data.task ? { ...t, status: data.status, assigned_to: data.agentId } : t);
-                        }
-                        return [...prev, { id: Date.now(), title: data.task, assigned_to: data.agentId, status: data.status }];
-                    });
-                });
-                room.onMessage('tasks-sync', (serverTasks: any[]) => {
-                    setTasks(serverTasks.map(t => ({
-                        id: t.id,
-                        title: t.title,
-                        assigned_to: t.assigned_to || '',
-                        status: t.status
-                    })));
-                });
-                clearInterval(checkRoom);
-            }
-        }, 500);
-        return () => clearInterval(checkRoom);
+        const onTaskUpdate = (event: Event) => {
+            const data = ((event as CustomEvent).detail || {}) as any;
+            if (!data?.task) return;
+            setTasks(prev => {
+                const existing = prev.find(t => t.id === data.id || (t.title === data.task && t.assigned_to === data.agentId));
+                if (existing) {
+                    return prev.map(t => (t.id === existing.id ? {
+                        ...t,
+                        id: data.id || t.id,
+                        status: data.status || t.status,
+                        assigned_to: data.agentId ?? t.assigned_to,
+                        status_reason: data.statusReason ?? t.status_reason,
+                        priority: data.priority || t.priority,
+                        requires_approval: data.requiresApproval ?? t.requires_approval
+                    } : t));
+                }
+                return [...prev, {
+                    id: String(data.id || `${Date.now()}-${Math.random()}`),
+                    title: data.task,
+                    assigned_to: data.agentId || '',
+                    status: (data.status || 'backlog') as TaskStatus,
+                    status_reason: data.statusReason || null,
+                    priority: data.priority || 'medium',
+                    requires_approval: Boolean(data.requiresApproval)
+                }];
+            });
+        };
+
+        const onTasksSync = (event: Event) => {
+            const serverTasks = (event as CustomEvent).detail;
+            if (!Array.isArray(serverTasks)) return;
+            setTasks(serverTasks.map((t: any) => ({
+                id: String(t.id),
+                title: t.title,
+                assigned_to: t.assigned_to || '',
+                status: (t.status || 'backlog') as TaskStatus,
+                status_reason: t.status_reason || null,
+                priority: t.priority || 'medium',
+                requires_approval: Boolean(t.requires_approval)
+            })));
+        };
+
+        const onRosterSync = (event: Event) => {
+            const entries = (event as CustomEvent).detail;
+            if (!Array.isArray(entries)) return;
+            setRoster(entries.map((entry: any) => ({ id: String(entry.id), name: String(entry.name || entry.id) })));
+        };
+
+        eventBus.addEventListener('task-update', onTaskUpdate);
+        eventBus.addEventListener('tasks-sync', onTasksSync);
+        eventBus.addEventListener('agent-roster-sync', onRosterSync);
+        return () => {
+            eventBus.removeEventListener('task-update', onTaskUpdate);
+            eventBus.removeEventListener('tasks-sync', onTasksSync);
+            eventBus.removeEventListener('agent-roster-sync', onRosterSync);
+        };
     }, []);
+
+    const rosterMap = useMemo(() => new Map(roster.map((entry) => [entry.id, entry.name])), [roster]);
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         if (!newTask.trim()) return;
         const room = getColyseusRoom();
         if (room) {
-            room.send('assign-task', { title: newTask, agentId: targetAgent === 'auto' ? undefined : targetAgent });
+            room.send('assign-task', {
+                title: newTask.trim(),
+                agentId: targetAgent === 'auto' ? undefined : targetAgent,
+                priority,
+                requiresApproval
+            });
             setNewTask('');
+            setPriority('medium');
+            setRequiresApproval(false);
         }
     };
 
@@ -62,10 +122,12 @@ export function TaskBoard() {
         return 'default';
     };
 
-    const statusIcon = (s: string) => {
-        if (s === 'completed') return '✅';
+    const statusIcon = (s: TaskStatus) => {
+        if (s === 'done') return '✅';
+        if (s === 'review') return '🕵️';
+        if (s === 'blocked') return '⛔';
         if (s === 'in_progress') return '🔄';
-        return '⏳';
+        return '🧾';
     };
 
     return (
@@ -87,25 +149,9 @@ export function TaskBoard() {
                         style={{ ...controlRoomStyles.input, flex: 1, padding: 6, color: tokens.color.textSecondary }}
                     >
                         <option value="auto">🤖 Auto-assign</option>
-                        <optgroup label="Engineering">
-                            <option value="frontend">Frontend Dev</option>
-                            <option value="backend">Backend Architect</option>
-                            <option value="devops">DevOps Automator</option>
-                            <option value="security">Security Engineer</option>
-                        </optgroup>
-                        <optgroup label="Ops / Strategy">
-                            <option value="shepherd">Project Shepherd</option>
-                            <option value="reality">Reality Checker</option>
-                            <option value="evidence">Evidence Collector</option>
-                            <option value="seo">SEO Specialist</option>
-                        </optgroup>
-                        <optgroup label="Growth">
-                            <option value="sales">Sales Outreach</option>
-                            <option value="proposal">Proposal Strategist</option>
-                        </optgroup>
-                        <optgroup label="Leadership">
-                            <option value="ceo">Faz (CEO)</option>
-                        </optgroup>
+                        {roster.map((agent) => (
+                            <option key={agent.id} value={agent.id}>{agent.name}</option>
+                        ))}
                     </select>
                     <Button type="submit" tone="primary">Assign</Button>
                 </Toolbar>

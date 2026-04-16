@@ -43,7 +43,7 @@ const formatBytes = (bytes: number) => {
 
 const mentionHandles = ['frontend', 'backend', 'devops', 'security', 'shepherd', 'reality', 'evidence', 'seo', 'sales', 'proposal', 'ceo'];
 
-export function ChatPanel() {
+export function ChatPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [messages, setMessages] = useState<ChatMessage[]>([
         { sender: 'System', text: 'Office environment initialized.' }
     ]);
