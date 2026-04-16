@@ -1,10 +1,8 @@
 import React from 'react';
-import { Panel } from './ui/Panel';
-import { SectionHeader } from './ui/SectionHeader';
-import { Stat } from './ui/Stat';
-import { tokens } from '../theme/tokens';
+import { useUIStore } from '../store/uiStore';
 
-export function AgentInspector({ agent }: { agent?: any }) {
+export function AgentInspector() {
+    const { selectedAgent: agent } = useUIStore();
     if (!agent) return null;
 
     return (

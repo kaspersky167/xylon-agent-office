@@ -368,6 +368,21 @@ export class OfficeScene extends Phaser.Scene {
                         }));
                     });
 
+                    eventBus.dispatchEvent(new CustomEvent('agent-state-sync', {
+                        detail: {
+                            id: sessionId,
+                            role: agent.id,
+                            name: agent.name,
+                            action: agent.action,
+                            status: agent.action || 'idle',
+                            currentTask: agent.currentTask,
+                            mood: Number(agent.mood || 0),
+                            reputation: Number(agent.reputation || 0),
+                            riskLevel: Number(agent.riskLevel || 0),
+                            momentum: Number(agent.momentum || 0)
+                        }
+                    }));
+
                     let prevX = agent.x;
                     let prevY = agent.y;
                     let lastAction = '';
@@ -476,12 +491,14 @@ export class OfficeScene extends Phaser.Scene {
                                 action: agent.action
                             }
                         }));
-                        eventBus.dispatchEvent(new CustomEvent('agent-state', {
+                        eventBus.dispatchEvent(new CustomEvent('agent-state-sync', {
                             detail: {
                                 id: sessionId,
+                                role: agent.id,
                                 name: agent.name,
                                 action: agent.action,
-                                currentTask: agent.currentTask || '',
+                                status: agent.action || 'idle',
+                                currentTask: agent.currentTask,
                                 mood: Number(agent.mood || 0),
                                 reputation: Number(agent.reputation || 0),
                                 riskLevel: Number(agent.riskLevel || 0),
@@ -501,7 +518,7 @@ export class OfficeScene extends Phaser.Scene {
                         sprite.destroy();
                         this.agentSprites.delete(sessionId);
                     }
-                    this.agentNameToSessionId.delete(agent.name);
+                    eventBus.dispatchEvent(new CustomEvent('agent-removed', { detail: { id: sessionId, role: agent.id, name: agent.name } }));
                 });
             });
 

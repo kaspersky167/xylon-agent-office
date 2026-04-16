@@ -1,196 +1,74 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { eventBus } from '../events';
-import { getColyseusRoom } from '../game/Game';
+import React, { useMemo, useState } from 'react';
 import { FloatingPanel } from './FloatingPanel';
+import { useUIStore } from '../store/uiStore';
 
-type TaskItem = {
-    id: number | string;
-    title: string;
-    assigned_to?: string;
-    status: string;
-    progress?: number;
-};
-
-type ApprovalRequest = {
-    id: string;
-    requestedByName: string;
-    requestedAction: string;
-    rationale: string;
-    isMajor: boolean;
-    status: 'pending' | 'approved' | 'rejected';
-};
-
-type CompletedWorkItem = {
-    id: string;
-    task: string;
-    agentName: string;
-    completedAt: string;
-    summaryPath: string;
-};
-
-export function CeoOperationsPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
-    const [tasks, setTasks] = useState<TaskItem[]>([]);
-    const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
-    const [meeting, setMeeting] = useState<{ active: boolean; topic?: string; endsAt?: number } | null>(null);
-    const [fastTrackEnabled, setFastTrackEnabled] = useState(true);
+export function CeoOperationsPanel() {
     const [newTask, setNewTask] = useState('');
     const [targetAgent, setTargetAgent] = useState('auto');
-    const [completedWork, setCompletedWork] = useState<CompletedWorkItem[]>([]);
-    const [reviewFolder, setReviewFolder] = useState('data/workspace/completed-work');
-    const [panelPulse, setPanelPulse] = useState(false);
-    const tasksSectionRef = useRef<HTMLDivElement>(null);
-    const approvalsSectionRef = useRef<HTMLDivElement>(null);
-    const activitySectionRef = useRef<HTMLDivElement>(null);
-
-    useEffect(() => {
-        const onTaskUpdate = (event: Event) => {
-            const data = (event as CustomEvent).detail || {};
-            if (!data?.task) return;
-            setTasks((prev) => {
-                const existing = prev.find((t) => t.title === data.task);
-                if (existing) {
-                    return prev.map((t) => t.title === data.task
-                        ? { ...t, status: data.status, assigned_to: data.agentId, progress: typeof data.progress === 'number' ? data.progress : t.progress }
-                        : t);
-                }
-                return [...prev, {
-                    id: Date.now(),
-                    title: data.task,
-                    assigned_to: data.agentId,
-                    status: data.status || 'pending',
-                    progress: typeof data.progress === 'number' ? data.progress : undefined
-                }];
-            });
-        };
-        const onTasksSync = (event: Event) => {
-            const list = (event as CustomEvent).detail;
-            if (!Array.isArray(list)) return;
-            setTasks(list.map((task: any) => ({
-                id: task.id,
-                title: task.title,
-                assigned_to: task.assigned_to || '',
-                status: task.status || 'pending',
-                progress: typeof task.progress === 'number' ? task.progress : undefined
-            })));
-        };
-        const onApprovals = (event: Event) => {
-            const list = (event as CustomEvent).detail;
-            setApprovals(Array.isArray(list) ? list : []);
-        };
-        const onMeeting = (event: Event) => setMeeting((event as CustomEvent).detail || null);
-        const onFastTrack = (event: Event) => setFastTrackEnabled(Boolean((event as CustomEvent).detail?.enabled));
-        const onCompletedWork = (event: Event) => {
-            const detail = (event as CustomEvent).detail || {};
-            setCompletedWork(Array.isArray(detail.items) ? detail.items : []);
-            if (typeof detail.reviewFolder === 'string' && detail.reviewFolder.trim()) {
-                setReviewFolder(detail.reviewFolder.trim());
-            }
-        };
-        const onOpenContext = (event: Event) => {
-            const detail = (event as CustomEvent).detail || {};
-            if (detail.panel && detail.panel !== 'ceo-operations') return;
-            setPanelPulse(true);
-            window.setTimeout(() => setPanelPulse(false), 700);
-            const section = detail.section;
-            if (section === 'approvals') {
-                approvalsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                return;
-            }
-            if (section === 'tasks') {
-                tasksSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-                return;
-            }
-            activitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        };
-
-        eventBus.addEventListener('task-update', onTaskUpdate);
-        eventBus.addEventListener('tasks-sync', onTasksSync);
-        eventBus.addEventListener('approvals-sync', onApprovals);
-        eventBus.addEventListener('meeting-state', onMeeting);
-        eventBus.addEventListener('fast-track-state', onFastTrack);
-        eventBus.addEventListener('completed-work-sync', onCompletedWork);
-        eventBus.addEventListener('open-context-panel', onOpenContext);
-
-        const requestTimer = setInterval(() => {
-            const room = getColyseusRoom();
-            if (!room) return;
-            room.send('request-approvals', {});
-            room.send('request-completed-work', {});
-            clearInterval(requestTimer);
-        }, 400);
-
-        return () => {
-            clearInterval(requestTimer);
-            eventBus.removeEventListener('task-update', onTaskUpdate);
-            eventBus.removeEventListener('tasks-sync', onTasksSync);
-            eventBus.removeEventListener('approvals-sync', onApprovals);
-            eventBus.removeEventListener('meeting-state', onMeeting);
-            eventBus.removeEventListener('fast-track-state', onFastTrack);
-            eventBus.removeEventListener('completed-work-sync', onCompletedWork);
-            eventBus.removeEventListener('open-context-panel', onOpenContext);
-        };
-    }, []);
+    const { state, filteredTasks, actions } = useUIStore();
+    const { approvals, simulation, completedWork, reviewFolder, filters } = state;
 
     const metrics = useMemo(() => {
-        const total = tasks.length;
-        const completed = tasks.filter((t) => t.status === 'completed').length;
-        const inProgress = tasks.filter((t) => t.status === 'in_progress').length;
-        const pending = tasks.filter((t) => t.status !== 'completed' && t.status !== 'in_progress').length;
+        const total = filteredTasks.length;
+        const completed = filteredTasks.filter((t) => t.status === 'completed').length;
+        const inProgress = filteredTasks.filter((t) => t.status === 'in_progress').length;
+        const pending = filteredTasks.filter((t) => t.status !== 'completed' && t.status !== 'in_progress').length;
         return { total, completed, inProgress, pending, completionPct: total === 0 ? 0 : Math.round((completed / total) * 100) };
-    }, [tasks]);
+    }, [filteredTasks]);
 
     const pendingApprovals = approvals.filter((a) => a.status === 'pending');
 
     const assignTask = () => {
-        const room = getColyseusRoom();
-        if (!room || !newTask.trim()) return;
-        room.send('assign-task', { title: newTask.trim(), agentId: targetAgent === 'auto' ? undefined : targetAgent });
+        if (!newTask.trim()) return;
+        actions.sendTaskAssignment(newTask, targetAgent === 'auto' ? undefined : targetAgent);
         setNewTask('');
     };
 
     const decide = (id: string, decision: 'approved' | 'rejected') => {
-        const room = getColyseusRoom();
-        room?.send('approval-decision', { id, decision });
+        actions.sendApprovalDecision(id, decision);
     };
 
     const toggleFastTrack = () => {
-        const room = getColyseusRoom();
-        room?.send('set-fast-track', { enabled: !fastTrackEnabled });
+        actions.setFastTrack(!simulation.fastTrackEnabled);
     };
 
     const callMeeting = () => {
-        const room = getColyseusRoom();
-        if (!room) return;
         const topic = window.prompt('Meeting topic?', 'Daily executive sync') || 'All-hands';
-        room.send('call-meeting', { topic, durationSec: 60 });
+        actions.callMeeting(topic, 60);
     };
 
     const endMeeting = () => {
-        const room = getColyseusRoom();
-        room?.send('end-meeting', {});
+        actions.endMeeting();
     };
 
     return (
         <FloatingPanel id="ceo-operations" title="CEO Operations" subtitle="Tasks · Progress · Approvals" width={360} defaultDock="right" defaultY={20} zIndex={26} mode={mode}>
             <div style={{ display: 'grid', gap: 10, fontSize: 12 }}>
-                <div
-                    ref={activitySectionRef}
-                    style={{
-                        display: 'grid',
-                        gridTemplateColumns: '1fr 1fr',
-                        gap: 6,
-                        border: panelPulse ? '1px solid rgba(108,92,231,0.75)' : '1px solid transparent',
-                        borderRadius: 8,
-                        padding: 3
-                    }}
-                >
-                    <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
-                    {meeting?.active
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                    <button onClick={toggleFastTrack} style={{ borderRadius: 6 }}>{simulation.fastTrackEnabled ? '⚡ Fast-track ON' : '🧭 Fast-track OFF'}</button>
+                    {simulation.meeting?.active
                         ? <button onClick={endMeeting} style={{ borderRadius: 6 }}>🔚 End Meeting</button>
                         : <button onClick={callMeeting} style={{ borderRadius: 6 }}>📣 Call Meeting</button>}
                 </div>
 
-                <div ref={tasksSectionRef} style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
+                <div style={{ display: 'grid', gap: 6, padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
+                    <div style={{ fontWeight: 700 }}>Filters</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                        <select value={filters.taskStatus} onChange={(e) => actions.setFilters({ taskStatus: e.target.value as any })}>
+                            <option value="all">All statuses</option>
+                            <option value="pending">Pending</option>
+                            <option value="in_progress">In progress</option>
+                            <option value="completed">Completed</option>
+                        </select>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                            <input type="checkbox" checked={filters.approvalsOnly} onChange={(e) => actions.setFilters({ approvalsOnly: e.target.checked })} />
+                            CEO-gated only
+                        </label>
+                    </div>
+                    <input value={filters.search} onChange={(e) => actions.setFilters({ search: e.target.value })} placeholder="Search tasks..." />
+                </div>
+
+                <div style={{ padding: 8, borderRadius: 8, background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.09)' }}>
                     <div style={{ fontWeight: 700, marginBottom: 4 }}>Task Assignment</div>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 6 }}>
                         <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)}>
