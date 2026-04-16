@@ -1,6 +1,8 @@
 import React from 'react';
+import { useUIStore } from '../store/uiStore';
 
-export function AgentInspector({ agent }: { agent?: any }) {
+export function AgentInspector() {
+    const { selectedAgent: agent } = useUIStore();
     if (!agent) return null;
     return (
         <div style={{ position: 'absolute', right: 20, top: 20, width: 250, backgroundColor: 'rgba(0,0,0,0.8)', color: 'white', padding: 16, borderRadius: 8 }}>

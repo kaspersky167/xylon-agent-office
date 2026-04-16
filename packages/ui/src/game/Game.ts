@@ -707,6 +707,21 @@ export class OfficeScene extends Phaser.Scene {
                         }
                     });
 
+                    eventBus.dispatchEvent(new CustomEvent('agent-state-sync', {
+                        detail: {
+                            id: sessionId,
+                            role: agent.id,
+                            name: agent.name,
+                            action: agent.action,
+                            status: agent.action || 'idle',
+                            currentTask: agent.currentTask,
+                            mood: Number(agent.mood || 0),
+                            reputation: Number(agent.reputation || 0),
+                            riskLevel: Number(agent.riskLevel || 0),
+                            momentum: Number(agent.momentum || 0)
+                        }
+                    }));
+
                     let prevX = agent.x;
                     let prevY = agent.y;
                     let lastAction = '';
@@ -776,6 +791,20 @@ export class OfficeScene extends Phaser.Scene {
                                 action: agent.action
                             }
                         }));
+                        eventBus.dispatchEvent(new CustomEvent('agent-state-sync', {
+                            detail: {
+                                id: sessionId,
+                                role: agent.id,
+                                name: agent.name,
+                                action: agent.action,
+                                status: agent.action || 'idle',
+                                currentTask: agent.currentTask,
+                                mood: Number(agent.mood || 0),
+                                reputation: Number(agent.reputation || 0),
+                                riskLevel: Number(agent.riskLevel || 0),
+                                momentum: Number(agent.momentum || 0)
+                            }
+                        }));
 
                         lastAction = agent.action;
                         prevX = agent.x;
@@ -789,6 +818,7 @@ export class OfficeScene extends Phaser.Scene {
                         sprite.destroy();
                         this.agentSprites.delete(sessionId);
                     }
+                    eventBus.dispatchEvent(new CustomEvent('agent-removed', { detail: { id: sessionId, role: agent.id, name: agent.name } }));
                 });
             });
 
