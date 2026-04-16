@@ -6,6 +6,7 @@ import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { ExtensionRegistry } from '../extensions/registry';
 
 interface HighlightEvent {
     type: string;
@@ -89,6 +90,7 @@ const MAJOR_TOOLS = new Set<string>([
 
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
+    private static extensionRegistry: ExtensionRegistry = new ExtensionRegistry([]);
 
     maxClients = 100;
     private office!: Office;
@@ -117,6 +119,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
+    private extensionRegistry = OfficeRoom.extensionRegistry;
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -243,6 +246,10 @@ export class OfficeRoom extends Room<OfficeState> {
 
     static getActiveRoom(): OfficeRoom | null {
         return OfficeRoom.activeRoom;
+    }
+
+    static setExtensionRegistry(registry: ExtensionRegistry) {
+        OfficeRoom.extensionRegistry = registry;
     }
 
     private configureInferenceProvider() {
@@ -630,6 +637,14 @@ Paired buddy: Sales Outreach.`,
                     fastTrackMode: this.fastTrackMode
                 });
                 this.seedTaskProgress(targetId, title);
+                this.extensionRegistry.onTaskCreated({
+                    title,
+                    assigneeId: targetId,
+                    assigneeName: agentState.name,
+                    createdById: 'system-ui',
+                    createdByName: 'System',
+                    source: 'ui',
+                }).catch((error) => console.error('[Extensions] onTaskCreated failed', error));
             }
         });
 
@@ -984,7 +999,7 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
-                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m) => m.from.includes('CEO'))) {
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: ConversationMessage) => m.from.includes('CEO'))) {
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
                                 text: `🗣️ ${decision.message}`
@@ -1026,6 +1041,14 @@ Paired buddy: Sales Outreach.`,
                                     fastTrackMode: this.fastTrackMode
                                 });
                                 this.seedTaskProgress(targetId, title);
+                                await this.extensionRegistry.onTaskCreated({
+                                    title,
+                                    assigneeId: targetId,
+                                    assigneeName: targetAgent.config.name,
+                                    createdById: id,
+                                    createdByName: coreAgent.config.name,
+                                    source: 'tool',
+                                });
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1113,57 +1136,67 @@ Paired buddy: Sales Outreach.`,
                                     text: `⚠️ ${coreAgent.config.name} tried to hire but the office is full! (Max 7 agents)`
                                 });
                             }
-                        } else if (id !== 'ceo' && this.isMajorToolCall(decision.toolCall.name, decision.toolCall.params)) {
-                            // ─── MAJOR ACTION → CEO APPROVAL GATE ───
-                            this.createApproval({
-                                requestedBy: id,
-                                requestedByName: coreAgent.config.name,
-                                requestedAction: `${decision.toolCall.name}`,
-                                rationale: decision.thought || 'No rationale provided — please supply more context.',
-                                isMajor: true,
-                                pending: { toolName: decision.toolCall.name, params: decision.toolCall.params },
-                            });
                         } else {
-                            const result = await this.toolExecutor.execute(
-                                decision.toolCall.name,
-                                decision.toolCall.params
-                            );
-
-                            this.broadcast('chat', {
-                                sender: coreAgent.config.name,
-                                text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                            const beforeToolCall = await this.extensionRegistry.beforeToolCall({
+                                agentId: id,
+                                agentName: coreAgent.config.name,
+                                toolName: decision.toolCall.name,
+                                params: decision.toolCall.params,
+                                thought: decision.thought,
+                                requestApproval: (input) => this.createApproval(input),
+                                isMajorToolCall: (name, params) => this.isMajorToolCall(name, params),
                             });
-                            this.emitHighlight(
-                                'tool',
-                                `${coreAgent.config.name} used ${decision.toolCall.name}`,
-                                (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
-                                id
-                            );
-
-                            coreAgent.addMemory({
-                                content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            });
-                            await this.memoryStore.saveMemory('agency:global', {
-                                content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            }, this.sessionId);
-
-                            if (
-                                decision.toolCall.name === 'write_file' &&
-                                String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
-                            ) {
-                                await this.queueFileReviewApproval({
-                                    sharedByAgentId: id,
-                                    sharedByAgentName: coreAgent.config.name,
-                                    filePath: String(decision.toolCall.params?.path || ''),
-                                    summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
-                                    fileId: decision.toolCall.params?.fileId,
+                            if (!beforeToolCall.handled) {
+                                const result = await this.toolExecutor.execute(
+                                    decision.toolCall.name,
+                                    decision.toolCall.params
+                                );
+                                await this.extensionRegistry.afterToolCall({
+                                    agentId: id,
+                                    agentName: coreAgent.config.name,
+                                    toolName: decision.toolCall.name,
+                                    params: decision.toolCall.params,
+                                    success: result.success,
+                                    output: result.output,
+                                    error: result.error,
                                 });
+
+                                this.broadcast('chat', {
+                                    sender: coreAgent.config.name,
+                                    text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                                });
+                                this.emitHighlight(
+                                    'tool',
+                                    `${coreAgent.config.name} used ${decision.toolCall.name}`,
+                                    (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
+                                    id
+                                );
+
+                                coreAgent.addMemory({
+                                    content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                });
+                                await this.memoryStore.saveMemory('agency:global', {
+                                    content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                }, this.sessionId);
+
+                                if (
+                                    decision.toolCall.name === 'write_file' &&
+                                    String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
+                                ) {
+                                    await this.queueFileReviewApproval({
+                                        sharedByAgentId: id,
+                                        sharedByAgentName: coreAgent.config.name,
+                                        filePath: String(decision.toolCall.params?.path || ''),
+                                        summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
+                                        fileId: decision.toolCall.params?.fileId,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1663,6 +1696,16 @@ Paired buddy: Sales Outreach.`,
         });
         this.broadcast('approvals-sync', this.listApprovals());
         this.emitHighlight('approval', `Approval requested: ${req.requestedAction}`, req.rationale.slice(0, 120), req.requestedBy);
+        this.extensionRegistry.onApprovalRequested({
+            id: req.id,
+            requestedBy: req.requestedBy,
+            requestedByName: req.requestedByName,
+            requestedAction: req.requestedAction,
+            rationale: req.rationale,
+            isMajor: req.isMajor,
+            status: req.status,
+            createdAt: req.createdAt,
+        }).catch((error) => console.error('[Extensions] onApprovalRequested failed', error));
 
         // CEO auto-triage: if the rationale is obviously weak, auto-reject with
         // a "please provide rationale" note so the queue doesn't flood.
@@ -1903,6 +1946,11 @@ Paired buddy: Sales Outreach.`,
     }
 
     private applyScenarioKickoff(scenarioName: string) {
+        this.extensionRegistry.onScenarioStart({
+            scenario: scenarioName,
+            startedAt: this.state.officeTime,
+        }).catch((error) => console.error('[Extensions] onScenarioStart failed', error));
+
         this.broadcast('scenario-event', {
             type: 'scenario-started',
             scenario: scenarioName,
