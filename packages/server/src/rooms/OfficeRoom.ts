@@ -4,6 +4,8 @@ import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/
 import { OllamaAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore } from '../memory/MemoryStore';
+import path from 'path';
+import { promises as fs } from 'fs';
 
 interface HighlightEvent {
     type: string;
@@ -33,6 +35,13 @@ interface ApprovalRequest {
     createdAt: string;
     // optional pending tool call to resume after approval
     pending?: { toolName: string; params: any } | null;
+}
+
+interface WorkspaceFileEntry {
+    path: string;
+    type: 'file' | 'directory';
+    size?: number;
+    updatedAt?: string;
 }
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
@@ -69,6 +78,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingActive = false;
     private meetingEndsAt = 0;
     private meetingTopic = '';
+    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
 
     // Furniture interaction points: named locations agents can walk to
     private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
@@ -227,6 +237,8 @@ export class OfficeRoom extends Room<OfficeState> {
             ` publishing/launch, major reprioritization, or anything tagged "major") you MUST`,
             ` request CEO approval before executing. Minor work (drafting, research, notes,`,
             ` internal coordination, proposing tasks) does not need approval.`,
+            `When collaborating on workspace files, share relevant files with other agents for review`,
+            ` and escalate important outcomes to the CEO (use chat summary + rationale).`,
             `WEB SEARCH BUDGET: the team shares a limited Tavily API budget (1 000 credits total).`,
             ` Be frugal — only call web_search or fetch_url when the information is not already`,
             ` available in your memory or recent chat. Combine multiple questions into one query.`,
@@ -476,6 +488,103 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
         });
 
+        // ─── DESKTOP COMPUTER FILE HANDLERS ───
+        this.onMessage('file-list', async (client) => {
+            const files = await this.listWorkspaceFiles();
+            client.send('file-list', { files });
+        });
+
+        this.onMessage('file-preview', async (client, message) => {
+            const targetPath = String(message?.path || '');
+            const result = await this.readWorkspaceFile(targetPath);
+            if (!result.ok) {
+                client.send('file-error', { path: targetPath, message: result.error });
+                return;
+            }
+            client.send('file-preview', result.preview);
+        });
+
+        this.onMessage('file-save', async (client, message) => {
+            const targetPath = String(message?.path || '');
+            const content = String(message?.content ?? '');
+            const result = await this.writeWorkspaceFile(targetPath, content);
+            if (!result.ok) {
+                client.send('file-error', { path: targetPath, message: result.error });
+                return;
+            }
+            this.broadcast('chat', { sender: 'System', text: `💾 File saved: ${targetPath}` });
+            this.broadcast('file-preview', {
+                path: targetPath,
+                type: this.guessPreviewType(targetPath),
+                content
+            });
+            const files = await this.listWorkspaceFiles();
+            this.broadcast('file-list', { files });
+        });
+
+        this.onMessage('file-share', (client, message) => {
+            const targetPath = String(message?.path || '');
+            const audience = String(message?.audience || '').toLowerCase();
+            const instructions = String(message?.instructions || '').trim();
+            const recipientRaw = String(message?.recipient || '').trim();
+
+            if (!targetPath) {
+                client.send('file-error', { message: 'Missing file path for share action.' });
+                return;
+            }
+
+            if (audience === 'ceo') {
+                const ceo = this.coreAgents.get('ceo');
+                if (ceo) {
+                    ceo.receiveMessage({
+                        from: 'User',
+                        to: ceo.config.name,
+                        content: `File shared with CEO for review: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}`,
+                        timestamp: this.state.officeTime
+                    });
+                }
+                this.broadcast('chat', { sender: 'System', text: `📤 Shared ${targetPath} with CEO.` });
+                this.emitHighlight('file_share', 'Shared with CEO', `${targetPath} was routed to CEO review.`, 'ceo');
+                return;
+            }
+
+            const targetAgentId = this.resolveAgentId(recipientRaw);
+            if (!targetAgentId) {
+                client.send('file-error', { message: 'Choose a valid agent recipient before sharing.' });
+                return;
+            }
+
+            const targetAgent = this.coreAgents.get(targetAgentId);
+            if (!targetAgent) {
+                client.send('file-error', { message: 'Agent recipient is currently unavailable.' });
+                return;
+            }
+
+            targetAgent.receiveMessage({
+                from: 'User',
+                to: targetAgent.config.name,
+                content: `Please review/update file: ${targetPath}${instructions ? `\nInstructions: ${instructions}` : ''}. If this is major or client-facing, share outcomes with CEO.`,
+                timestamp: this.state.officeTime
+            });
+
+            this.broadcast('chat', {
+                sender: 'System',
+                text: `📤 Shared ${targetPath} with ${targetAgent.config.name}${instructions ? ' (with instructions)' : ''}.`
+            });
+            this.emitHighlight('file_share', `Shared with ${targetAgent.config.name}`, targetPath, targetAgentId);
+        });
+
+        this.onMessage('file-mark-review', (client, message) => {
+            const targetPath = String(message?.path || '');
+            const note = String(message?.note || 'Review requested by user.');
+            if (!targetPath) {
+                client.send('file-error', { message: 'Missing file path for review mark.' });
+                return;
+            }
+            this.broadcast('chat', { sender: 'System', text: `📝 Review requested for ${targetPath}. ${note}` });
+            this.emitHighlight('file_review', 'File marked for review', `${targetPath} — ${note}`);
+        });
+
         // Start Simulation Loop
         this.setSimulationInterval((delta) => this.update(delta), 100);
     }
@@ -522,7 +631,7 @@ Paired buddy: Sales Outreach.`,
                     currentTask: coreAgent.currentTask || null,
                     recentMessages: coreAgent.getUnreadMessages(),
                     memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision) => {
+                }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
@@ -727,7 +836,7 @@ Paired buddy: Sales Outreach.`,
 
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
 
-                }).catch(err => {
+                }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), 15000);
                 });
@@ -1544,6 +1653,11 @@ Paired buddy: Sales Outreach.`,
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
             : { active: false });
+        this.listWorkspaceFiles().then((files) => {
+            client.send('file-list', { files });
+        }).catch((err) => {
+            client.send('file-error', { message: `Unable to list workspace files: ${String(err?.message || err)}` });
+        });
     }
 
     onLeave(client: Client, consented: boolean) {
@@ -1558,5 +1672,110 @@ Paired buddy: Sales Outreach.`,
             await this.memoryStore.saveMemories(id, agent.memories, this.sessionId);
         }
         await this.memoryStore.close();
+    }
+
+    private safeWorkspacePath(relativePath: string): string {
+        const cleaned = String(relativePath || '').replace(/^\/+/, '');
+        const resolved = path.resolve(this.workspaceRoot, cleaned);
+        const rel = path.relative(this.workspaceRoot, resolved);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) {
+            throw new Error('Path traversal not allowed.');
+        }
+        return resolved;
+    }
+
+    private guessPreviewType(filePath: string): 'text' | 'markdown' | 'json' | 'html' | 'unsupported' {
+        const ext = path.extname(filePath).toLowerCase();
+        if (ext === '.json') return 'json';
+        if (ext === '.md' || ext === '.mdx') return 'markdown';
+        if (ext === '.html' || ext === '.htm') return 'html';
+        const textSet = new Set(['.txt', '.log', '.csv', '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.go', '.rb', '.css', '.scss', '.yml', '.yaml', '.xml']);
+        return textSet.has(ext) ? 'text' : 'unsupported';
+    }
+
+    private async listWorkspaceFiles(): Promise<WorkspaceFileEntry[]> {
+        const output: WorkspaceFileEntry[] = [];
+        const maxDepth = 4;
+        const walk = async (dir: string, depth: number) => {
+            if (depth > maxDepth) return;
+            const entries = await fs.readdir(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.name.startsWith('.')) continue;
+                const fullPath = path.join(dir, entry.name);
+                const relPath = path.relative(this.workspaceRoot, fullPath).replace(/\\/g, '/');
+                const stat = await fs.stat(fullPath);
+                if (entry.isDirectory()) {
+                    output.push({ path: relPath, type: 'directory', updatedAt: stat.mtime.toISOString() });
+                    await walk(fullPath, depth + 1);
+                } else if (entry.isFile()) {
+                    output.push({
+                        path: relPath,
+                        type: 'file',
+                        size: stat.size,
+                        updatedAt: stat.mtime.toISOString()
+                    });
+                }
+            }
+        };
+
+        await fs.mkdir(this.workspaceRoot, { recursive: true });
+        await walk(this.workspaceRoot, 0);
+        return output.sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    private async readWorkspaceFile(relativePath: string): Promise<{ ok: true; preview: any } | { ok: false; error: string }> {
+        try {
+            if (!relativePath) return { ok: false, error: 'Missing file path.' };
+            const fullPath = this.safeWorkspacePath(relativePath);
+            const buf = await fs.readFile(fullPath);
+            const looksBinary = buf.includes(0);
+            if (looksBinary) {
+                return {
+                    ok: true,
+                    preview: {
+                        path: relativePath,
+                        type: 'unsupported',
+                        content: '',
+                        downloadUrl: `file://${fullPath}`,
+                        externalUrl: `file://${fullPath}`
+                    }
+                };
+            }
+            return {
+                ok: true,
+                preview: {
+                    path: relativePath,
+                    type: this.guessPreviewType(relativePath),
+                    content: buf.toString('utf-8')
+                }
+            };
+        } catch (err: any) {
+            return { ok: false, error: String(err?.message || err) };
+        }
+    }
+
+    private async writeWorkspaceFile(relativePath: string, content: string): Promise<{ ok: true } | { ok: false; error: string }> {
+        try {
+            if (!relativePath) return { ok: false, error: 'Missing file path.' };
+            const fullPath = this.safeWorkspacePath(relativePath);
+            await fs.mkdir(path.dirname(fullPath), { recursive: true });
+            await fs.writeFile(fullPath, content, 'utf-8');
+            return { ok: true };
+        } catch (err: any) {
+            return { ok: false, error: String(err?.message || err) };
+        }
+    }
+
+    private resolveAgentId(input: string): string | null {
+        if (!input) return null;
+        const normalized = input.toLowerCase();
+        if (this.coreAgents.has(normalized)) return normalized;
+        for (const [id, agent] of this.coreAgents.entries()) {
+            const name = agent.config.name.toLowerCase();
+            if (name === normalized || name.includes(normalized) || normalized.includes(name)) {
+                return id;
+            }
+        }
+        return null;
     }
 }
