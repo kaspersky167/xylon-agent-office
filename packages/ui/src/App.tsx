@@ -7,13 +7,15 @@ import { DesktopComputerPanel } from './components/DesktopComputerPanel';
 import { CeoOperationsPanel } from './components/CeoOperationsPanel';
 import { SystemLog } from './components/SystemLog';
 import { ViralControlPanel } from './components/ViralControlPanel';
+import { HighlightsFeed } from './components/HighlightsFeed';
 import { LayoutEditor } from './components/LayoutEditor';
 import { AgentInspector } from './components/AgentInspector';
 import { eventBus } from './events';
+import { UIStoreProvider, useUIStore } from './store/uiStore';
 
-export function App() {
-    const [desktopPanelOpen, setDesktopPanelOpen] = useState(false);
-    const [showAdvancedPanels, setShowAdvancedPanels] = useState(false);
+function AppContent() {
+    const { state, actions } = useUIStore();
+    const { panelVisibility } = state;
     const [activeZone, setActiveZone] = useState<'main' | 'ceo_office'>('main');
 
     useEffect(() => {

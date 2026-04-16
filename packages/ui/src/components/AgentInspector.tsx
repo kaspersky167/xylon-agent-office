@@ -1,18 +1,20 @@
 import React from 'react';
+import { FloatingPanel } from './FloatingPanel';
 import { useUIStore } from '../store/uiStore';
 
 export function AgentInspector() {
-    const { selectedAgent: agent } = useUIStore();
-    if (!agent) return null;
+    const { selectedAgent } = useUIStore();
+    if (!selectedAgent) return null;
 
     return (
-        <Panel style={{ position: 'absolute', right: 20, top: 20, width: 260 }}>
-            <SectionHeader title={`Inspector: ${agent.name}`} subtitle="Live agent snapshot" />
-            <div style={{ display: 'grid', gap: tokens.spacing.xs }}>
-                <Stat label="Role" value={agent.role || 'Unknown'} />
-                <Stat label="Status" value={agent.status || 'Idle'} />
-                <Stat label="Current Task" value={agent.currentTask || 'None'} />
+        <FloatingPanel id="agent-inspector" title={`Inspector: ${selectedAgent.name}`} subtitle="Live agent snapshot" width={280} defaultDock="right" defaultY={420}>
+            <div style={{ display: 'grid', gap: 6, fontSize: 12 }}>
+                <div><strong>Role:</strong> {selectedAgent.role || 'Unknown'}</div>
+                <div><strong>Status:</strong> {selectedAgent.status || 'Idle'}</div>
+                <div><strong>Current Task:</strong> {selectedAgent.currentTask || 'None'}</div>
+                <div><strong>Mood:</strong> {selectedAgent.mood}</div>
+                <div><strong>Momentum:</strong> {selectedAgent.momentum}</div>
             </div>
-        </Panel>
+        </FloatingPanel>
     );
 }
