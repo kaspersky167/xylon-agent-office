@@ -9,58 +9,8 @@ import { SystemLog } from './components/SystemLog';
 import { ViralControlPanel } from './components/ViralControlPanel';
 import { HighlightsFeed } from './components/HighlightsFeed';
 import { LayoutEditor } from './components/LayoutEditor';
-import { AgentInspector, type InspectorAgent, type InspectorActionEntry } from './components/AgentInspector';
-import { eventBus } from './events';
-
-type AgentStateEvent = {
-    id: string;
-    name: string;
-    action: string;
-    currentTask: string;
-    mood: number;
-    reputation: number;
-    riskLevel: number;
-    momentum: number;
-};
-
-type RelationshipEdge = {
-    a: string;
-    b: string;
-    aName: string;
-    bName: string;
-    score: number;
-    status: 'alliance' | 'neutral' | 'rivalry';
-};
-
-type AgentIdentity = {
-    role: string;
-    team: string;
-    division: string;
-    buddyRole: string;
-};
-
-const ROLES = ['Engineer', 'Product Designer', 'Data Analyst', 'Growth Strategist', 'QA Specialist', 'Platform Ops'];
-const TEAMS = ['Core Platform', 'Innovation Lab', 'Customer Ops', 'Revenue'];
-const DIVISIONS = ['Delivery', 'Research', 'Enablement'];
-
-function hashSeed(input: string): number {
-    return Math.abs((input || '').split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0));
-}
-
-function deriveIdentity(agentId: string, agentName: string): AgentIdentity {
-    const seed = hashSeed(`${agentId}:${agentName}`);
-    return {
-        role: ROLES[seed % ROLES.length],
-        team: TEAMS[seed % TEAMS.length],
-        division: DIVISIONS[seed % DIVISIONS.length],
-        buddyRole: ROLES[(seed + 2) % ROLES.length]
-    };
-}
-
-function normalizeStatus(action: string): string {
-    if (!action) return 'Idle';
-    return action.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
-}
+import { AgentInspector } from './components/AgentInspector';
+import { TaskBoard } from './components/TaskBoard';
 
 export function App() {
     const [desktopPanelOpen, setDesktopPanelOpen] = useState(false);
@@ -257,6 +207,7 @@ export function App() {
                     </div>
                 </AppShellZone>
 
+            {showAdvancedPanels && <TaskBoard />}
             {showAdvancedPanels && <AgentPulseBoard />}
             {showAdvancedPanels && <RelationshipGraph />}
             {showAdvancedPanels && <EpisodeRecapPanel />}
