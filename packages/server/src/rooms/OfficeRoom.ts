@@ -114,10 +114,24 @@ interface ChatAttachment {
   createdAt: string;
 }
 
-type ZoneId = 'main' | 'ceo_office';
-type ZoneBounds = { minX: number; maxX: number; minY: number; maxY: number };
-type LayoutItem = { id: string; type: string; x: number; y: number; label?: string; zoneId: ZoneId };
-type FurnitureTarget = { x: number; y: number; type: string };
+interface MailAttachment {
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+}
+
+interface MailMessage {
+    id: string;
+    threadId: string;
+    from: string;
+    to: string;
+    toAgentId?: string;
+    subject: string;
+    body: string;
+    attachments: MailAttachment[];
+    createdAt: string;
+}
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
@@ -131,69 +145,180 @@ const MAJOR_TOOLS = new Set<string>([
 ]);
 
 export class OfficeRoom extends Room<OfficeState> {
-  private static activeRoom: OfficeRoom | null = null;
-  private static extensionRegistry: ExtensionRegistry | null = null;
+    private static activeRoom: OfficeRoom | null = null;
 
-  static setExtensionRegistry(extensionRegistry: ExtensionRegistry): void {
-    OfficeRoom.extensionRegistry = extensionRegistry;
-  }
+    maxClients = 100;
+    private office!: Office;
+    private demoTickCount = 0;
+    private coreAgents: Map<string, Agent> = new Map();
+    private thinkingLocks: Map<string, boolean> = new Map();
+    private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
+    private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
+    private inferenceProvider = 'ollama';
+    private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
+    private hireCount = 0; // Counter for generating unique IDs
+    private toolExecutor = new ToolExecutor();
+    private memoryStore = new MemoryStore();
+    private sessionId = `session_${Date.now()}`;
+    private currentScenario = 'Free Play';
+    private highlights: HighlightEvent[] = [];
+    private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
+    private relationships: Map<string, RelationshipEdge> = new Map();
+    private audienceVotes: Record<string, number> = {};
+    private currentLayout: any[] = [];
+    private approvals: Map<string, ApprovalRequest> = new Map();
+    private meetingActive = false;
+    private meetingEndsAt = 0;
+    private meetingTopic = '';
+    private taskProgress: Map<string, number> = new Map();
+    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
+    private completedTasks: CompletedTaskRecord[] = [];
+    private fastTrackMode = true;
+    private mailMessages: MailMessage[] = [];
 
-  maxClients = 100;
-  private office!: Office;
-  private demoTickCount = 0;
-  private coreAgents: Map<string, Agent> = new Map();
-  private thinkingLocks: Map<string, boolean> = new Map();
-  private ollamaAdapter = new OllamaAdapter("http://localhost:11434");
-  private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter =
-    this.ollamaAdapter;
-  private inferenceProvider: InferenceConfig["provider"] = "ollama";
-  private defaultModel =
-    process.env.AGENT_MODEL ||
-    process.env.CLAUDE_MODEL ||
-    "claude-3-5-sonnet-latest";
-  private hireCount = 0; // Counter for generating unique IDs
-  private toolExecutor = new ToolExecutor();
-  private memoryStore = new MemoryStore();
-  private sessionId = `session_${Date.now()}`;
-  private currentScenario = "Free Play";
-  private highlights: HighlightEvent[] = [];
-  private chaosHistory: Array<{ event: string; label: string; time: string }> =
-    [];
-  private relationships: Map<string, RelationshipEdge> = new Map();
-  private audienceVotes: Record<string, number> = {};
-  private currentLayout: any[] = [];
-  private approvals: Map<string, ApprovalRequest> = new Map();
-  private meetingActive = false;
-  private meetingEndsAt = 0;
-  private meetingTopic = "";
-  private taskProgress: Map<string, number> = new Map();
-  private workspaceRoot = path.resolve(
-    process.env.AGENT_WORKSPACE_DIR || "data/workspace",
-  );
-  private completedTasks: CompletedTaskRecord[] = [];
-  private fastTrackMode = true;
+    private getMimeType(filePath: string): string {
+        const ext = path.extname(filePath).toLowerCase();
+        const map: Record<string, string> = {
+            '.md': 'text/markdown',
+            '.txt': 'text/plain',
+            '.json': 'application/json',
+            '.js': 'text/javascript',
+            '.ts': 'text/typescript',
+            '.tsx': 'text/tsx',
+            '.jsx': 'text/jsx',
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.pdf': 'application/pdf',
+            '.csv': 'text/csv',
+            '.yml': 'text/yaml',
+            '.yaml': 'text/yaml'
+        };
+        return map[ext] || 'application/octet-stream';
+    }
 
-  private getMimeType(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    const map: Record<string, string> = {
-      ".md": "text/markdown",
-      ".txt": "text/plain",
-      ".json": "application/json",
-      ".js": "text/javascript",
-      ".ts": "text/typescript",
-      ".tsx": "text/tsx",
-      ".jsx": "text/jsx",
-      ".html": "text/html",
-      ".css": "text/css",
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".gif": "image/gif",
-      ".svg": "image/svg+xml",
-      ".pdf": "application/pdf",
-      ".csv": "text/csv",
-      ".yml": "text/yaml",
-      ".yaml": "text/yaml",
+    private resolveWorkspacePath(targetPath: string): string {
+        const safeTarget = String(targetPath || '').trim();
+        const fullPath = path.resolve(this.workspaceRoot, safeTarget);
+        const rel = path.relative(this.workspaceRoot, fullPath);
+        if (!safeTarget || rel.startsWith('..') || path.isAbsolute(rel)) {
+            throw new Error('Invalid workspace file path.');
+        }
+        return fullPath;
+    }
+
+    private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
+        if (!input || typeof input !== 'object') return null;
+
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : '';
+        const filePath = typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '';
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '';
+        const mimeType = typeof input.mimeType === 'string' && input.mimeType.trim() ? input.mimeType.trim() : '';
+        const size = Number(input.size);
+        const sharedBy = typeof input.sharedBy === 'string' && input.sharedBy.trim()
+            ? input.sharedBy.trim()
+            : defaultSharedBy;
+
+        const sharedWith = Array.isArray(input.sharedWith)
+            ? input.sharedWith
+                .filter((entry: unknown) => typeof entry === 'string')
+                .map((entry: string) => entry.trim())
+                .filter(Boolean)
+            : [];
+
+        const createdAtRaw = typeof input.createdAt === 'string' ? input.createdAt : '';
+        const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+        const createdAt = Number.isNaN(createdAtDate.getTime())
+            ? new Date().toISOString()
+            : createdAtDate.toISOString();
+
+        if (!id || !filePath || !name || !mimeType || !Number.isFinite(size) || size < 0) return null;
+
+        return {
+            id,
+            path: filePath,
+            name,
+            mimeType,
+            size: Math.floor(size),
+            sharedBy,
+            sharedWith,
+            createdAt
+        };
+    }
+
+    private parseChatAttachments(raw: any, defaultSharedBy: string): ChatAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+            .filter((item): item is ChatAttachment => Boolean(item));
+    }
+
+    private normalizeMailAttachments(raw: any): MailAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((entry: any) => {
+                const filePath = String(entry?.path || '').trim();
+                if (!filePath) return null;
+                return {
+                    path: filePath,
+                    name: String(entry?.name || path.basename(filePath)),
+                    mimeType: String(entry?.mimeType || this.getMimeType(filePath)),
+                    size: Number.isFinite(Number(entry?.size)) ? Math.max(0, Math.floor(Number(entry.size))) : 0
+                } as MailAttachment;
+            })
+            .filter((item: MailAttachment | null): item is MailAttachment => Boolean(item));
+    }
+
+    private pushMail(message: MailMessage) {
+        this.mailMessages.push(message);
+        if (this.mailMessages.length > 250) this.mailMessages = this.mailMessages.slice(-250);
+        this.broadcast('mail-sync', { messages: this.mailMessages.slice(-150) });
+    }
+
+    // Furniture interaction points: named locations agents can walk to
+    private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
+        // ─── ENGINEERING POD (pod of 4, left side) ───
+        // Pair: Frontend + Backend / Pair: DevOps + Security
+        'frontend-desk':    { x: 5,  y: 10, type: 'desk' },
+        'backend-desk':     { x: 8,  y: 10, type: 'desk' },
+        'devops-desk':      { x: 5,  y: 14, type: 'desk' },
+        'security-desk':    { x: 8,  y: 14, type: 'desk' },
+
+        // ─── OPS / STRATEGY POD (pod of 4, center) ───
+        // Pair: Shepherd + Reality / Pair: Evidence + SEO
+        'shepherd-desk':    { x: 17, y: 10, type: 'desk' },
+        'reality-desk':     { x: 20, y: 10, type: 'desk' },
+        'evidence-desk':    { x: 17, y: 14, type: 'desk' },
+        'seo-desk':         { x: 20, y: 14, type: 'desk' },
+
+        // ─── GROWTH POD (small pod of 2, right side) ───
+        // Pair: Sales + Proposal
+        'sales-desk':       { x: 29, y: 10, type: 'desk' },
+        'proposal-desk':    { x: 32, y: 10, type: 'desk' },
+
+        // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
+        'ceo-desk':         { x: 32, y: 30, type: 'desk' },
+        'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
+        'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
+        'ceo-office-door':  { x: 28, y: 30, type: 'door' },
+
+        // ─── SHARED FURNITURE ───
+        'meeting-table':  { x: 20, y: 22, type: 'table' },
+        'coffee-machine': { x: 5,  y: 30, type: 'appliance' },
+        'whiteboard':     { x: 20, y: 5,  type: 'board' },
+        'water-cooler':   { x: 12, y: 30, type: 'appliance' },
+        'bookshelf':      { x: 17, y: 30, type: 'furniture' },
+        'beanbag':        { x: 24, y: 30, type: 'seating' },
+        // Extra desks for dynamically hired agents
+        'hire_0-desk': { x: 22, y: 18, type: 'desk' },
+        'hire_1-desk': { x: 22, y: 23, type: 'desk' },
+        'hire_2-desk': { x: 25, y: 18, type: 'desk' },
+        'hire_3-desk': { x: 25, y: 8,  type: 'desk' },
+        'hire_4-desk': { x: 32, y: 18, type: 'desk' },
     };
     return map[ext] || "application/octet-stream";
   }
@@ -1612,15 +1737,134 @@ Paired buddy: Sales Outreach.`,
                     params: decision.toolCall.params,
                   },
                 });
-              } else {
-                const result = await this.toolExecutor.execute(
-                  decision.toolCall.name,
-                  decision.toolCall.params,
-                  {
-                    actorId: id,
-                    actorRole: coreAgent.config.role,
-                  },
-                );
+                approvalId = approval.id;
+            }
+
+            await this.memoryStore.updateSharedFileStatus(fileId, nextStatus, approvalId);
+            await this.memoryStore.logShareAction({
+                fileId,
+                action: 'file-status-update',
+                actor: client.sessionId,
+                details: JSON.stringify({ status: nextStatus, approvalId }),
+            });
+
+            const file = await this.memoryStore.getSharedFile(fileId);
+            this.broadcast('file-status-update', file);
+        });
+
+        this.onMessage('mail-request-sync', (client) => {
+            client.send('mail-sync', { messages: this.mailMessages.slice(-150) });
+        });
+
+        this.onMessage('mail-send', async (client, message) => {
+            const toAgentId = String(message?.toAgentId || '').trim().toLowerCase();
+            const subject = String(message?.subject || '').trim() || 'No subject';
+            const body = String(message?.body || '').trim();
+            const attachments = this.normalizeMailAttachments(message?.attachments);
+            const targetAgent = this.coreAgents.get(toAgentId);
+
+            if (!targetAgent) {
+                client.send('mail-error', { message: `Unknown agent: ${toAgentId || '(empty)'}` });
+                return;
+            }
+            if (!body && attachments.length === 0) {
+                client.send('mail-error', { message: 'Add instructions or attachments before sending.' });
+                return;
+            }
+
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const threadId = `mail-${toAgentId}-${Date.now()}`;
+            const outbound: MailMessage = {
+                id: `${threadId}-user`,
+                threadId,
+                from: 'You',
+                to: targetAgent.config.name,
+                toAgentId,
+                subject,
+                body,
+                attachments,
+                createdAt: nowIso
+            };
+            this.pushMail(outbound);
+
+            const targetState = this.state.agents.get(toAgentId);
+            const attachmentList = attachments.length > 0
+                ? attachments.map((a) => a.path).join(', ')
+                : 'none';
+
+            targetAgent.receiveMessage({
+                from: 'Faz (CEO)',
+                to: targetAgent.config.name,
+                content: `EMAIL SUBJECT: ${subject}\nINSTRUCTIONS: ${body || '(none)'}\nATTACHMENTS: ${attachmentList}\nReply with clear next steps and ETA in office email.`,
+                timestamp: nowIso
+            });
+            targetAgent.currentTask = `Email follow-up: ${subject}`.slice(0, 120);
+            if (targetState) {
+                targetState.currentTask = targetAgent.currentTask;
+                targetState.action = 'talk';
+            }
+
+            this.broadcast('chat', {
+                sender: '📨 Office Mail',
+                text: `Sent "${subject}" to ${targetAgent.config.name}.`
+            });
+
+            const ackBody = [
+                `Received your email: "${subject}".`,
+                body ? `Planned action: ${body.slice(0, 140)}` : 'Planned action: reviewing provided context.',
+                attachments.length > 0
+                    ? `I will process these files: ${attachments.map((a) => a.name).join(', ')}.`
+                    : 'No attachments were included.',
+                'I will post progress updates and outcomes in chat + completed work if artifacts are produced.'
+            ].join(' ');
+
+            setTimeout(() => {
+                const reply: MailMessage = {
+                    id: `${threadId}-agent`,
+                    threadId,
+                    from: targetAgent.config.name,
+                    to: 'You',
+                    toAgentId,
+                    subject: `RE: ${subject}`,
+                    body: ackBody,
+                    attachments: [],
+                    createdAt: this.state.officeTime || new Date().toISOString()
+                };
+                this.pushMail(reply);
+                this.broadcast('chat', {
+                    sender: '📨 Office Mail',
+                    text: `${targetAgent.config.name} replied to "${subject}".`
+                });
+            }, 1800 + Math.floor(Math.random() * 1800));
+        });
+
+        // Save office layout from editor
+        this.onMessage('save-layout', async (client, message) => {
+            const layoutName = message.name || 'default';
+            const layout = Array.isArray(message.layout) ? message.layout : [];
+            await this.memoryStore.saveLayout(layoutName, JSON.stringify(layout));
+            this.currentLayout = layout;
+            this.broadcast('layout-sync', { name: layoutName, layout: this.currentLayout });
+            this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
+        });
+
+        // Start Simulation Loop
+        this.setSimulationInterval((delta) => this.update(delta), 100);
+    }
+
+    private autoAssignAgent(): string {
+        // Pick the agent with no current task, or the first one
+        for (const [id, agent] of this.coreAgents) {
+            if (!agent.currentTask) return id;
+        }
+        // fallback: first registered core agent (Project Shepherd by default)
+        return this.coreAgents.keys().next().value || 'shepherd';
+    }
+
+    async update(delta: number) {
+        if (Math.random() < 0.02) {
+            console.log(`[Server] Agents: ${this.state.agents.size} | Session: ${this.sessionId}`);
+        }
 
                 this.broadcast("chat", {
                   sender: coreAgent.config.name,
@@ -1636,11 +1880,261 @@ Paired buddy: Sales Outreach.`,
                   id,
                 );
 
-                coreAgent.addMemory({
-                  content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
-                  type: "task_result",
-                  timestamp: this.state.officeTime,
-                  importance: 0.8,
+                coreAgent.think({
+                    time: this.state.officeTime,
+                    location: `${agentState.x},${agentState.y}`,
+                    nearbyAgents,
+                    currentTask: coreAgent.currentTask || null,
+                    recentMessages: coreAgent.getUnreadMessages(),
+                    memories: coreAgent.getRecentMemories(5)
+                }).then(async (decision: any) => {
+                    agentState.action = decision.action;
+
+                    if (decision.thought) {
+                        agentState.thought = decision.thought;
+                    }
+
+                    // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
+                    if (decision.action === 'talk' && decision.message) {
+                        const targetName = decision.target || '';
+                        let targetId = '';
+                        this.coreAgents.forEach((a, aId) => {
+                            if (a.config.name.toLowerCase() === targetName.toLowerCase()) targetId = aId;
+                        });
+
+                        const targetAgent = this.coreAgents.get(targetId);
+                        if (targetAgent) {
+                            const msg: ConversationMessage = {
+                                from: coreAgent.config.name,
+                                to: targetAgent.config.name,
+                                content: decision.message,
+                                timestamp: this.state.officeTime
+                            };
+                            targetAgent.receiveMessage(msg);
+
+                            // Broadcast to UI chat
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `💬 (to ${targetAgent.config.name}): ${decision.message}`
+                            });
+                            this.emitHighlight(
+                                'conversation',
+                                `${coreAgent.config.name} pinged ${targetAgent.config.name}`,
+                                decision.message.slice(0, 120),
+                                id
+                            );
+                            this.updateRelationship(id, targetId, 0.08);
+
+                            // Save conversation memory
+                            await this.memoryStore.saveMemory(id, {
+                                content: `Said to ${targetAgent.config.name}: "${decision.message}"`,
+                                type: 'conversation',
+                                timestamp: this.state.officeTime,
+                                importance: 0.7
+                            }, this.sessionId);
+                            await this.memoryStore.saveMemory('agency:global', {
+                                content: `${coreAgent.config.name} told ${targetAgent.config.name}: "${decision.message}"`,
+                                type: 'conversation',
+                                timestamp: this.state.officeTime,
+                                importance: 0.7
+                            }, this.sessionId);
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: ConversationMessage) => m.from.includes('CEO'))) {
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `🗣️ ${decision.message}`
+                            });
+                            this.emitHighlight(
+                                'conversation',
+                                `${coreAgent.config.name} replied to CEO`,
+                                decision.message.slice(0, 120),
+                                id
+                            );
+                        }
+
+                        coreAgent.clearInbox(); // Clear after processing
+                    }
+
+                    // ─── HANDLE TOOL EXECUTION ───
+                    if (decision.action === 'use_tool' && decision.toolCall) {
+                        // Special case: agent-created tasks
+                        if (decision.toolCall.name === 'create_task') {
+                            const { title, assignee } = decision.toolCall.params;
+                            const targetId = assignee?.toLowerCase() || this.autoAssignAgent();
+                            const targetAgent = this.coreAgents.get(targetId);
+                            const targetState = this.state.agents.get(targetId);
+
+                            if (targetAgent && targetState) {
+                                targetAgent.currentTask = title;
+                                targetState.currentTask = title;
+                                await this.memoryStore.createTask(title, targetId);
+
+                                this.broadcast('chat', {
+                                    sender: coreAgent.config.name,
+                                    text: `📋 Created task "${title}" for ${targetAgent.config.name}`
+                                });
+                                this.broadcast('task-update', {
+                                    agentId: targetId,
+                                    agentName: targetAgent.config.name,
+                                    task: title,
+                                    status: 'in_progress',
+                                    fastTrackMode: this.fastTrackMode
+                                });
+                                this.seedTaskProgress(targetId, title);
+                                this.emitHighlight(
+                                    'task',
+                                    `${coreAgent.config.name} assigned work`,
+                                    `"${title}" is now owned by ${targetAgent.config.name}.`,
+                                    targetId
+                                );
+                            }
+                        } else if (decision.toolCall.name === 'hire_agent' && id !== 'ceo') {
+                            // Hiring is MAJOR → route to CEO approval queue
+                            this.createApproval({
+                                requestedBy: id,
+                                requestedByName: coreAgent.config.name,
+                                requestedAction: `hire_agent (${decision.toolCall.params?.role || 'Intern'})`,
+                                rationale: decision.thought || 'No rationale provided.',
+                                isMajor: true,
+                                pending: { toolName: 'hire_agent', params: decision.toolCall.params },
+                            });
+                        } else if (decision.toolCall.name === 'hire_agent') {
+                            // ─── DYNAMIC AGENT HIRING (CEO-executed) ───
+                            const hireParams = decision.toolCall.params;
+                            const hireName = hireParams.name || ['Charlie', 'Diana', 'Eve', 'Frank', 'Grace'][this.hireCount % 5];
+                            const hireRole = hireParams.role || 'Intern';
+                            const hireId = `hire_${this.hireCount}`;
+
+                            if (this.hireCount < 5 && !this.coreAgents.has(hireId)) {
+                                // Spawn at office door (top-center), then walk to their desk
+                                const spawnX = 20;
+                                const spawnY = 2;
+
+                                this.state.createAgent(hireId, hireName);
+                                const hireState = this.state.agents.get(hireId);
+                                if (hireState) { hireState.x = spawnX; hireState.y = spawnY; }
+
+                                const hireAgent = new Agent({
+                                    id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
+                                    inference: {
+                                        provider: this.inferenceProvider,
+                                        model: this.defaultModel,
+                                        systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
+                                    },
+                                    personality: {
+                                        traits: { openness: 0.9, conscientiousness: 0.7, extraversion: 0.8, agreeableness: 0.9, neuroticism: 0.2 },
+                                        communicationStyle: hireRole.includes('Design') ? 'creative' : 'casual',
+                                        workHours: { start: '09:00', end: '17:00' },
+                                        breakFrequency: 90
+                                    },
+                                    capabilities: [
+                                        { name: 'code_execute', description: 'Execute JavaScript code' },
+                                        { name: 'web_search', description: 'Search the web' },
+                                        { name: 'write_note', description: 'Write a note' },
+                                        { name: 'create_task', description: 'Create a task for the team' }
+                                    ],
+                                    memory: { shortTermLimit: 50 }
+                                });
+
+                                hireAgent.setInferenceAdapter(this.inferenceAdapter);
+                                await hireAgent.initialize();
+                                this.coreAgents.set(hireId, hireAgent);
+                                this.thinkingLocks.set(hireId, false);
+
+                                this.hireCount++;
+                                this.rebuildRelationshipGraph();
+
+                                this.broadcast('chat', {
+                                    sender: '🏢 Office',
+                                    text: `🎉 ${coreAgent.config.name} hired ${hireName} as ${hireRole}! Welcome to the team!`
+                                });
+                                this.emitHighlight(
+                                    'hiring',
+                                    `${hireName} joined the team`,
+                                    `${coreAgent.config.name} hired ${hireName} (${hireRole}).`,
+                                    hireId
+                                );
+
+                                // Give the hiring agent a memory of the hire
+                                coreAgent.addMemory({
+                                    content: `I hired ${hireName} as a ${hireRole}. They just joined the team.`,
+                                    type: 'achievement',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.9
+                                });
+                            } else if (this.hireCount >= 5) {
+                                this.broadcast('chat', {
+                                    sender: '🏢 Office',
+                                    text: `⚠️ ${coreAgent.config.name} tried to hire but the office is full! (Max 7 agents)`
+                                });
+                            }
+                        } else if (id !== 'ceo' && this.isMajorToolCall(decision.toolCall.name, decision.toolCall.params)) {
+                            // ─── MAJOR ACTION → CEO APPROVAL GATE ───
+                            this.createApproval({
+                                requestedBy: id,
+                                requestedByName: coreAgent.config.name,
+                                requestedAction: `${decision.toolCall.name}`,
+                                rationale: decision.thought || 'No rationale provided — please supply more context.',
+                                isMajor: true,
+                                pending: { toolName: decision.toolCall.name, params: decision.toolCall.params },
+                            });
+                        } else {
+                            const result = await this.toolExecutor.execute(
+                                decision.toolCall.name,
+                                decision.toolCall.params
+                            );
+
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                            });
+                            this.emitHighlight(
+                                'tool',
+                                `${coreAgent.config.name} used ${decision.toolCall.name}`,
+                                (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
+                                id
+                            );
+
+                            coreAgent.addMemory({
+                                content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
+                                type: 'task_result',
+                                timestamp: this.state.officeTime,
+                                importance: 0.8
+                            });
+                            await this.memoryStore.saveMemory('agency:global', {
+                                content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
+                                type: 'task_result',
+                                timestamp: this.state.officeTime,
+                                importance: 0.8
+                            }, this.sessionId);
+
+                            if (
+                                decision.toolCall.name === 'write_file' &&
+                                String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
+                            ) {
+                                await this.queueFileReviewApproval({
+                                    sharedByAgentId: id,
+                                    sharedByAgentName: coreAgent.config.name,
+                                    filePath: String(decision.toolCall.params?.path || ''),
+                                    summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
+                                    fileId: decision.toolCall.params?.fileId,
+                                });
+                            }
+                        }
+                    }
+
+                    // ─── PERSIST MEMORIES PERIODICALLY ───
+                    if (Math.random() < 0.3) {
+                        const recentMemories = coreAgent.memories.slice(-3);
+                        await this.memoryStore.saveMemories(id, recentMemories, this.sessionId);
+                    }
+
+                    await this.advanceTaskProgress(id, coreAgent, agentState, decision.action);
+
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+
+                }).catch((err: any) => {
+                    console.error(`Agent ${id} think error:`, err);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
                 await this.memoryStore.saveMemory(
                   "agency:global",

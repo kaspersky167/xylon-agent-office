@@ -1,9 +1,11 @@
 import React, { useMemo, useState, useEffect } from 'react';
 import { getColyseusRoom } from '../game/Game';
-import { eventBus } from '../events';
-
-type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
-type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+import { Button } from './ui/Button';
+import { Chip } from './ui/Chip';
+import { Panel } from './ui/Panel';
+import { SectionHeader } from './ui/SectionHeader';
+import { Toolbar } from './ui/Toolbar';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 interface TaskItem {
     id: string;
@@ -114,17 +116,10 @@ export function TaskBoard() {
         }
     };
 
-    const transitionTask = (taskId: string, status: TaskStatus) => {
-        const room = getColyseusRoom();
-        room?.send('task-transition', { id: taskId, status });
-    };
-
-    const statusColor = (s: TaskStatus) => {
-        if (s === 'done') return '#00b894';
-        if (s === 'review') return '#a29bfe';
-        if (s === 'blocked') return '#ff7675';
-        if (s === 'in_progress') return '#fdcb6e';
-        return '#dfe6e9';
+    const taskTone = (s: string): 'success' | 'warning' | 'default' => {
+        if (s === 'completed') return 'success';
+        if (s === 'in_progress') return 'warning';
+        return 'default';
     };
 
     const statusIcon = (s: TaskStatus) => {
@@ -136,83 +131,59 @@ export function TaskBoard() {
     };
 
     return (
-        <div style={{
-            position: 'absolute', left: 20, top: 20, width: 300,
-            backgroundColor: 'rgba(10,10,30,0.92)', color: 'white',
-            padding: 16, borderRadius: 12,
-            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
-            backdropFilter: 'blur(8px)',
-            border: '1px solid rgba(108,92,231,0.3)',
-            maxHeight: '60vh', display: 'flex', flexDirection: 'column'
-        }}>
-            <h3 style={{ margin: '0 0 10px 0', fontSize: '14px', display: 'flex', alignItems: 'center', gap: 6 }}>
-                📋 Task Board
-            </h3>
+        <Panel style={{ position: 'absolute', left: 20, top: 20, width: 300, maxHeight: '52vh', display: 'flex', flexDirection: 'column' }}>
+            <SectionHeader title="📋 Task Board" subtitle="Assign, route, and monitor execution" />
 
-            <form onSubmit={handleSubmit} style={{ marginBottom: 10 }}>
+            <form onSubmit={handleSubmit} style={{ marginBottom: tokens.spacing.sm }}>
                 <input
                     type="text"
                     value={newTask}
                     onChange={(e) => setNewTask(e.target.value)}
                     placeholder="Assign a task..."
-                    style={{ width: '100%', padding: '8px 10px', borderRadius: 6, border: '1px solid #444', backgroundColor: '#1a1a3e', color: 'white', fontSize: '12px', outline: 'none', boxSizing: 'border-box', marginBottom: 6 }}
+                    style={{ ...controlRoomStyles.input, marginBottom: tokens.spacing.xs }}
                 />
-                <div style={{ display: 'grid', gap: 6 }}>
-                    <select value={targetAgent} onChange={(e) => setTargetAgent(e.target.value)} style={{ padding: '6px', borderRadius: 6, border: '1px solid #444', backgroundColor: '#1a1a3e', color: '#aaa', fontSize: '11px' }}>
+                <Toolbar>
+                    <select
+                        value={targetAgent}
+                        onChange={(e) => setTargetAgent(e.target.value)}
+                        style={{ ...controlRoomStyles.input, flex: 1, padding: 6, color: tokens.color.textSecondary }}
+                    >
                         <option value="auto">🤖 Auto-assign</option>
                         {roster.map((agent) => (
                             <option key={agent.id} value={agent.id}>{agent.name}</option>
                         ))}
                     </select>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 6 }}>
-                        <select value={priority} onChange={(e) => setPriority(e.target.value as TaskPriority)} style={{ borderRadius: 6, border: '1px solid #444', backgroundColor: '#1a1a3e', color: '#aaa', fontSize: '11px', padding: 6 }}>
-                            <option value="low">Low</option>
-                            <option value="medium">Medium</option>
-                            <option value="high">High</option>
-                            <option value="critical">Critical</option>
-                        </select>
-                        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}>
-                            <input type="checkbox" checked={requiresApproval} onChange={(e) => setRequiresApproval(e.target.checked)} /> CEO approval
-                        </label>
-                        <button type="submit" style={{ padding: '6px 12px', borderRadius: 6, border: 'none', backgroundColor: '#6c5ce7', color: 'white', fontSize: '11px', cursor: 'pointer', fontWeight: 'bold' }}>
-                            Assign
-                        </button>
-                    </div>
-                </div>
+                    <Button type="submit" tone="primary">Assign</Button>
+                </Toolbar>
             </form>
 
-            <div style={{ flex: 1, overflowY: 'auto', fontSize: '12px' }}>
-                {tasks.length === 0 && <p style={{ color: '#666', fontStyle: 'italic', margin: 0, fontSize: '11px' }}>No tasks yet.</p>}
+            <div style={{ flex: 1, overflowY: 'auto', fontSize: tokens.typography.caption, ...controlRoomStyles.scroll }}>
+                {tasks.length === 0 && (
+                    <p style={{ color: tokens.color.textMuted, fontStyle: 'italic', margin: 0, fontSize: tokens.typography.micro }}>
+                        No tasks yet. Type above to assign work to agents.
+                    </p>
+                )}
                 {tasks.map(task => (
-                    <div key={task.id} style={{ padding: '6px 8px', marginBottom: 4, borderRadius: 6, backgroundColor: 'rgba(255,255,255,0.05)', borderLeft: `3px solid ${statusColor(task.status)}` }}>
-                        <div style={{ fontWeight: 'bold', fontSize: '11px' }}>{statusIcon(task.status)} {task.title}</div>
-                        <div style={{ fontSize: '10px', color: '#888', marginTop: 2 }}>
-                            → {rosterMap.get(task.assigned_to) || task.assigned_to || 'Unassigned'} · {task.priority || 'medium'}
-                            {task.requires_approval ? ' · CEO gate' : ''}
-                        </div>
-                        {task.status_reason && <div style={{ fontSize: 10, color: '#ffb3b3', marginTop: 2 }}>Reason: {task.status_reason}</div>}
-                        <div style={{ display: 'flex', gap: 4, marginTop: 5, flexWrap: 'wrap' }}>
-                            {(nextTransitions[task.status] || []).map((next) => (
-                                <button
-                                    key={next}
-                                    type="button"
-                                    onClick={() => transitionTask(task.id, next)}
-                                    style={{
-                                        borderRadius: 6,
-                                        border: '1px solid rgba(255,255,255,0.2)',
-                                        background: 'rgba(108,92,231,0.2)',
-                                        color: '#fff',
-                                        fontSize: 10,
-                                        cursor: 'pointer'
-                                    }}
-                                >
-                                    {next.replace('_', ' ')}
-                                </button>
-                            ))}
-                        </div>
+                    <div key={task.id} style={{ ...controlRoomStyles.panelMuted, padding: `${tokens.spacing.xs}px ${tokens.spacing.sm}px`, marginBottom: tokens.spacing.xs }}>
+                        <Toolbar>
+                            <div style={{ fontWeight: 700, fontSize: tokens.typography.caption, flex: 1 }}>{statusIcon(task.status)} {task.title}</div>
+                            {/(\bmajor\b|\bdeploy\b|\blaunch\b|\bpublish\b|\bhire\b|\bfire\b|\bpricing\b)/i.test(task.title) && (
+                                <Chip tone="danger">🛂 CEO</Chip>
+                            )}
+                        </Toolbar>
+                        <Toolbar style={{ marginTop: 3 }}>
+                            <Chip tone={taskTone(task.status)}>{task.status.replace('_', ' ')}</Chip>
+                            <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>
+                                → {task.assigned_to || 'Unassigned'}
+                            </div>
+                        </Toolbar>
                     </div>
                 ))}
             </div>
-        </div>
+
+            <div style={{ marginTop: tokens.spacing.sm, fontSize: tokens.typography.micro, color: tokens.color.textMuted, borderTop: `1px solid ${tokens.color.borderSoft}`, paddingTop: 6 }}>
+                🤖 Engine: Ollama Local • 💾 SQLite Persistence
+            </div>
+        </Panel>
     );
 }

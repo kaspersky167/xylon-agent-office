@@ -299,8 +299,16 @@ export class OfficeScene extends Phaser.Scene {
                 this.room!.onMessage('file-error', (message: any) => {
                     emitUIEvent(UIEvents.desktopFileError, message);
                 });
+                this.room!.onMessage('mail-sync', (message: any) => {
+                    emitUIEvent(UIEvents.mailSync, message);
+                });
+                this.room!.onMessage('mail-error', (message: any) => {
+                    emitUIEvent(UIEvents.mailError, message);
+                });
 
                 this.room!.send('file-list', { request: true });
+                this.room!.send('request-completed-work', {});
+                this.room!.send('mail-request-sync', {});
 
                 state.agents.onAdd((agent: AgentState, sessionId: string) => {
                     console.log(`[Colyseus] Agent added: ${agent.name} at (${agent.x}, ${agent.y})`);
