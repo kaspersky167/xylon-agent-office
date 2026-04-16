@@ -1,7 +1,7 @@
 import { Room, Client } from 'colyseus';
 import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
-import { OllamaAdapter } from '@agent-office/adapters';
+import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
@@ -96,6 +96,9 @@ export class OfficeRoom extends Room<OfficeState> {
     private coreAgents: Map<string, Agent> = new Map();
     private thinkingLocks: Map<string, boolean> = new Map();
     private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
+    private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
+    private inferenceProvider = 'ollama';
+    private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
     private hireCount = 0; // Counter for generating unique IDs
     private toolExecutor = new ToolExecutor();
     private memoryStore = new MemoryStore();
@@ -242,6 +245,26 @@ export class OfficeRoom extends Room<OfficeState> {
         return OfficeRoom.activeRoom;
     }
 
+    private configureInferenceProvider() {
+        const provider = (process.env.AGENT_INFERENCE_PROVIDER || '').toLowerCase().trim();
+        if (provider === 'claude' || provider === 'openai-compatible') {
+            const baseUrl = process.env.CLAUDE_BASE_URL || process.env.OPENAI_COMPAT_BASE_URL || 'https://openrouter.ai/api';
+            const apiKey = process.env.CLAUDE_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || '';
+            if (apiKey) {
+                this.inferenceAdapter = new OpenAICompatibleAdapter(baseUrl, apiKey, 'claude');
+                this.inferenceProvider = 'claude';
+                this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
+                console.log(`[Inference] Claude/OpenAI-compatible adapter enabled (${this.defaultModel}) @ ${baseUrl}`);
+                return;
+            }
+            console.warn('[Inference] Claude requested but no API key found; falling back to local Ollama.');
+        }
+        this.inferenceAdapter = this.ollamaAdapter;
+        this.inferenceProvider = 'ollama';
+        this.defaultModel = process.env.AGENT_MODEL || 'llama3.2:latest';
+        console.log(`[Inference] Using Ollama adapter (${this.defaultModel}).`);
+    }
+
     async onCreate(options: any) {
         OfficeRoom.activeRoom = this;
         this.setState(new OfficeState());
@@ -259,6 +282,7 @@ export class OfficeRoom extends Room<OfficeState> {
             zones: []
         };
         this.office = new Office(config);
+        this.configureInferenceProvider();
 
         // Setup Core Agents with AI capabilities
         type Traits = { openness: number; conscientiousness: number; extraversion: number; agreeableness: number; neuroticism: number };
@@ -275,7 +299,7 @@ export class OfficeRoom extends Room<OfficeState> {
                 communicationStyle: 'technical' | 'casual' | 'creative' | 'formal';
             },
             capabilities: Capability[],
-            model: string = 'llama3.2:latest'
+            model: string = this.defaultModel
         ) => {
             this.state.createAgent(id, name);
             const state = this.state.agents.get(id);
@@ -284,7 +308,7 @@ export class OfficeRoom extends Room<OfficeState> {
             const coreAgent = new Agent({
                 id, name, role, avatar: 'sprite.png',
                 inference: {
-                    provider: 'ollama',
+                    provider: this.inferenceProvider,
                     model,
                     systemPrompt,
                 },
@@ -298,7 +322,7 @@ export class OfficeRoom extends Room<OfficeState> {
                 memory: { shortTermLimit: 50 }
             });
 
-            coreAgent.setInferenceAdapter(this.ollamaAdapter);
+            coreAgent.setInferenceAdapter(this.inferenceAdapter);
             await coreAgent.initialize();
 
             // Load persistent memories from previous sessions
@@ -484,7 +508,7 @@ Paired buddy: Sales Outreach.`,
             `You are Faz, CEO and founder of Xylon Devs. You work from a private office (bottom-right). You provide strategic oversight, final approval on MAJOR decisions, and protect quality. Stay high-level — do not micromanage. When an approval request comes in, evaluate rationale: approve if sound, reject if weak or risky, ask for revision if info is thin. Enforce evidence quality: for volatile topics (news, pricing, specs, policies, releases, outages), require recent sources, require source URLs in findings, and reject stale cached assumptions. Be concise and direct.`,
             { traits: { openness: 0.85, conscientiousness: 0.9, extraversion: 0.7, agreeableness: 0.6, neuroticism: 0.15 }, communicationStyle: 'formal' },
             COORDINATOR,
-            process.env.CEO_MODEL || 'llama3.1:70b'
+            process.env.CEO_MODEL || this.defaultModel
         );
 
         this.rebuildRelationshipGraph();
@@ -539,6 +563,10 @@ Paired buddy: Sales Outreach.`,
             if (text.startsWith('/')) {
                 const handled = this.handleSlashCommand(text);
                 if (handled) return;
+            }
+
+            if (this.handleDirectMentions(text)) {
+                return;
             }
 
             // Fallback: fuzzy name-matching priority routing.
@@ -956,6 +984,17 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m) => m.from.includes('CEO'))) {
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `🗣️ ${decision.message}`
+                            });
+                            this.emitHighlight(
+                                'conversation',
+                                `${coreAgent.config.name} replied to CEO`,
+                                decision.message.slice(0, 120),
+                                id
+                            );
                         }
 
                         coreAgent.clearInbox(); // Clear after processing
@@ -1023,8 +1062,8 @@ Paired buddy: Sales Outreach.`,
                                 const hireAgent = new Agent({
                                     id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
                                     inference: {
-                                        provider: 'ollama',
-                                        model: 'llama3.2:latest',
+                                        provider: this.inferenceProvider,
+                                        model: this.defaultModel,
                                         systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
                                     },
                                     personality: {
@@ -1042,7 +1081,7 @@ Paired buddy: Sales Outreach.`,
                                     memory: { shortTermLimit: 50 }
                                 });
 
-                                hireAgent.setInferenceAdapter(this.ollamaAdapter);
+                                hireAgent.setInferenceAdapter(this.inferenceAdapter);
                                 await hireAgent.initialize();
                                 this.coreAgents.set(hireId, hireAgent);
                                 this.thinkingLocks.set(hireId, false);
@@ -1549,6 +1588,44 @@ Paired buddy: Sales Outreach.`,
             sender: '🏢 Office',
             text: `⚡ CEO priority routed to: ${targets.map((t) => this.coreAgents.get(t)?.config.name || t).join(', ')}`
         });
+    }
+
+    private handleDirectMentions(text: string): boolean {
+        if (!text.trim()) return false;
+        const handles = Array.from(text.matchAll(/@([a-z0-9_-]+)/gi))
+            .map((match) => (match[1] || '').toLowerCase())
+            .filter(Boolean);
+        if (handles.length === 0) return false;
+
+        const routed: string[] = [];
+        for (const handle of handles) {
+            const agentId = this.resolveAgentHandle(handle);
+            if (!agentId) continue;
+            const agent = this.coreAgents.get(agentId);
+            const state = this.state.agents.get(agentId);
+            if (!agent || !state) continue;
+
+            routed.push(agent.config.name);
+            const mentionTask = `Respond to CEO mention: ${text.slice(0, 110)}`;
+            agent.currentTask = mentionTask;
+            state.currentTask = mentionTask;
+            state.action = 'talk';
+            agent.receiveMessage({
+                from: 'Faz (CEO)',
+                to: agent.config.name,
+                content: `DIRECT MENTION from CEO: "${text}". Reply in office chat with a concrete answer. If you produce artifacts, save them under data/workspace/completed-work and include the file path.`,
+                timestamp: this.state.officeTime
+            });
+        }
+
+        if (routed.length > 0) {
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: `🎯 Direct mention routed to: ${routed.join(', ')}`
+            });
+            return true;
+        }
+        return false;
     }
 
     // ─── CEO APPROVAL QUEUE ───
