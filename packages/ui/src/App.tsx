@@ -7,7 +7,6 @@ import { DesktopComputerPanel } from './components/DesktopComputerPanel';
 import { CeoOperationsPanel } from './components/CeoOperationsPanel';
 import { SystemLog } from './components/SystemLog';
 import { ViralControlPanel } from './components/ViralControlPanel';
-import { HighlightsFeed } from './components/HighlightsFeed';
 import { LayoutEditor } from './components/LayoutEditor';
 import { AgentInspector } from './components/AgentInspector';
 import { TaskBoard } from './components/TaskBoard';
@@ -213,7 +212,6 @@ export function App() {
             {showAdvancedPanels && <EpisodeRecapPanel />}
             {showAdvancedPanels && <SystemLog />}
             {showAdvancedPanels && <ViralControlPanel />}
-            {showAdvancedPanels && <HighlightsFeed />}
             {showAdvancedPanels && <LayoutEditor />}
             {showAdvancedPanels && <AgentInspector agent={selectedAgent} onAction={handleAction} />}
         </>
