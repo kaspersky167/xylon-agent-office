@@ -12,7 +12,9 @@ export const UIEvents = {
     layoutSync: 'layout-sync',
     desktopFilesSync: 'desktop-files-sync',
     desktopFilePreview: 'desktop-file-preview',
-    desktopFileError: 'desktop-file-error'
+    desktopFileError: 'desktop-file-error',
+    mailSync: 'mail-sync',
+    mailError: 'mail-error'
 } as const;
 
 export function emitUIEvent(eventName: string, detail?: unknown) {

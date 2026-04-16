@@ -76,6 +76,25 @@ interface ChatAttachment {
     createdAt: string;
 }
 
+interface MailAttachment {
+    path: string;
+    name: string;
+    mimeType: string;
+    size: number;
+}
+
+interface MailMessage {
+    id: string;
+    threadId: string;
+    from: string;
+    to: string;
+    toAgentId?: string;
+    subject: string;
+    body: string;
+    attachments: MailAttachment[];
+    createdAt: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -117,6 +136,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
+    private mailMessages: MailMessage[] = [];
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -197,6 +217,28 @@ export class OfficeRoom extends Room<OfficeState> {
         return raw
             .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
             .filter((item): item is ChatAttachment => Boolean(item));
+    }
+
+    private normalizeMailAttachments(raw: any): MailAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((entry: any) => {
+                const filePath = String(entry?.path || '').trim();
+                if (!filePath) return null;
+                return {
+                    path: filePath,
+                    name: String(entry?.name || path.basename(filePath)),
+                    mimeType: String(entry?.mimeType || this.getMimeType(filePath)),
+                    size: Number.isFinite(Number(entry?.size)) ? Math.max(0, Math.floor(Number(entry.size))) : 0
+                } as MailAttachment;
+            })
+            .filter((item: MailAttachment | null): item is MailAttachment => Boolean(item));
+    }
+
+    private pushMail(message: MailMessage) {
+        this.mailMessages.push(message);
+        if (this.mailMessages.length > 250) this.mailMessages = this.mailMessages.slice(-250);
+        this.broadcast('mail-sync', { messages: this.mailMessages.slice(-150) });
     }
 
     // Furniture interaction points: named locations agents can walk to
@@ -877,6 +919,92 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('file-status-update', file);
         });
 
+        this.onMessage('mail-request-sync', (client) => {
+            client.send('mail-sync', { messages: this.mailMessages.slice(-150) });
+        });
+
+        this.onMessage('mail-send', async (client, message) => {
+            const toAgentId = String(message?.toAgentId || '').trim().toLowerCase();
+            const subject = String(message?.subject || '').trim() || 'No subject';
+            const body = String(message?.body || '').trim();
+            const attachments = this.normalizeMailAttachments(message?.attachments);
+            const targetAgent = this.coreAgents.get(toAgentId);
+
+            if (!targetAgent) {
+                client.send('mail-error', { message: `Unknown agent: ${toAgentId || '(empty)'}` });
+                return;
+            }
+            if (!body && attachments.length === 0) {
+                client.send('mail-error', { message: 'Add instructions or attachments before sending.' });
+                return;
+            }
+
+            const nowIso = this.state.officeTime || new Date().toISOString();
+            const threadId = `mail-${toAgentId}-${Date.now()}`;
+            const outbound: MailMessage = {
+                id: `${threadId}-user`,
+                threadId,
+                from: 'You',
+                to: targetAgent.config.name,
+                toAgentId,
+                subject,
+                body,
+                attachments,
+                createdAt: nowIso
+            };
+            this.pushMail(outbound);
+
+            const targetState = this.state.agents.get(toAgentId);
+            const attachmentList = attachments.length > 0
+                ? attachments.map((a) => a.path).join(', ')
+                : 'none';
+
+            targetAgent.receiveMessage({
+                from: 'Faz (CEO)',
+                to: targetAgent.config.name,
+                content: `EMAIL SUBJECT: ${subject}\nINSTRUCTIONS: ${body || '(none)'}\nATTACHMENTS: ${attachmentList}\nReply with clear next steps and ETA in office email.`,
+                timestamp: nowIso
+            });
+            targetAgent.currentTask = `Email follow-up: ${subject}`.slice(0, 120);
+            if (targetState) {
+                targetState.currentTask = targetAgent.currentTask;
+                targetState.action = 'talk';
+            }
+
+            this.broadcast('chat', {
+                sender: '📨 Office Mail',
+                text: `Sent "${subject}" to ${targetAgent.config.name}.`
+            });
+
+            const ackBody = [
+                `Received your email: "${subject}".`,
+                body ? `Planned action: ${body.slice(0, 140)}` : 'Planned action: reviewing provided context.',
+                attachments.length > 0
+                    ? `I will process these files: ${attachments.map((a) => a.name).join(', ')}.`
+                    : 'No attachments were included.',
+                'I will post progress updates and outcomes in chat + completed work if artifacts are produced.'
+            ].join(' ');
+
+            setTimeout(() => {
+                const reply: MailMessage = {
+                    id: `${threadId}-agent`,
+                    threadId,
+                    from: targetAgent.config.name,
+                    to: 'You',
+                    toAgentId,
+                    subject: `RE: ${subject}`,
+                    body: ackBody,
+                    attachments: [],
+                    createdAt: this.state.officeTime || new Date().toISOString()
+                };
+                this.pushMail(reply);
+                this.broadcast('chat', {
+                    sender: '📨 Office Mail',
+                    text: `${targetAgent.config.name} replied to "${subject}".`
+                });
+            }, 1800 + Math.floor(Math.random() * 1800));
+        });
+
         // Save office layout from editor
         this.onMessage('save-layout', async (client, message) => {
             const layoutName = message.name || 'default';
@@ -984,7 +1112,7 @@ Paired buddy: Sales Outreach.`,
                                 timestamp: this.state.officeTime,
                                 importance: 0.7
                             }, this.sessionId);
-                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m) => m.from.includes('CEO'))) {
+                        } else if (/\b(user|ceo|faz)\b/i.test(targetName) || coreAgent.getUnreadMessages().some((m: ConversationMessage) => m.from.includes('CEO'))) {
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
                                 text: `🗣️ ${decision.message}`

@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
+import { Button } from './ui/Button';
+import { Chip } from './ui/Chip';
+import { Panel } from './ui/Panel';
+import { SectionHeader } from './ui/SectionHeader';
+import { Toolbar } from './ui/Toolbar';
+import { controlRoomStyles, tokens } from '../theme/tokens';
 
 type ChatAttachment = {
     id: string;
@@ -177,106 +183,104 @@ export function ChatPanel() {
     };
 
     return (
-        <div style={{ position: 'absolute', right: 20, bottom: 20, width: 300, height: 400, backgroundColor: 'rgba(0,0,0,0.8)', color: 'white', padding: 16, borderRadius: 8, display: 'flex', flexDirection: 'column' }}>
-            <h3 style={{ margin: '0 0 10px 0' }}>Office Chat</h3>
-            <div style={{ flex: 1, overflowY: 'auto', fontSize: '14px', marginBottom: 10, paddingRight: 4 }}>
+        <Panel style={{ position: 'absolute', right: 20, bottom: 20, width: 320, height: 520, display: 'flex', flexDirection: 'column' }}>
+            <SectionHeader title="Office Chat" subtitle="Message agents + share workspace files" />
+            <div style={{ flex: 1, overflowY: 'auto', fontSize: tokens.typography.body, marginBottom: tokens.spacing.sm, paddingRight: 4, ...controlRoomStyles.scroll }}>
                 {messages.map((m, i) => (
                     <div key={i} style={{ margin: '6px 0' }}>
                         <p style={{ margin: 0, lineHeight: '1.4' }}>
-                            <strong style={{ color: m.sender === 'System' ? '#00eeff' : '#aaffaa' }}>{m.sender}:</strong> {m.text}
+                            <strong style={{ color: m.sender === 'System' ? '#7de9ff' : '#b9fbc0' }}>{m.sender}:</strong> {m.text}
                         </p>
                         {Array.isArray(m.attachments) && m.attachments.length > 0 && (
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+                            <Toolbar style={{ marginTop: 6 }}>
                                 {m.attachments.map((attachment) => (
-                                    <div key={attachment.id} style={{ border: '1px solid #4f6270', borderRadius: 6, padding: '6px 8px', background: '#1f2937', fontSize: 11, minWidth: 110 }}>
-                                        <div style={{ fontWeight: 700, color: '#d9f99d' }}>{attachment.name}</div>
-                                        <div style={{ color: '#9ca3af' }}>{attachment.mimeType} • {formatBytes(attachment.size)}</div>
+                                    <div key={attachment.id} style={{ ...controlRoomStyles.panelMuted, padding: '6px 8px', fontSize: tokens.typography.micro, minWidth: 110 }}>
+                                        <div style={{ fontWeight: 700, color: '#d8d0ff' }}>{attachment.name}</div>
+                                        <div style={{ color: tokens.color.textSecondary }}>{attachment.mimeType} • {formatBytes(attachment.size)}</div>
                                     </div>
                                 ))}
-                            </div>
+                            </Toolbar>
                         )}
                     </div>
                 ))}
                 <div ref={endRef} />
             </div>
-            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+
+            <Toolbar style={{ marginBottom: tokens.spacing.sm }}>
                 <select
                     value={selectedPath}
                     onChange={(e) => setSelectedPath(e.target.value)}
-                    style={{ flex: 1, background: '#333', color: 'white', border: '1px solid #444', borderRadius: 4, padding: '8px' }}
+                    style={{ ...controlRoomStyles.input, flex: 1 }}
                 >
                     <option value="">Attach workspace file...</option>
                     {workspaceFiles.map((file) => (
                         <option key={file.path} value={file.path}>{file.name} ({file.path})</option>
                     ))}
                 </select>
-                <button
-                    type="button"
-                    onClick={attachSelectedFile}
-                    style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '8px 10px', cursor: 'pointer' }}
-                >
-                    Attach
-                </button>
-            </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                <Button type="button" onClick={attachSelectedFile}>Attach</Button>
+            </Toolbar>
+
+            <Toolbar style={{ marginBottom: tokens.spacing.sm }}>
                 {mentionHandles.slice(0, 6).map((handle) => (
-                    <button
-                        key={handle}
-                        type="button"
-                        onClick={() => insertMention(handle)}
-                        style={{ border: '1px solid #43506b', background: '#0f172a', color: '#c7d2fe', borderRadius: 999, padding: '3px 8px', fontSize: 10, cursor: 'pointer' }}
-                    >
-                        @{handle}
-                    </button>
+                    <Chip key={handle} tone="accent" onClick={() => insertMention(handle)}>@{handle}</Chip>
                 ))}
-            </div>
+            </Toolbar>
+
             {selectedAttachments.length > 0 && (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                <Toolbar style={{ marginBottom: tokens.spacing.sm }}>
                     {selectedAttachments.map((attachment) => (
-                        <button
-                            key={attachment.id}
-                            type="button"
-                            onClick={() => removeSelectedAttachment(attachment.id)}
-                            style={{ border: '1px solid #566', background: '#202938', color: '#dbeafe', borderRadius: 999, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}
-                        >
+                        <Chip key={attachment.id} tone="default" onClick={() => removeSelectedAttachment(attachment.id)}>
                             {attachment.name} ×
-                        </button>
+                        </Chip>
                     ))}
-                </div>
+                </Toolbar>
             )}
-            <div style={{ border: '1px solid #2f3c4a', borderRadius: 6, padding: 8, marginBottom: 8, background: '#111827' }}>
-                <div style={{ fontSize: 11, marginBottom: 6, color: '#d1d5db' }}>Save/upload workspace file</div>
+
+            <Panel tone="muted" style={{ marginBottom: tokens.spacing.sm, padding: tokens.spacing.sm }}>
+                <div style={{ fontSize: tokens.typography.caption, marginBottom: 6, color: tokens.color.textSecondary }}>Save/upload workspace file</div>
                 <input
                     type="text"
                     placeholder="notes/todo.md"
                     value={newFilePath}
                     onChange={(e) => setNewFilePath(e.target.value)}
-                    style={{ width: '100%', marginBottom: 6, padding: '6px 8px', boxSizing: 'border-box', background: '#1f2937', color: 'white', border: '1px solid #374151', borderRadius: 4 }}
+                    style={{ ...controlRoomStyles.input, marginBottom: 6 }}
                 />
                 <textarea
                     placeholder="File content"
                     value={newFileContent}
                     onChange={(e) => setNewFileContent(e.target.value)}
                     rows={3}
-                    style={{ width: '100%', marginBottom: 6, padding: '6px 8px', boxSizing: 'border-box', background: '#1f2937', color: 'white', border: '1px solid #374151', borderRadius: 4, resize: 'vertical' }}
+                    style={{ ...controlRoomStyles.input, marginBottom: 6, resize: 'vertical' }}
                 />
-                <div style={{ display: 'flex', gap: 6, marginBottom: 4 }}>
-                    <button type="button" onClick={saveWorkspaceFile} style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '6px 8px', cursor: 'pointer' }}>Save File</button>
-                    <label style={{ border: '1px solid #555', background: '#1f2937', color: '#fff', borderRadius: 4, padding: '6px 8px', cursor: 'pointer' }}>
-                        Upload File
+                <Toolbar style={{ marginBottom: 4 }}>
+                    <Button type="button" onClick={saveWorkspaceFile}>Save File</Button>
+                    <label style={{ cursor: 'pointer' }}>
+                        <span style={{
+                            borderRadius: tokens.radius.sm,
+                            border: `1px solid ${tokens.color.border}`,
+                            background: 'rgba(18,25,52,0.95)',
+                            color: tokens.color.textPrimary,
+                            padding: '6px 10px',
+                            fontSize: tokens.typography.caption,
+                            fontWeight: 600,
+                            display: 'inline-block'
+                        }}>
+                            Upload File
+                        </span>
                         <input type="file" onChange={uploadWorkspaceFile} style={{ display: 'none' }} />
                     </label>
-                </div>
-                {fileActionStatus && <div style={{ fontSize: 10, color: '#93c5fd' }}>{fileActionStatus}</div>}
-            </div>
+                </Toolbar>
+                {fileActionStatus && <div style={{ fontSize: tokens.typography.micro, color: '#9ac5ff' }}>{fileActionStatus}</div>}
+            </Panel>
+
             <input
                 type="text"
                 placeholder="Send a message... (tip: use @frontend, @devops, @shepherd)"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && send()}
-                style={{ width: '100%', padding: '10px', boxSizing: 'border-box', background: '#333', color: 'white', border: '1px solid #444', borderRadius: 4, outline: 'none' }}
+                style={controlRoomStyles.input}
             />
-        </div>
+        </Panel>
     );
 }
