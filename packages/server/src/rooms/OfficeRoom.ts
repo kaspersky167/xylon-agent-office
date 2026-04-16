@@ -42,6 +42,28 @@ interface CompletedTaskRecord {
   summaryPath: string;
 }
 
+interface TaskRecord {
+    id: string;
+    title: string;
+    assigned_to?: string | null;
+    status: TaskStatus;
+    priority: TaskPriority;
+    requires_approval: number;
+    created_by: string;
+    created_at: string;
+    updated_at: string;
+    status_reason?: string | null;
+    completed_at?: string | null;
+}
+
+const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+    backlog: ['in_progress'],
+    in_progress: ['blocked', 'review'],
+    blocked: ['in_progress'],
+    review: ['done', 'in_progress'],
+    done: []
+};
+
 interface ApprovalRequest {
   id: string;
   requestedBy: string; // agent id
@@ -84,6 +106,11 @@ interface ChatAttachment {
   sharedWith: string[];
   createdAt: string;
 }
+
+type ZoneId = 'main' | 'ceo_office';
+type ZoneBounds = { minX: number; maxX: number; minY: number; maxY: number };
+type LayoutItem = { id: string; type: string; x: number; y: number; label?: string; zoneId: ZoneId };
+type FurnitureTarget = { x: number; y: number; type: string };
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([

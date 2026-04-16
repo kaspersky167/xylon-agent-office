@@ -33,6 +33,9 @@ export interface SharedFileRecord {
   approvalRequestId?: string | null;
 }
 
+export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+export type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
   let dot = 0,
@@ -80,11 +83,16 @@ export class MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance DESC);
 
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 assigned_to TEXT,
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'backlog',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                requires_approval INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL DEFAULT 'system',
+                status_reason TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
                 completed_at TEXT
             );
 
