@@ -12,7 +12,7 @@ const CHAOS_EVENTS = [
     { id: 'viral_tweet', label: 'Viral Tweet' },
 ] as const;
 
-export function ViralControlPanel() {
+export function ViralControlPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [scenario, setScenario] = useState<string>(SCENARIOS[0]);
     const [cinematicMode, setCinematicMode] = useState(true);
     const [lastEvent, setLastEvent] = useState('Idle');
@@ -77,6 +77,7 @@ export function ViralControlPanel() {
             defaultDock="right"
             defaultY={20}
             zIndex={18}
+            mode={mode}
         >
             <div style={{ fontSize: 11, color: '#babedc', marginTop: 8, marginBottom: 10 }}>
                 Last event: <strong style={{ color: '#ffd6a5' }}>{lastEvent}</strong>
