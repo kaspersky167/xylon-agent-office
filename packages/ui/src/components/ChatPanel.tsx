@@ -37,7 +37,7 @@ const formatBytes = (bytes: number) => {
 
 const mentionHandles = ['frontend', 'backend', 'devops', 'security', 'shepherd', 'reality', 'evidence', 'seo', 'sales', 'proposal', 'ceo'];
 
-export function ChatPanel() {
+export function ChatPanel({ mode = 'floating' }: { mode?: 'floating' | 'docked' }) {
     const [messages, setMessages] = useState<ChatMessage[]>([
         { sender: 'System', text: 'Office environment initialized.' }
     ]);
@@ -177,7 +177,7 @@ export function ChatPanel() {
     };
 
     return (
-        <div style={{ position: 'absolute', right: 20, bottom: 20, width: 300, height: 400, backgroundColor: 'rgba(0,0,0,0.8)', color: 'white', padding: 16, borderRadius: 8, display: 'flex', flexDirection: 'column' }}>
+        <div style={{ position: mode === 'floating' ? 'absolute' : 'relative', right: mode === 'floating' ? 20 : undefined, bottom: mode === 'floating' ? 20 : undefined, width: '100%', height: 400, backgroundColor: 'rgba(0,0,0,0.8)', color: 'white', padding: 16, borderRadius: 8, display: 'flex', flexDirection: 'column' }}>
             <h3 style={{ margin: '0 0 10px 0' }}>Office Chat</h3>
             <div style={{ flex: 1, overflowY: 'auto', fontSize: '14px', marginBottom: 10, paddingRight: 4 }}>
                 {messages.map((m, i) => (
