@@ -2,6 +2,10 @@ import Phaser from 'phaser';
 import * as Colyseus from 'colyseus.js';
 import { OfficeState, AgentState } from './schema';
 import { UIEvents, emitUIEvent, eventBus } from '../events';
+import { COLORS, GRID_SIZE_PX } from './theme';
+import { drawOfficeBase, drawSubtleGrid, drawZoneFrames } from './render/zones';
+import { drawFurniture } from './render/furniture';
+import { AGENT_EMOTE_MAP, getAgentStyle } from './render/agents';
 
 let activeRoom: Colyseus.Room<OfficeState> | undefined;
 
