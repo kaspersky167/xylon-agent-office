@@ -1,6 +1,7 @@
 import sqlite3 from 'sqlite3';
 import { open, Database } from 'sqlite';
 import { MemoryEntry } from '@agent-office/core';
+import { randomUUID } from 'crypto';
 
 export type SharedFileStatus = 'draft' | 'shared' | 'needs_review' | 'approved' | 'rejected';
 
@@ -17,6 +18,9 @@ export interface SharedFileRecord {
     updatedAt?: string;
     approvalRequestId?: string | null;
 }
+
+export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+export type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
 
 function cosineSimilarity(a: number[], b: number[]): number {
     if (a.length !== b.length) return 0;
@@ -61,11 +65,16 @@ export class MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance DESC);
 
             CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 assigned_to TEXT,
-                status TEXT DEFAULT 'pending',
+                status TEXT DEFAULT 'backlog',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                requires_approval INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL DEFAULT 'system',
+                status_reason TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
                 completed_at TEXT
             );
 
@@ -132,6 +141,17 @@ export class MemoryStore {
         try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN size_bytes INTEGER DEFAULT 0'); } catch {}
         try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN shared_with TEXT'); } catch {}
         try { await this.db.exec('ALTER TABLE shared_files ADD COLUMN created_at TEXT DEFAULT (datetime(\'now\'))'); } catch {}
+        try { await this.db.exec('ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT \'medium\''); } catch {}
+        try { await this.db.exec('ALTER TABLE tasks ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0'); } catch {}
+        try { await this.db.exec('ALTER TABLE tasks ADD COLUMN created_by TEXT NOT NULL DEFAULT \'system\''); } catch {}
+        try { await this.db.exec('ALTER TABLE tasks ADD COLUMN status_reason TEXT'); } catch {}
+        try { await this.db.exec('ALTER TABLE tasks ADD COLUMN updated_at TEXT DEFAULT (datetime(\'now\'))'); } catch {}
+        await this.db.run(
+            "UPDATE tasks SET status = 'backlog' WHERE status IS NULL OR status = '' OR status = 'pending'"
+        );
+        await this.db.run(
+            "UPDATE tasks SET status = 'done', completed_at = COALESCE(completed_at, datetime('now')) WHERE status = 'completed'"
+        );
 
         console.log('[MemoryStore] SQLite initialized at', dbPath);
     }
@@ -207,13 +227,38 @@ export class MemoryStore {
         }));
     }
 
-    async createTask(title: string, assignedTo?: string): Promise<number> {
-        if (!this.db) return -1;
+    async createTask(input: {
+        title: string;
+        assignedTo?: string;
+        createdBy?: string;
+        priority?: TaskPriority;
+        requiresApproval?: boolean;
+        status?: TaskStatus;
+        statusReason?: string | null;
+    }): Promise<string> {
+        if (!this.db) return '-1';
+        const id = randomUUID();
+        const status = input.status || (input.assignedTo ? 'in_progress' : 'backlog');
+        const nowIso = new Date().toISOString();
         const result = await this.db.run(
-            'INSERT INTO tasks (title, assigned_to) VALUES (?, ?)',
-            [title, assignedTo || null]
+            `INSERT INTO tasks
+             (id, title, assigned_to, status, priority, requires_approval, created_by, status_reason, created_at, updated_at, completed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                id,
+                input.title,
+                input.assignedTo || null,
+                status,
+                input.priority || 'medium',
+                input.requiresApproval ? 1 : 0,
+                input.createdBy || 'system',
+                input.statusReason || null,
+                nowIso,
+                nowIso,
+                status === 'done' ? nowIso : null
+            ]
         );
-        return result.lastID || -1;
+        return result.changes ? id : '-1';
     }
 
     async getTasks(): Promise<any[]> {
@@ -221,14 +266,26 @@ export class MemoryStore {
         return this.db.all('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50');
     }
 
-    async assignTask(taskId: number, agentId: string): Promise<void> {
+    async assignTask(taskId: string, agentId: string): Promise<void> {
         if (!this.db) return;
-        await this.db.run('UPDATE tasks SET assigned_to = ?, status = ? WHERE id = ?', [agentId, 'in_progress', taskId]);
+        await this.db.run(
+            'UPDATE tasks SET assigned_to = ?, status = ?, status_reason = ?, updated_at = ? WHERE id = ?',
+            [agentId, 'in_progress', null, new Date().toISOString(), taskId]
+        );
     }
 
-    async completeTask(taskId: number): Promise<void> {
+    async updateTaskStatus(taskId: string, status: TaskStatus, statusReason?: string | null): Promise<void> {
         if (!this.db) return;
-        await this.db.run("UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?", [taskId]);
+        const nowIso = new Date().toISOString();
+        await this.db.run(
+            'UPDATE tasks SET status = ?, status_reason = ?, updated_at = ?, completed_at = ? WHERE id = ?',
+            [status, statusReason || null, nowIso, status === 'done' ? nowIso : null, taskId]
+        );
+    }
+
+    async getTask(taskId: string): Promise<any | null> {
+        if (!this.db) return null;
+        return this.db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
     }
 
     async saveLayout(name: string, layoutJson: string): Promise<void> {

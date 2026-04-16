@@ -7,7 +7,6 @@ import { DesktopComputerPanel } from './components/DesktopComputerPanel';
 import { CeoOperationsPanel } from './components/CeoOperationsPanel';
 import { SystemLog } from './components/SystemLog';
 import { ViralControlPanel } from './components/ViralControlPanel';
-import { HighlightsFeed } from './components/HighlightsFeed';
 import { LayoutEditor } from './components/LayoutEditor';
 import { AgentInspector } from './components/AgentInspector';
 import { eventBus } from './events';
@@ -38,10 +37,10 @@ export function App() {
                 <p style={{ margin: '4px 0 0', opacity: 0.6, fontSize: '11px' }}>CEO Operations Mode · unified command center</p>
                 <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
                     <button
-                        onClick={() => setShowAdvancedPanels((prev) => !prev)}
-                        style={{ borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: showAdvancedPanels ? 'rgba(168,85,247,0.35)' : 'rgba(16,185,129,0.35)', color: '#fff', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}
+                        onClick={() => actions.togglePanel('advanced')}
+                        style={{ borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: panelVisibility.advanced ? 'rgba(168,85,247,0.35)' : 'rgba(16,185,129,0.35)', color: '#fff', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}
                     >
-                        {showAdvancedPanels ? 'Hide Advanced Panels' : 'Show Advanced Panels'}
+                        {panelVisibility.advanced ? 'Hide Advanced Panels' : 'Show Advanced Panels'}
                     </button>
                 </div>
                 <div style={{ display: 'flex', gap: 6, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -60,24 +59,32 @@ export function App() {
                     </button>
                 </div>
                 <button
-                    onClick={() => setDesktopPanelOpen((open) => !open)}
+                    onClick={() => actions.togglePanel('desktop')}
                     style={{ marginTop: 10, borderRadius: 7, border: '1px solid rgba(255,255,255,0.25)', background: 'rgba(120, 165, 255, 0.24)', color: '#fff', padding: '6px 10px', fontSize: 12, cursor: 'pointer' }}
                 >
-                    {desktopPanelOpen ? 'Close Desk Computer' : 'Desk Computer'}
+                    {panelVisibility.desktop ? 'Close Desk Computer' : 'Desk Computer'}
                 </button>
             </div>
-            <ChatPanel />
-            <CeoOperationsPanel />
-            <DesktopComputerPanel isOpen={desktopPanelOpen} onClose={() => setDesktopPanelOpen(false)} />
+            {panelVisibility.chat && <ChatPanel />}
+            {panelVisibility.operations && <CeoOperationsPanel />}
+            <DesktopComputerPanel isOpen={panelVisibility.desktop} onClose={() => actions.setPanelVisibility('desktop', false)} />
 
-            {showAdvancedPanels && <AgentPulseBoard />}
-            {showAdvancedPanels && <RelationshipGraph />}
-            {showAdvancedPanels && <EpisodeRecapPanel />}
-            {showAdvancedPanels && <SystemLog />}
-            {showAdvancedPanels && <ViralControlPanel />}
-            {showAdvancedPanels && <HighlightsFeed />}
-            {showAdvancedPanels && <LayoutEditor />}
-            {showAdvancedPanels && <AgentInspector agent={{ name: 'Alice', role: 'Engineer', status: 'Idle', currentTask: 'Write Scaffold' }} />}
+            {panelVisibility.advanced && panelVisibility.agentPulse && <AgentPulseBoard />}
+            {panelVisibility.advanced && panelVisibility.relationship && <RelationshipGraph />}
+            {panelVisibility.advanced && panelVisibility.recap && <EpisodeRecapPanel />}
+            {panelVisibility.advanced && panelVisibility.systemLog && <SystemLog />}
+            {panelVisibility.advanced && panelVisibility.viral && <ViralControlPanel />}
+            {panelVisibility.advanced && panelVisibility.highlights && <HighlightsFeed />}
+            {panelVisibility.advanced && panelVisibility.layoutEditor && <LayoutEditor />}
+            {panelVisibility.advanced && panelVisibility.inspector && <AgentInspector />}
         </>
+    );
+}
+
+export function App() {
+    return (
+        <UIStoreProvider>
+            <AppContent />
+        </UIStoreProvider>
     );
 }

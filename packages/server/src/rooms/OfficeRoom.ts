@@ -3,9 +3,10 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus, TaskPriority, TaskStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { ExtensionRegistry } from '../extensions/registry';
 
 interface HighlightEvent {
     type: string;
@@ -32,6 +33,28 @@ interface CompletedTaskRecord {
     completedAt: string;
     summaryPath: string;
 }
+
+interface TaskRecord {
+    id: string;
+    title: string;
+    assigned_to?: string | null;
+    status: TaskStatus;
+    priority: TaskPriority;
+    requires_approval: number;
+    created_by: string;
+    created_at: string;
+    updated_at: string;
+    status_reason?: string | null;
+    completed_at?: string | null;
+}
+
+const TASK_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+    backlog: ['in_progress'],
+    in_progress: ['blocked', 'review'],
+    blocked: ['in_progress'],
+    review: ['done', 'in_progress'],
+    done: []
+};
 
 interface ApprovalRequest {
     id: string;
@@ -94,6 +117,7 @@ const MAJOR_TOOLS = new Set<string>([
 
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
+    private static extensionRegistry: ExtensionRegistry = new ExtensionRegistry([]);
 
     maxClients = 100;
     private office!: Office;
@@ -102,13 +126,14 @@ export class OfficeRoom extends Room<OfficeState> {
     private thinkingLocks: Map<string, boolean> = new Map();
     private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
     private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
-    private inferenceProvider = 'ollama';
+    private inferenceProvider: 'ollama' | 'openai' | 'gaia' | 'anthropic' | 'custom' = 'ollama';
     private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
     private hireCount = 0; // Counter for generating unique IDs
     private toolExecutor = new ToolExecutor();
     private memoryStore = new MemoryStore();
     private sessionId = `session_${Date.now()}`;
     private currentScenario = 'Free Play';
+    private officeTemplate: OfficeTemplate = getOfficeTemplate('default');
     private highlights: HighlightEvent[] = [];
     private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
     private relationships: Map<string, RelationshipEdge> = new Map();
@@ -122,6 +147,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
+    private extensionRegistry = OfficeRoom.extensionRegistry;
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -315,7 +341,7 @@ export class OfficeRoom extends Room<OfficeState> {
             const apiKey = process.env.CLAUDE_API_KEY || process.env.OPENAI_API_KEY || process.env.OPENROUTER_API_KEY || '';
             if (apiKey) {
                 this.inferenceAdapter = new OpenAICompatibleAdapter(baseUrl, apiKey, 'claude');
-                this.inferenceProvider = 'claude';
+                this.inferenceProvider = 'openai';
                 this.defaultModel = process.env.CLAUDE_MODEL || this.defaultModel;
                 console.log(`[Inference] Claude/OpenAI-compatible adapter enabled (${this.defaultModel}) @ ${baseUrl}`);
                 return;
@@ -336,12 +362,16 @@ export class OfficeRoom extends Room<OfficeState> {
         const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
         await this.memoryStore.initialize(dbPath);
 
+        const requestedTemplateId = String(options?.template || options?.templateId || '').trim();
+        this.officeTemplate = getOfficeTemplate(requestedTemplateId || 'default');
+        this.furnitureTargets = { ...this.officeTemplate.layout.furnitureTargets };
+
         const config: OfficeConfig = {
-            name: options.name || 'Startup HQ',
-            grid: { width: 40, height: 40, tileSize: 16 },
+            name: options.name || this.officeTemplate.organization.name || 'Startup HQ',
+            grid: this.officeTemplate.layout.grid,
             rooms: [],
             furniture: [],
-            spawnPoints: [{ x: 10, y: 10 }],
+            spawnPoints: this.officeTemplate.layout.spawnPoints,
             zones: []
         };
         this.office = new Office(config);
@@ -366,6 +396,7 @@ export class OfficeRoom extends Room<OfficeState> {
             model: string = this.defaultModel
         ) => {
             this.state.createAgent(id, name);
+            this.broadcastRoster();
             const state = this.state.agents.get(id);
             if (state) {
                 state.x = x;
@@ -375,7 +406,10 @@ export class OfficeRoom extends Room<OfficeState> {
             }
 
             const coreAgent = new Agent({
-                id, name, role, avatar: 'sprite.png',
+                id,
+                name,
+                role,
+                avatar: 'sprite.png',
                 inference: {
                     provider: this.inferenceProvider,
                     model,
@@ -394,7 +428,6 @@ export class OfficeRoom extends Room<OfficeState> {
             coreAgent.setInferenceAdapter(this.inferenceAdapter);
             await coreAgent.initialize();
 
-            // Load persistent memories from previous sessions
             const previousMemories = await this.memoryStore.loadMemories(id, 20);
             const agencyMemories = await this.memoryStore.loadMemories('agency:global', 20);
             const mergedMemories = [...previousMemories, ...agencyMemories].slice(-50);
@@ -669,37 +702,98 @@ Paired buddy: Sales Outreach.`,
         });
 
         // UI-driven task assignment
-        this.onMessage('assign-task', (client, message) => {
+        this.onMessage('assign-task', async (client, message) => {
             const { title, agentId } = message;
             console.log(`[TaskBoard] Assigning "${title}" to ${agentId || 'auto'}`);
 
             // Pick agent: explicit or auto-assign to least busy
-            const targetId = agentId || this.autoAssignAgent();
+            const targetId = agentId && this.state.agents.has(agentId) ? agentId : this.autoAssignAgent();
             const agent = this.coreAgents.get(targetId);
             const agentState = this.state.agents.get(targetId);
+            const cleanedTitle = String(title || '').trim();
 
-            if (agent && agentState) {
-                agent.currentTask = title;
-                agentState.currentTask = title;
+            if (agent && agentState && cleanedTitle) {
+                agent.currentTask = cleanedTitle;
+                agentState.currentTask = cleanedTitle;
                 agentState.action = 'work';
 
                 // Persist task
-                this.memoryStore.createTask(title, targetId);
+                const priority = this.resolvePriority(message?.priority);
+                const requiresApproval = Boolean(message?.requiresApproval);
+                const createdBy = String(message?.createdBy || client.sessionId || 'ceo');
+                const taskId = await this.memoryStore.createTask({
+                    title: cleanedTitle,
+                    assignedTo: targetId,
+                    createdBy,
+                    priority,
+                    requiresApproval,
+                    status: 'in_progress'
+                });
 
                 this.broadcast('chat', {
                     sender: 'System',
-                    text: `📋 Task "${title}" assigned to ${agentState.name}`
+                    text: `📋 Task "${cleanedTitle}" assigned to ${agentState.name}`
                 });
 
                 this.broadcast('task-update', {
+                    id: taskId,
                     agentId: targetId,
                     agentName: agentState.name,
-                    task: title,
+                    task: cleanedTitle,
                     status: 'in_progress',
+                    priority,
+                    requiresApproval,
                     fastTrackMode: this.fastTrackMode
                 });
                 this.seedTaskProgress(targetId, title);
+                this.extensionRegistry.onTaskCreated({
+                    title,
+                    assigneeId: targetId,
+                    assigneeName: agentState.name,
+                    createdById: 'system-ui',
+                    createdByName: 'System',
+                    source: 'ui',
+                }).catch((error) => console.error('[Extensions] onTaskCreated failed', error));
             }
+        });
+
+        this.onMessage('task-transition', async (client, message) => {
+            const taskId = String(message?.id || '').trim();
+            const nextStatus = String(message?.status || '').trim().toLowerCase() as TaskStatus;
+            const reason = String(message?.statusReason || '').trim();
+            const validStatuses: TaskStatus[] = ['backlog', 'in_progress', 'blocked', 'review', 'done'];
+            if (!taskId || !validStatuses.includes(nextStatus)) {
+                return;
+            }
+
+            const task = await this.memoryStore.getTask(taskId) as TaskRecord | null;
+            if (!task) {
+                client.send('task-transition-error', { id: taskId, error: 'task not found' });
+                return;
+            }
+            const currentStatus = String(task.status || 'backlog') as TaskStatus;
+            if (!this.canTransitionTask(currentStatus, nextStatus)) {
+                client.send('task-transition-error', {
+                    id: taskId,
+                    error: `invalid transition ${currentStatus} -> ${nextStatus}`
+                });
+                return;
+            }
+
+            await this.memoryStore.updateTaskStatus(taskId, nextStatus, reason || null);
+            const agentState = task.assigned_to ? this.state.agents.get(task.assigned_to) : null;
+            this.broadcast('task-update', {
+                id: taskId,
+                agentId: task.assigned_to || '',
+                agentName: agentState?.name || task.assigned_to || 'Unassigned',
+                task: task.title,
+                status: nextStatus,
+                statusReason: reason || null,
+                priority: task.priority,
+                requiresApproval: Boolean(task.requires_approval),
+                progress: nextStatus === 'done' ? 1 : undefined,
+                fastTrackMode: this.fastTrackMode
+            });
         });
 
         this.onMessage('set-fast-track', (_client, message) => {
@@ -1100,13 +1194,19 @@ Paired buddy: Sales Outreach.`,
                             if (targetAgent && targetState) {
                                 targetAgent.currentTask = title;
                                 targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
+                                const taskId = await this.memoryStore.createTask({
+                                    title,
+                                    assignedTo: targetId,
+                                    createdBy: id,
+                                    status: 'in_progress'
+                                });
 
                                 this.broadcast('chat', {
                                     sender: coreAgent.config.name,
                                     text: `📋 Created task "${title}" for ${targetAgent.config.name}`
                                 });
                                 this.broadcast('task-update', {
+                                    id: taskId,
                                     agentId: targetId,
                                     agentName: targetAgent.config.name,
                                     task: title,
@@ -1114,6 +1214,14 @@ Paired buddy: Sales Outreach.`,
                                     fastTrackMode: this.fastTrackMode
                                 });
                                 this.seedTaskProgress(targetId, title);
+                                await this.extensionRegistry.onTaskCreated({
+                                    title,
+                                    assigneeId: targetId,
+                                    assigneeName: targetAgent.config.name,
+                                    createdById: id,
+                                    createdByName: coreAgent.config.name,
+                                    source: 'tool',
+                                });
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1144,6 +1252,7 @@ Paired buddy: Sales Outreach.`,
                                 const spawnY = 2;
 
                                 this.state.createAgent(hireId, hireName);
+                                this.broadcastRoster();
                                 const hireState = this.state.agents.get(hireId);
                                 if (hireState) {
                                     hireState.x = spawnX;
@@ -1206,57 +1315,67 @@ Paired buddy: Sales Outreach.`,
                                     text: `⚠️ ${coreAgent.config.name} tried to hire but the office is full! (Max 7 agents)`
                                 });
                             }
-                        } else if (id !== 'ceo' && this.isMajorToolCall(decision.toolCall.name, decision.toolCall.params)) {
-                            // ─── MAJOR ACTION → CEO APPROVAL GATE ───
-                            this.createApproval({
-                                requestedBy: id,
-                                requestedByName: coreAgent.config.name,
-                                requestedAction: `${decision.toolCall.name}`,
-                                rationale: decision.thought || 'No rationale provided — please supply more context.',
-                                isMajor: true,
-                                pending: { toolName: decision.toolCall.name, params: decision.toolCall.params },
-                            });
                         } else {
-                            const result = await this.toolExecutor.execute(
-                                decision.toolCall.name,
-                                decision.toolCall.params
-                            );
-
-                            this.broadcast('chat', {
-                                sender: coreAgent.config.name,
-                                text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                            const beforeToolCall = await this.extensionRegistry.beforeToolCall({
+                                agentId: id,
+                                agentName: coreAgent.config.name,
+                                toolName: decision.toolCall.name,
+                                params: decision.toolCall.params,
+                                thought: decision.thought,
+                                requestApproval: (input) => this.createApproval(input),
+                                isMajorToolCall: (name, params) => this.isMajorToolCall(name, params),
                             });
-                            this.emitHighlight(
-                                'tool',
-                                `${coreAgent.config.name} used ${decision.toolCall.name}`,
-                                (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
-                                id
-                            );
-
-                            coreAgent.addMemory({
-                                content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            });
-                            await this.memoryStore.saveMemory('agency:global', {
-                                content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
-                                type: 'task_result',
-                                timestamp: this.state.officeTime,
-                                importance: 0.8
-                            }, this.sessionId);
-
-                            if (
-                                decision.toolCall.name === 'write_file' &&
-                                String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
-                            ) {
-                                await this.queueFileReviewApproval({
-                                    sharedByAgentId: id,
-                                    sharedByAgentName: coreAgent.config.name,
-                                    filePath: String(decision.toolCall.params?.path || ''),
-                                    summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
-                                    fileId: decision.toolCall.params?.fileId,
+                            if (!beforeToolCall.handled) {
+                                const result = await this.toolExecutor.execute(
+                                    decision.toolCall.name,
+                                    decision.toolCall.params
+                                );
+                                await this.extensionRegistry.afterToolCall({
+                                    agentId: id,
+                                    agentName: coreAgent.config.name,
+                                    toolName: decision.toolCall.name,
+                                    params: decision.toolCall.params,
+                                    success: result.success,
+                                    output: result.output,
+                                    error: result.error,
                                 });
+
+                                this.broadcast('chat', {
+                                    sender: coreAgent.config.name,
+                                    text: `🔧 Used tool [${decision.toolCall.name}]: ${result.success ? result.output.slice(0, 100) : result.error}`
+                                });
+                                this.emitHighlight(
+                                    'tool',
+                                    `${coreAgent.config.name} used ${decision.toolCall.name}`,
+                                    (result.success ? result.output : result.error || 'Tool failed').slice(0, 120),
+                                    id
+                                );
+
+                                coreAgent.addMemory({
+                                    content: `Tool ${decision.toolCall.name} result: ${result.output.slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                });
+                                await this.memoryStore.saveMemory('agency:global', {
+                                    content: `${coreAgent.config.name} used ${decision.toolCall.name}: ${(result.success ? result.output : result.error || 'failed').slice(0, 200)}`,
+                                    type: 'task_result',
+                                    timestamp: this.state.officeTime,
+                                    importance: 0.8
+                                }, this.sessionId);
+
+                                if (
+                                    decision.toolCall.name === 'write_file' &&
+                                    String(decision.toolCall.params?.status || '').toLowerCase() === 'needs_review'
+                                ) {
+                                    await this.queueFileReviewApproval({
+                                        sharedByAgentId: id,
+                                        sharedByAgentName: coreAgent.config.name,
+                                        filePath: String(decision.toolCall.params?.path || ''),
+                                        summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
+                                        fileId: decision.toolCall.params?.fileId,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1452,13 +1571,19 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95
             });
-            this.memoryStore.createTask(task, agentId).catch(() => {});
+            this.memoryStore.createTask({
+                title: task,
+                assignedTo: agentId,
+                createdBy: 'ceo',
+                priority: 'high',
+                status: 'in_progress'
+            }).catch(() => {});
             this.broadcast('chat', {
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
             });
             this.broadcast('task-update', {
-                agentId, agentName: agent.config.name, task, status: 'in_progress'
+                agentId, agentName: agent.config.name, task, status: 'in_progress', priority: 'high'
             });
             this.seedTaskProgress(agentId, task);
             return true;
@@ -1492,6 +1617,29 @@ Paired buddy: Sales Outreach.`,
         return `${agentId}:${taskTitle}`;
     }
 
+    private getLiveRoster() {
+        return Array.from(this.state.agents.entries()).map(([id, agent]) => ({
+            id,
+            name: agent.name
+        }));
+    }
+
+    private broadcastRoster() {
+        this.broadcast('agent-roster-sync', this.getLiveRoster());
+    }
+
+    private resolvePriority(value: unknown): TaskPriority {
+        const normalized = String(value || '').toLowerCase();
+        if (normalized === 'low' || normalized === 'medium' || normalized === 'high' || normalized === 'critical') {
+            return normalized;
+        }
+        return 'medium';
+    }
+
+    private canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {
+        return TASK_TRANSITIONS[from]?.includes(to) ?? false;
+    }
+
     private seedTaskProgress(agentId: string, taskTitle: string) {
         if (!taskTitle) return;
         this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
@@ -1522,7 +1670,7 @@ Paired buddy: Sales Outreach.`,
             agentId,
             agentName: agent.config.name,
             task: taskTitle,
-            status: next >= 1 ? 'completed' : 'in_progress',
+            status: next >= 1 ? 'done' : 'in_progress',
             progress: next,
             fastTrackMode: this.fastTrackMode
         });
@@ -1535,8 +1683,8 @@ Paired buddy: Sales Outreach.`,
 
         try {
             const tasks = await this.memoryStore.getTasks();
-            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
-            if (match?.id) await this.memoryStore.completeTask(match.id);
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'done');
+            if (match?.id) await this.memoryStore.updateTaskStatus(String(match.id), 'done');
         } catch {
             // Best-effort persistence only; task completion is still reflected in broadcast updates.
         }
@@ -1756,6 +1904,16 @@ Paired buddy: Sales Outreach.`,
         });
         this.broadcast('approvals-sync', this.listApprovals());
         this.emitHighlight('approval', `Approval requested: ${req.requestedAction}`, req.rationale.slice(0, 120), req.requestedBy);
+        this.extensionRegistry.onApprovalRequested({
+            id: req.id,
+            requestedBy: req.requestedBy,
+            requestedByName: req.requestedByName,
+            requestedAction: req.requestedAction,
+            rationale: req.rationale,
+            isMajor: req.isMajor,
+            status: req.status,
+            createdAt: req.createdAt,
+        }).catch((error) => console.error('[Extensions] onApprovalRequested failed', error));
 
         // CEO auto-triage: if the rationale is obviously weak, auto-reject with
         // a "please provide rationale" note so the queue doesn't flood.
@@ -1996,6 +2154,11 @@ Paired buddy: Sales Outreach.`,
     }
 
     private applyScenarioKickoff(scenarioName: string) {
+        this.extensionRegistry.onScenarioStart({
+            scenario: scenarioName,
+            startedAt: this.state.officeTime,
+        }).catch((error) => console.error('[Extensions] onScenarioStart failed', error));
+
         this.broadcast('scenario-event', {
             type: 'scenario-started',
             scenario: scenarioName,
@@ -2026,100 +2189,24 @@ Paired buddy: Sales Outreach.`,
             }
         });
 
-        // Structured project scenarios that actually route work across the whole agency
+        // Structured project scenarios loaded from template scripts.
         const normalized = scenarioName.toLowerCase();
-        if (normalized.includes('xylon growth sprint') || normalized.includes('acme')) {
-            this.kickoffXylonGrowthSprint();
+        const script = Object.values(this.officeTemplate.scenarios.scripts).find((candidate) =>
+            candidate.aliases.some((alias) => normalized.includes(alias.toLowerCase()))
+        );
+        if (script) {
+            this.kickoffScenario(script);
         }
     }
 
-    // ─── REAL-WORLD PROJECT: XYLON GROWTH SPRINT (ACME MANUFACTURING) ───
-    //
-    // This scenario forces the whole agency to collaborate. The CEO is the gate
-    // on pricing and launch. Each agent gets a specific brief that references
-    // the others', so they must consult their paired buddy and cross-pod peers.
-    //
-    // Real business value mirror: Xylon Devs sells exactly this — a Microsoft 365
-    // Copilot rollout with oversharing remediation, a landing page to capture
-    // the lead, and a Statement of Work. Running this scenario exercises the
-    // exact muscles the real company uses to win work.
-    private kickoffXylonGrowthSprint() {
-        const project = 'ACME Manufacturing — M365 Copilot rollout + oversharing remediation + landing page + SOW';
-        const brief = [
-            `NEW PROJECT: ${project}.`,
-            `Client: ACME Manufacturing (fictional mid-market AU manufacturer, ~800 staff, Microsoft 365 E3).`,
-            `Client pain: wants to roll out Microsoft 365 Copilot but worried about oversharing across SharePoint/OneDrive.`,
-            `Deliverables Xylon must produce this sprint: (1) prospect research brief, (2) oversharing remediation plan,`,
-            ` (3) landing page at xylondevs.com/copilot-rollout to capture similar leads, (4) backend intake form API,`,
-            ` (5) deploy plan, (6) final Statement of Work with 3 pricing tiers, (7) QA evidence + live-URL checks.`,
-            `Every agent consults their paired buddy first, then loops in other pods. MAJOR gates: final SOW pricing,`,
-            ` deploy, and publish all need CEO approval. Read xylondevs.com first so your work matches our current brand.`,
-        ].join(' ');
-
+    private kickoffScenario(script: ScenarioScript) {
         this.broadcast('chat', {
             sender: '📣 Project Kickoff',
-            text: `🚀 ${project}. Everyone has a specific brief in their inbox — check it, then start executing.`
+            text: script.kickoffChat
         });
-        this.emitHighlight('scenario', 'Xylon Growth Sprint kicked off', project, 'shepherd');
+        this.emitHighlight('scenario', script.highlightTitle, script.project, 'shepherd');
 
-        const assignments: Array<{
-            id: string;
-            task: string;
-            inbox: string;
-        }> = [
-            {
-                id: 'shepherd',
-                task: 'Coordinate ACME sprint: break work into milestones, route to specialists, track blockers',
-                inbox: `${brief} You are the coordinator. Produce a milestone plan (Discovery → Research → Design → Build → Security review → QA → CEO gate → Launch), create tasks for each specialist via create_task, and chase blockers. Pair with Reality Checker to pressure-test the plan before assigning.`,
-            },
-            {
-                id: 'reality',
-                task: 'Pressure-test the ACME plan and every deliverable as they arrive',
-                inbox: `${brief} Your job: challenge scope creep, thin rationale, and "is this really launch-ready?" checks. Pair with Project Shepherd on the milestone plan. Read xylondevs.com and flag any claim in the SOW we cannot back up with the current site.`,
-            },
-            {
-                id: 'sales',
-                task: 'Research ACME, qualify the opportunity, write outreach, brief Proposal Strategist',
-                inbox: `${brief} Use web_search to research ACME Manufacturing (AU manufacturing sector, M365 adoption, Copilot pilots). Use fetch_url on xylondevs.com to match our positioning. Draft a 120-word outbound email and a 3-line LinkedIn opener. When qualified, brief Proposal Strategist with BANT/MEDDIC-lite notes. DO NOT commit pricing — that is the CEO's call.`,
-            },
-            {
-                id: 'proposal',
-                task: 'Draft the Statement of Work with 3 pricing tiers (Good/Better/Best) — pricing is MAJOR',
-                inbox: `${brief} Build the 10-part SOW. Pair with Sales Outreach for qualification inputs, Security for the remediation scope, DevOps for deploy effort, and Frontend for landing-page scope. Write the SOW via write_file to data/workspace/acme-sow.md. Propose Good/Better/Best pricing but REQUEST CEO APPROVAL before finalising numbers or sending to client. Also read xylondevs.com to mirror tone.`,
-            },
-            {
-                id: 'seo',
-                task: 'Audit xylondevs.com and propose keyword/meta plan for /copilot-rollout landing page',
-                inbox: `${brief} fetch_url https://xylondevs.com and audit: title tags, H1s, meta description, internal linking, any existing Copilot/AI content. web_search for Australian buyer-intent keywords around "Microsoft Copilot rollout", "Copilot oversharing", "Purview restricted SharePoint search". Hand the keyword + metadata brief to Frontend Dev. Pair with Evidence Collector so they can verify the new page ranks the right terms.`,
-            },
-            {
-                id: 'frontend',
-                task: 'Build landing page mockup at data/workspace/copilot-rollout-landing.html',
-                inbox: `${brief} fetch_url https://xylondevs.com to match the current brand look. Take SEO's keyword+metadata brief and Proposal's scope. write_file an HTML landing page to data/workspace/copilot-rollout-landing.html with hero, pain statement, 3-tier pricing placeholder, intake form pointing at Backend Architect's API, and a clear CTA. Pair with Backend Architect on the form fields.`,
-            },
-            {
-                id: 'backend',
-                task: 'Design intake form API contract for the landing page',
-                inbox: `${brief} Design a minimal POST /api/leads endpoint: fields (company, contact, email, staff_count, current_m365_plan, message, utm_source). Return 202 + lead id. Define validation + rate limiting. write_note the contract and share with Frontend Dev. Loop in Security Engineer for auth + Purview-aligned data handling.`,
-            },
-            {
-                id: 'devops',
-                task: 'Propose a safe deploy plan for the landing page + API — deploy is MAJOR',
-                inbox: `${brief} Draft a deploy plan: static hosting for the landing page, containerised API, env vars, rollback plan, DNS for xylondevs.com/copilot-rollout. The actual deploy is MAJOR — do not execute it. File an approval request to the CEO with rationale (why now, rollback, blast radius). Pair with Security for any secret handling.`,
-            },
-            {
-                id: 'security',
-                task: 'Write the Copilot oversharing remediation plan for the ACME SOW',
-                inbox: `${brief} This is the centrepiece. Produce a concrete remediation plan ACME can adopt pre-Copilot rollout: (1) SharePoint/OneDrive permission hygiene sweep, (2) sensitivity labels + DLP via Purview, (3) restricted SharePoint search, (4) Copilot semantic index scoping, (5) Entra ID conditional access + PIM, (6) content filtering + prompt logging, (7) audit cadence. Map each to the exact M365 setting. Hand to Proposal Strategist for the SOW. Pair with DevOps on any secrets handling.`,
-            },
-            {
-                id: 'evidence',
-                task: 'Capture proof: SOW complete, landing page file exists, API contract noted, site 200 OK',
-                inbox: `${brief} Verify each deliverable: read_file data/workspace/acme-sow.md, read_file data/workspace/copilot-rollout-landing.html, check_health https://xylondevs.com and the deploy URL once live. Post an evidence summary in chat before the CEO's final approval. Pair with SEO for post-launch keyword verification.`,
-            },
-        ];
-
-        for (const a of assignments) {
+        for (const a of script.assignments) {
             const agent = this.coreAgents.get(a.id);
             const state = this.state.agents.get(a.id);
             if (!agent || !state) continue;
@@ -2138,20 +2225,24 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95,
             });
-            this.memoryStore.createTask(a.task, a.id).catch(() => {});
+            this.memoryStore.createTask({
+                title: a.task,
+                assignedTo: a.id,
+                createdBy: 'scenario',
+                status: 'in_progress'
+            }).catch(() => {});
             this.broadcast('task-update', {
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
             this.seedTaskProgress(a.id, a.task);
         }
 
-        // CEO brief (no approval gate, just awareness)
         const ceo = this.coreAgents.get('ceo');
         if (ceo) {
             ceo.receiveMessage({
                 from: 'Faz (CEO)',
                 to: ceo.config.name,
-                content: `You kicked off "${project}". You are the final gate on SOW pricing, the deploy, and the public launch. Watch the approval queue. Stay strategic — do not micromanage. Ask for rationale if a request is weak.`,
+                content: script.ceoBrief,
                 timestamp: this.state.officeTime,
             });
         }
@@ -2369,6 +2460,7 @@ Paired buddy: Sales Outreach.`,
         this.memoryStore.getTasks().then(tasks => {
             client.send('tasks-sync', tasks);
         });
+        client.send('agent-roster-sync', this.getLiveRoster());
         client.send('relationship-update', this.buildRelationshipPayload());
         client.send('fast-track-state', { enabled: this.fastTrackMode });
         client.send('completed-work-sync', {
