@@ -127,6 +127,8 @@ function renderPreviewContent(preview: DesktopFilePreview | null, loading: boole
 
 export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelProps) {
     const [files, setFiles] = useState<DesktopFileItem[]>([]);
+    const [, setEditorValue] = useState('');
+    const [, setIsDirty] = useState(false);
     const [selectedPath, setSelectedPath] = useState<string | null>(null);
     const [preview, setPreview] = useState<DesktopFilePreview | null>(null);
     const [loadingPreview, setLoadingPreview] = useState(false);
@@ -144,6 +146,7 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
             .slice()
             .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     }, [mailMessages, targetAgent]);
+    const groupedFiles = files;
 
     const loadWorkspaceFiles = async () => {
         try {

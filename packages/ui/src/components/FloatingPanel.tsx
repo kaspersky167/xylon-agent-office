@@ -107,7 +107,16 @@ export function FloatingPanel({
             borderRadius: tokens.radius.lg,
             overflow: 'hidden',
             ...controlRoomStyles.panel
-        }}>
+        }
+        : {
+            width: '100%',
+            borderRadius: tokens.radius.lg,
+            overflow: 'hidden',
+            ...controlRoomStyles.panel
+        };
+
+    return (
+        <div className={className} style={floatingStyle}>
             <div
                 onMouseDown={(event) => {
                     if (mode !== 'floating') return;
