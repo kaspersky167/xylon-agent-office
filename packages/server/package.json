@@ -5,7 +5,7 @@
     "types": "dist/index.d.ts",
     "scripts": {
         "build": "tsc -b",
-        "start": "node --env-file=../../.env dist/index.js",
+        "start": "sh -c 'if [ -f ../../.env ]; then node --env-file=../../.env dist/index.js; else node dist/index.js; fi'",
         "test": "jest"
     },
     "dependencies": {
