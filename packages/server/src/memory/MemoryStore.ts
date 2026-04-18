@@ -1,6 +1,7 @@
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
-import { MemoryEntry, toCanonicalTaskStatus } from "@agent-office/core";
+import { createHash, randomUUID } from "crypto";
+import { MemoryEntry, TaskStatus, toCanonicalTaskStatus } from "@agent-office/core";
 
 export type SharedFileStatus =
   | "draft"
@@ -61,6 +62,19 @@ export interface ArtifactRecord {
   existsOnDisk?: boolean;
   createdAt?: string;
   updatedAt?: string;
+}
+
+export type ReviewDecision = "approved" | "rejected" | "pending";
+
+export interface ReviewRecord {
+  id?: number;
+  projectId: string;
+  taskId: string;
+  artifactId: string;
+  decision: ReviewDecision;
+  notes: string;
+  reviewer: string;
+  createdAt?: string;
 }
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
@@ -441,6 +455,34 @@ export class MemoryStore {
     );
   }
 
+  async upsertTaskStatusByTitle(
+    agentId: string,
+    taskTitle: string,
+    status: TaskStatus,
+    statusReason?: string | null,
+  ): Promise<void> {
+    if (!this.db || !agentId || !taskTitle) return;
+    const existing = await this.db.get(
+      "SELECT id FROM tasks WHERE assigned_to = ? AND title = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+      [agentId, taskTitle],
+    );
+    if (!existing?.id) {
+      const created = await this.createTask(taskTitle, agentId);
+      if (!created) return;
+      await this.updateTaskStatus(created, status, statusReason);
+      return;
+    }
+    await this.updateTaskStatus(existing.id, status, statusReason);
+  }
+
+  async findActiveTask(agentId: string, taskTitle: string): Promise<any | null> {
+    if (!this.db) return null;
+    return this.db.get(
+      "SELECT * FROM tasks WHERE assigned_to = ? AND title = ? AND status != 'done' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+      [agentId, taskTitle],
+    );
+  }
+
   async findMostRecentTaskByTitleAndAssignee(
     title: string,
     assignee: string,
@@ -719,6 +761,53 @@ export class MemoryStore {
       ],
     );
     return typeof result?.lastID === "number" ? result.lastID : null;
+  }
+
+  hashToolParams(params: unknown): string {
+    return createHash("sha256")
+      .update(JSON.stringify(params ?? {}))
+      .digest("hex");
+  }
+
+  async addTaskEvidence(input: TaskEvidenceRecord): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      `INSERT OR REPLACE INTO task_evidence
+         (id, task_id, agent_id, evidence_type, artifact_id, artifact_path, tool_audit_log_id, validator_decision, metadata, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+      [
+        input.id,
+        input.taskId,
+        input.agentId,
+        input.evidenceType,
+        input.artifactId || null,
+        input.artifactPath || null,
+        input.toolAuditLogId ?? null,
+        input.validatorDecision || null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        input.createdAt || null,
+      ],
+    );
+  }
+
+  async getTaskEvidence(taskId: string): Promise<TaskEvidenceRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY created_at DESC",
+      [taskId],
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      taskId: row.task_id,
+      agentId: row.agent_id,
+      evidenceType: row.evidence_type,
+      artifactId: row.artifact_id || null,
+      artifactPath: row.artifact_path || null,
+      toolAuditLogId: row.tool_audit_log_id == null ? null : Number(row.tool_audit_log_id),
+      validatorDecision: row.validator_decision || null,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      createdAt: row.created_at,
+    }));
   }
 
   async upsertArtifact(
