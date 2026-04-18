@@ -414,99 +414,31 @@ export class MemoryStore {
     );
   }
 
-  async updateTaskStatus(input: {
-    taskId: string;
-    status: TaskStatus;
-    statusReason?: string | null;
-    progress?: number;
-    completed?: boolean;
-  }): Promise<void> {
-    if (!this.db) return;
-    const progress = Number.isFinite(input.progress)
-      ? Math.max(0, Math.min(1, Number(input.progress)))
-      : null;
-    await this.db.run(
-      `UPDATE tasks
-       SET status = ?,
-           status_reason = ?,
-           progress = COALESCE(?, progress),
-           completed_at = CASE WHEN ? = 1 THEN datetime('now') ELSE completed_at END,
-           updated_at = datetime('now')
-       WHERE id = ?`,
-      [
-        input.status,
-        input.statusReason || null,
-        progress,
-        input.completed ? 1 : 0,
-        input.taskId,
-      ],
-    );
-  }
-
-  async findActiveTask(assignedTo: string, title: string): Promise<any | null> {
-    if (!this.db) return null;
-    return this.db.get(
-      `SELECT *
-       FROM tasks
-       WHERE assigned_to = ?
-         AND title = ?
-         AND status != 'done'
-       ORDER BY datetime(updated_at) DESC
-       LIMIT 1`,
+  async upsertTaskStatusByTitle(
+    assignedTo: string,
+    title: string,
+    status: TaskStatus,
+    reason?: string,
+  ): Promise<void> {
+    if (!this.db || !title?.trim()) return;
+    const existing = await this.db.get(
+      "SELECT id FROM tasks WHERE assigned_to = ? AND title = ? ORDER BY updated_at DESC LIMIT 1",
       [assignedTo, title],
     );
-  }
 
-  async addTaskEvidence(input: TaskEvidenceRecord): Promise<void> {
-    if (!this.db) return;
-    await this.db.run(
-      `INSERT INTO task_evidence
-       (id, task_id, agent_id, evidence_type, artifact_id, artifact_path, tool_audit_log_id, validator_decision, metadata, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        input.id,
-        input.taskId,
-        input.agentId,
-        input.evidenceType,
-        input.artifactId || null,
-        input.artifactPath || null,
-        input.toolAuditLogId ?? null,
-        input.validatorDecision || null,
-        input.metadata ? JSON.stringify(input.metadata) : null,
-        input.createdAt || new Date().toISOString(),
-      ],
-    );
-  }
-
-  async getTaskEvidence(taskId: string): Promise<TaskEvidenceRecord[]> {
-    if (!this.db) return [];
-    const rows = await this.db.all(
-      "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY datetime(created_at) DESC",
-      [taskId],
-    );
-    return rows.map((row: any) => ({
-      id: row.id,
-      taskId: row.task_id,
-      agentId: row.agent_id,
-      evidenceType: row.evidence_type,
-      artifactId: row.artifact_id || null,
-      artifactPath: row.artifact_path || null,
-      toolAuditLogId:
-        typeof row.tool_audit_log_id === "number" ? row.tool_audit_log_id : null,
-      validatorDecision: row.validator_decision || null,
-      metadata: row.metadata ? JSON.parse(row.metadata) : null,
-      createdAt: row.created_at,
-    }));
-  }
-
-  hashToolParams(params: any): string {
-    try {
-      return createHash("sha256")
-        .update(JSON.stringify(params ?? {}))
-        .digest("hex");
-    } catch {
-      return createHash("sha256").update(String(params)).digest("hex");
+    if (existing?.id) {
+      await this.db.run(
+        "UPDATE tasks SET status = ?, status_reason = ?, updated_at = datetime('now') WHERE id = ?",
+        [status, reason || null, existing.id],
+      );
+      return;
     }
+
+    const newId = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
+    await this.db.run(
+      "INSERT INTO tasks (id, title, assigned_to, status, status_reason, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+      [newId, title, assignedTo, status, reason || null, 'system:guardrail'],
+    );
   }
 
   async saveLayout(name: string, layoutJson: string): Promise<void> {
