@@ -7,6 +7,7 @@ import {
 } from "@tavily/core";
 import * as pathModule from "path";
 import { evaluateToolPolicy, type ToolExecutionContext } from "./policy";
+import { getActiveWorkspaceRoot, resolveScopedPath } from "../projects/workspacePaths";
 
 const MAX_READ_FILE_BYTES = 8 * 1024;
 const MAX_READ_CHUNK_BYTES = 64 * 1024;
@@ -28,6 +29,15 @@ export interface ToolAuditEntry {
 }
 
 type ToolAuditLogger = (entry: ToolAuditEntry) => Promise<void> | void;
+type ArtifactWriteLogger = (entry: {
+  relativePath: string;
+  absolutePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  actorId?: string;
+  status: "draft" | "submitted" | "validated" | "rejected";
+  existsOnDisk: boolean;
+}) => Promise<void> | void;
 
 // Frugality guard — shared across all ToolExecutor instances in the process.
 // Tavily charges 1 credit per basic search result (up to 5 results = 1 credit).
@@ -57,13 +67,22 @@ interface ToolResearchPayload {
 export class ToolExecutor {
   private tavilyClient: TavilyClient | null = null;
   private auditLogger: ToolAuditLogger | null = null;
+  private artifactWriteLogger: ArtifactWriteLogger | null = null;
 
-  constructor(options?: { auditLogger?: ToolAuditLogger }) {
+  constructor(options?: {
+    auditLogger?: ToolAuditLogger;
+    artifactWriteLogger?: ArtifactWriteLogger;
+  }) {
     this.auditLogger = options?.auditLogger || null;
+    this.artifactWriteLogger = options?.artifactWriteLogger || null;
   }
 
   setAuditLogger(logger: ToolAuditLogger | null) {
     this.auditLogger = logger;
+  }
+
+  setArtifactWriteLogger(logger: ArtifactWriteLogger | null) {
+    this.artifactWriteLogger = logger;
   }
 
   private getTavilyClient(): TavilyClient | null {
@@ -152,7 +171,11 @@ export class ToolExecutor {
           );
           break;
         case "write_file":
-          result = await this.writeFile(safeParams.path, safeParams.content);
+          result = await this.writeFile(
+            safeParams.path,
+            safeParams.content,
+            safeContext,
+          );
           break;
         case "run_command":
           result = await this.runCommand(safeParams.command);
@@ -422,24 +445,7 @@ export class ToolExecutor {
   }
 
   private getWorkspaceRoot(): string {
-    return pathModule.resolve(
-      process.env.AGENT_WORKSPACE_DIR || "data/workspace",
-    );
-  }
-
-  private resolveWorkspacePath(
-    workspaceRoot: string,
-    targetPath: string,
-  ): string {
-    if (typeof targetPath !== "string" || targetPath.trim() === "") {
-      throw new Error("Path is required.");
-    }
-    const resolvedTarget = pathModule.resolve(workspaceRoot, targetPath);
-    const relativePath = pathModule.relative(workspaceRoot, resolvedTarget);
-    if (relativePath.startsWith("..") || pathModule.isAbsolute(relativePath)) {
-      throw new Error("Path traversal not allowed.");
-    }
-    return resolvedTarget;
+    return getActiveWorkspaceRoot();
   }
 
   private async writeNote(content: string): Promise<ToolResult> {
@@ -455,7 +461,7 @@ export class ToolExecutor {
     const { readFile } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, path);
+      const safePath = resolveScopedPath(workspaceRoot, path);
       const content = await readFile(safePath, "utf-8");
       return { success: true, output: content.slice(0, MAX_READ_FILE_BYTES) };
     } catch (e: any) {
@@ -480,7 +486,7 @@ export class ToolExecutor {
     const { readdir } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const maxItems = this.normalizeLimit(limit);
       const shouldRecurse = Boolean(recursive);
       const files: Array<{
@@ -529,7 +535,7 @@ export class ToolExecutor {
     const { stat } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const details = await stat(safePath);
       return {
         success: true,
@@ -559,7 +565,7 @@ export class ToolExecutor {
     const { open } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const parsedOffset = Number(offset ?? 0);
       const parsedLength = Number(length ?? 4096);
       if (!Number.isFinite(parsedOffset) || parsedOffset < 0) {
@@ -613,17 +619,56 @@ export class ToolExecutor {
   private async writeFile(
     filePath: string,
     content: string,
+    context?: ToolExecutionContext,
   ): Promise<ToolResult> {
-    const { writeFile, mkdir } = await import("fs/promises");
+    const { writeFile, mkdir, stat } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, filePath);
+      const safePath = resolveScopedPath(workspaceRoot, filePath);
       await mkdir(pathModule.dirname(safePath), { recursive: true });
       await writeFile(safePath, content, "utf-8");
+      const metadata = await stat(safePath);
+      const relativePath = pathModule
+        .relative(workspaceRoot, safePath)
+        .replace(/\\/g, "/");
+      const allowedPattern =
+        /^projects\/[^/]+\/(?:artifacts|uploads|generated|outputs)\//;
+      const existsOnDisk = metadata.isFile();
+      if (this.artifactWriteLogger) {
+        await this.artifactWriteLogger({
+          relativePath,
+          absolutePath: safePath,
+          mimeType: this.guessMimeType(relativePath),
+          sizeBytes: metadata.size,
+          actorId: context?.actorId,
+          status:
+            allowedPattern.test(relativePath) && existsOnDisk
+              ? "validated"
+              : "rejected",
+          existsOnDisk,
+        });
+      }
       return { success: true, output: `Written to ${safePath}` };
     } catch (e: any) {
       return { success: false, output: "", error: e.message };
     }
+  }
+
+  private guessMimeType(filePath: string): string {
+    const ext = pathModule.extname(filePath).toLowerCase();
+    const map: Record<string, string> = {
+      ".md": "text/markdown",
+      ".txt": "text/plain",
+      ".json": "application/json",
+      ".html": "text/html",
+      ".htm": "text/html",
+      ".csv": "text/csv",
+      ".js": "text/javascript",
+      ".ts": "text/typescript",
+      ".tsx": "text/tsx",
+      ".jsx": "text/jsx",
+    };
+    return map[ext] || "application/octet-stream";
   }
 
   private runCommand(command: string): Promise<ToolResult> {

@@ -5,10 +5,18 @@ import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { OfficeRoom } from './rooms/OfficeRoom';
 import { ExtensionRegistry } from './extensions/registry';
+import { ProjectWorkspace } from './projects/ProjectWorkspace';
+import {
+    getActiveProject,
+    getActiveWorkspaceRoot,
+    getGlobalWorkspaceRoot,
+    resolveScopedPath
+} from './projects/workspacePaths';
 
 // Setup Express
 const app = express();
 app.use(express.json());
+const memoryStore = new MemoryStore();
 
 // Basic REST API for Office Management
 app.get('/api/offices', (req, res) => {
@@ -56,21 +64,61 @@ const EXTENSION_TO_MIME: Record<string, string> = {
     '.yaml': 'text/yaml'
 };
 
-const workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
-
 const resolveWorkspacePath = (targetPath: string): string => {
-    const safePath = String(targetPath || '').trim();
-    const fullPath = path.resolve(workspaceRoot, safePath);
-    const relative = path.relative(workspaceRoot, fullPath);
-    if (!safePath || relative.startsWith('..') || path.isAbsolute(relative)) {
-        throw new Error('Invalid workspace path.');
-    }
-    return fullPath;
+    return resolveScopedPath(getActiveWorkspaceRoot(), targetPath);
 };
 
 const guessMimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase();
     return EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+};
+
+const parseArtifactPath = (relativePath: string): {
+    projectId: string;
+    approved: boolean;
+} => {
+    const normalized = relativePath.split(path.sep).join('/');
+    const match = normalized.match(/^projects\/([^/]+)\/([^/]+)\//);
+    if (!match) {
+        return { projectId: 'unscoped', approved: false };
+    }
+    const subfolder = match[2];
+    return {
+        projectId: match[1],
+        approved: ['artifacts', 'uploads', 'generated', 'outputs'].includes(subfolder)
+    };
+};
+
+const upsertArtifactFromPath = async (relativePath: string, context?: {
+    taskId?: string;
+    agentId?: string;
+    status?: ArtifactStatus;
+    checksum?: string;
+}) => {
+    const fullPath = resolveWorkspacePath(relativePath);
+    let exists = false;
+    let sizeBytes = 0;
+    try {
+        const fileStats = await stat(fullPath);
+        exists = fileStats.isFile();
+        sizeBytes = fileStats.size;
+    } catch {
+        exists = false;
+    }
+    const parsed = parseArtifactPath(relativePath);
+    const status: ArtifactStatus = context?.status || (parsed.approved && exists ? 'validated' : 'rejected');
+    await memoryStore.upsertArtifact({
+        id: randomUUID(),
+        projectId: parsed.projectId,
+        taskId: context?.taskId || null,
+        agentId: context?.agentId || null,
+        relativePath: relativePath.split(path.sep).join('/'),
+        mimeType: guessMimeType(relativePath),
+        sizeBytes,
+        status,
+        checksum: context?.checksum || null,
+        existsOnDisk: exists
+    });
 };
 
 const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
@@ -102,9 +150,10 @@ const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
 
 app.get('/api/workspace-files', async (_req, res) => {
     try {
+        const workspaceRoot = getActiveWorkspaceRoot();
         await mkdir(workspaceRoot, { recursive: true });
         const files = await listWorkspaceFiles(workspaceRoot);
-        res.json({ ok: true, files });
+        res.json({ ok: true, root: workspaceRoot, project: getActiveProject(), files });
     } catch (error) {
         console.error('[workspace-files] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list workspace files.' });
@@ -113,16 +162,38 @@ app.get('/api/workspace-files', async (_req, res) => {
 
 app.get('/api/completed-work', async (_req, res) => {
     try {
+        const workspaceRoot = getActiveWorkspaceRoot();
         await mkdir(path.join(workspaceRoot, 'completed-work'), { recursive: true });
         const files = await listWorkspaceFiles(path.join(workspaceRoot, 'completed-work'));
         res.json({
             ok: true,
-            folder: 'data/workspace/completed-work',
+            folder: `${workspaceRoot}/completed-work`,
             files
         });
     } catch (error) {
         console.error('[completed-work] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list completed work files.' });
+    }
+});
+
+app.post('/api/projects/start', async (req, res) => {
+    try {
+        const project = await ProjectWorkspace.startProject({
+            templateId: req.body?.templateId ?? req.body?.template,
+            projectName: req.body?.projectName,
+            brief: req.body?.brief,
+            acceptanceCriteria: req.body?.acceptanceCriteria,
+            constraints: req.body?.constraints,
+            mode: req.body?.mode,
+            runMetadata: {
+                requestedBy: req.body?.requestedBy || 'api',
+                source: 'rest',
+                globalWorkspaceRoot: getGlobalWorkspaceRoot()
+            }
+        });
+        res.status(201).json({ ok: true, ...project });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to start project.' });
     }
 });
 
@@ -133,6 +204,11 @@ app.post('/api/workspace-files/save', async (req, res) => {
         const fullPath = resolveWorkspacePath(targetPath);
         await mkdir(path.dirname(fullPath), { recursive: true });
         await writeFile(fullPath, content, 'utf-8');
+        await upsertArtifactFromPath(targetPath, {
+            taskId: typeof req.body?.taskId === 'string' ? req.body.taskId : undefined,
+            agentId: typeof req.body?.agentId === 'string' ? req.body.agentId : 'user',
+            status: 'draft'
+        });
         res.json({ ok: true, path: targetPath });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to save workspace file.' });
@@ -148,18 +224,69 @@ app.post('/api/workspace-files/upload', async (req, res) => {
         const buffer = Buffer.from(normalized, 'base64');
         await mkdir(path.dirname(fullPath), { recursive: true });
         await writeFile(fullPath, buffer);
+        await upsertArtifactFromPath(targetPath, {
+            taskId: typeof req.body?.taskId === 'string' ? req.body.taskId : undefined,
+            agentId: typeof req.body?.agentId === 'string' ? req.body.agentId : 'user',
+            status: 'submitted'
+        });
         res.json({ ok: true, path: targetPath, size: buffer.length });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to upload workspace file.' });
     }
 });
 
+app.get('/api/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: typeof req.query.project_id === 'string' ? req.query.project_id : undefined,
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        res.json({ ok: true, artifacts, rootHint: workspaceRoot });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list artifacts.' });
+    }
+});
+
+app.get('/api/projects/:projectId/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: String(req.params.projectId || '').trim(),
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        res.json({ ok: true, artifacts, rootHint: path.join(workspaceRoot, 'projects', req.params.projectId, 'artifacts') });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list project artifacts.' });
+    }
+});
+
 const bootstrap = async () => {
+    const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
+    await memoryStore.initialize(dbPath);
     const configuredExtensionFolder = process.env.AGENT_EXTENSION_DIR
         ? path.resolve(process.cwd(), process.env.AGENT_EXTENSION_DIR)
         : path.resolve(__dirname, 'extensions', 'builtin');
     const extensionRegistry = await ExtensionRegistry.loadFromFolder(configuredExtensionFolder);
     OfficeRoom.setExtensionRegistry(extensionRegistry);
+    OfficeRoom.setArtifactWriteLogger(async (entry) => {
+        await upsertArtifactFromPath(entry.relativePath, {
+            agentId: entry.actorId,
+            status: entry.status
+        });
+    });
     console.log(`[Extensions] Active hooks: ${extensionRegistry.list().join(', ') || 'none'}`);
 
     // Create HTTP and Colyseus server
