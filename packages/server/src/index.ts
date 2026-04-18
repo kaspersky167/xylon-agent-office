@@ -1,8 +1,10 @@
 import express from 'express';
 import { Server } from 'colyseus';
 import { createServer } from 'http';
+import { randomUUID } from 'crypto';
 import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
+import { ArtifactStatus, MemoryStore } from './memory/MemoryStore';
 import { OfficeRoom } from './rooms/OfficeRoom';
 import { ExtensionRegistry } from './extensions/registry';
 import { ProjectWorkspace } from './projects/ProjectWorkspace';
@@ -248,7 +250,7 @@ app.get('/api/artifacts', async (req, res) => {
             existsOnDisk: existsFilter,
             limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
         });
-        res.json({ ok: true, artifacts, rootHint: workspaceRoot });
+        res.json({ ok: true, artifacts, rootHint: getActiveWorkspaceRoot() });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to list artifacts.' });
     }
@@ -267,7 +269,7 @@ app.get('/api/projects/:projectId/artifacts', async (req, res) => {
             existsOnDisk: existsFilter,
             limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
         });
-        res.json({ ok: true, artifacts, rootHint: path.join(workspaceRoot, 'projects', req.params.projectId, 'artifacts') });
+        res.json({ ok: true, artifacts, rootHint: path.join(getActiveWorkspaceRoot(), 'projects', req.params.projectId, 'artifacts') });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to list project artifacts.' });
     }

@@ -3,7 +3,8 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage, TaskStatus, toCanonicalTaskStatus, validateTaskStatusTransition } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore, SharedFileRecord, SharedFileStatus, TaskStatus } from '../memory/MemoryStore';
+import { createHash, randomUUID } from 'crypto';
+import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile, readdir } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
@@ -128,6 +129,12 @@ interface ValidationContext {
     reviewer?: string;
 }
 
+interface TaskEvidenceState {
+    artifactExists: boolean;
+    toolExecutionSucceeded: boolean;
+    validatorApproved: boolean;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -192,10 +199,12 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
+    private taskRecordIds: Map<string, string> = new Map();
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
     private mailMessages: MailMessage[] = [];
     private currentProjectSlug = 'xylon';
+    private simulationInterval?: NodeJS.Timeout;
 
     private getWorkspaceRoot(): string {
         return getActiveWorkspaceRoot();
@@ -231,7 +240,7 @@ export class OfficeRoom extends Room<OfficeState> {
     }
 
     private projectRoot(projectSlug: string): string {
-        return path.join(this.workspaceRoot, 'projects', projectSlug);
+        return path.join(this.getWorkspaceRoot(), 'projects', projectSlug);
     }
 
     private async safeReadWorkspaceText(relativePath: string): Promise<string> {
@@ -1273,8 +1282,20 @@ Paired buddy: Sales Outreach.`,
             this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
         });
 
-        // Start Simulation Loop
-        this.setSimulationInterval((delta) => this.update(delta), 100);
+        // Start simulation loop using a plain Node interval.
+        // NOTE: We intentionally avoid Room#setSimulationInterval here because
+        // we have seen runtime `ERR_INVALID_ARG_TYPE` crashes originating from
+        // @colyseus/core's internal timer callback invocation.
+        this.startSimulationLoop(100);
+    }
+
+    private startSimulationLoop(intervalMs: number) {
+        if (this.simulationInterval) {
+            clearInterval(this.simulationInterval);
+        }
+        this.simulationInterval = setInterval(() => {
+            void this.update(intervalMs);
+        }, intervalMs);
     }
 
     private autoAssignAgent(): string {
@@ -2000,7 +2021,7 @@ Paired buddy: Sales Outreach.`,
             evidence,
             action,
             fastTrackMode: this.fastTrackMode
-        });
+        } as any);
 
         if (!shouldComplete) return;
 
@@ -2395,7 +2416,7 @@ Paired buddy: Sales Outreach.`,
         const taskSlug = this.toSlug(taskTitle || 'task');
         const timestamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, 'Z');
         const relativePath = `projects/${projectSlug}/reviews/${timestamp}-${taskSlug}.md`;
-        const fullPath = path.resolve(this.workspaceRoot, relativePath);
+        const fullPath = this.resolveWorkspacePath(relativePath);
         await mkdir(path.dirname(fullPath), { recursive: true });
         const content = [
             '# Revision Request',
@@ -3053,6 +3074,10 @@ Paired buddy: Sales Outreach.`,
     async onDispose() {
         console.log("room", this.roomId, "disposing... saving memories");
         OfficeRoom.activeRoom = null;
+        if (this.simulationInterval) {
+            clearInterval(this.simulationInterval);
+            this.simulationInterval = undefined;
+        }
         // Persist all agent memories on shutdown
         for (const [id, agent] of this.coreAgents) {
             await this.memoryStore.saveMemories(id, agent.memories, this.sessionId);
