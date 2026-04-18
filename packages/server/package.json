@@ -6,7 +6,7 @@
     "scripts": {
         "build": "tsc -b",
         "start": "sh -c 'if [ -f ../../.env ]; then node --env-file=../../.env dist/index.js; else node dist/index.js; fi'",
-        "test": "jest"
+        "test": "jest --config ./jest.config.js"
     },
     "dependencies": {
         "@agent-office/core": "^1.0.0",
