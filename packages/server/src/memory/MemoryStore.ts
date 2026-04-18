@@ -35,6 +35,18 @@ export interface SharedFileRecord {
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 export type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+export type ReviewDecision = 'approved' | 'rejected';
+
+export interface ReviewRecord {
+  id?: number;
+  projectId: string;
+  taskId: string;
+  artifactId: string;
+  decision: ReviewDecision;
+  notes: string;
+  reviewer: string;
+  createdAt?: string;
+}
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
@@ -159,6 +171,20 @@ export class MemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_actor ON tool_audit_logs(actor_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_tool ON tool_audit_logs(tool_name, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                notes TEXT,
+                reviewer TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reviews_artifact ON reviews(artifact_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at DESC);
         `);
 
     try {
@@ -337,8 +363,31 @@ export class MemoryStore {
   async completeTask(taskId: number): Promise<void> {
     if (!this.db) return;
     await this.db.run(
-      "UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+      "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ?",
       [taskId],
+    );
+  }
+
+  async updateTaskStatus(
+    taskId: string | number,
+    status: TaskStatus,
+    statusReason?: string | null,
+  ): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "UPDATE tasks SET status = ?, status_reason = ?, updated_at = datetime('now'), completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?",
+      [status, statusReason || null, status, String(taskId)],
+    );
+  }
+
+  async findMostRecentTaskByTitleAndAssignee(
+    title: string,
+    assignee: string,
+  ): Promise<any | null> {
+    if (!this.db) return null;
+    return this.db.get(
+      "SELECT * FROM tasks WHERE title = ? AND assigned_to = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+      [title, assignee],
     );
   }
 
@@ -608,6 +657,62 @@ export class MemoryStore {
         input.approvalId || null,
       ],
     );
+  }
+
+  async createReview(input: ReviewRecord): Promise<number> {
+    if (!this.db) return -1;
+    const result = await this.db.run(
+      `INSERT INTO reviews
+             (project_id, task_id, artifact_id, decision, notes, reviewer, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+      [
+        input.projectId,
+        input.taskId,
+        input.artifactId,
+        input.decision,
+        input.notes || "",
+        input.reviewer,
+        input.createdAt || null,
+      ],
+    );
+    return result.lastID || -1;
+  }
+
+  async listReviews(filter?: {
+    projectId?: string;
+    taskId?: string;
+    artifactId?: string;
+    limit?: number;
+  }): Promise<ReviewRecord[]> {
+    if (!this.db) return [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (filter?.projectId) {
+      clauses.push("project_id = ?");
+      params.push(filter.projectId);
+    }
+    if (filter?.taskId) {
+      clauses.push("task_id = ?");
+      params.push(filter.taskId);
+    }
+    if (filter?.artifactId) {
+      clauses.push("artifact_id = ?");
+      params.push(filter.artifactId);
+    }
+
+    const sql = `SELECT * FROM reviews ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ?`;
+    params.push(Math.max(1, Math.min(Number(filter?.limit || 100), 500)));
+    const rows = await this.db.all(sql, params);
+    return rows.map((row: any) => ({
+      id: Number(row.id),
+      projectId: row.project_id,
+      taskId: row.task_id,
+      artifactId: row.artifact_id,
+      decision: row.decision as ReviewDecision,
+      notes: row.notes || "",
+      reviewer: row.reviewer,
+      createdAt: row.created_at,
+    }));
   }
 
   async close(): Promise<void> {
