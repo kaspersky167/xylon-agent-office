@@ -1,7 +1,6 @@
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
-import { MemoryEntry } from "@agent-office/core";
-import { createHash, randomUUID } from "crypto";
+import { MemoryEntry, toCanonicalTaskStatus } from "@agent-office/core";
 
 export type SharedFileStatus =
   | "draft"
@@ -65,19 +64,6 @@ export interface ArtifactRecord {
 }
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
-export type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
-export type ReviewDecision = 'approved' | 'rejected';
-
-export interface ReviewRecord {
-  id?: number;
-  projectId: string;
-  taskId: string;
-  artifactId: string;
-  decision: ReviewDecision;
-  notes: string;
-  reviewer: string;
-  createdAt?: string;
-}
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
@@ -286,6 +272,22 @@ export class MemoryStore {
       );
     } catch {}
 
+    try {
+      await this.db.exec(
+        "UPDATE tasks SET status = 'backlog' WHERE lower(coalesce(status, '')) IN ('', 'pending', 'todo', 'open')",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "UPDATE tasks SET status = 'in_progress' WHERE lower(status) = 'active'",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "UPDATE tasks SET status = 'done' WHERE lower(status) IN ('completed', 'complete')",
+      );
+    } catch {}
+
     console.log("[MemoryStore] SQLite initialized at", dbPath);
   }
 
@@ -404,7 +406,11 @@ export class MemoryStore {
 
   async getTasks(): Promise<any[]> {
     if (!this.db) return [];
-    return this.db.all("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50");
+    const rows = await this.db.all("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50");
+    return rows.map((row: any) => ({
+      ...row,
+      status: toCanonicalTaskStatus(row.status),
+    }));
   }
 
   async assignTask(taskId: number, agentId: string): Promise<void> {

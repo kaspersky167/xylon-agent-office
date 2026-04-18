@@ -9,6 +9,26 @@ import { controlRoomStyles, tokens } from '../theme/tokens';
 import { eventBus } from '../events';
 
 type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+
+const TASK_STATUS_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
+    backlog: ['in_progress', 'blocked'],
+    in_progress: ['blocked', 'review', 'done'],
+    blocked: ['backlog', 'in_progress'],
+    review: ['in_progress', 'done', 'blocked'],
+    done: []
+};
+
+const LEGACY_TASK_STATUS_MAP: Record<string, TaskStatus> = {
+    pending: 'backlog',
+    completed: 'done'
+};
+
+const toCanonicalTaskStatus = (value: unknown): TaskStatus => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'backlog' || normalized === 'in_progress' || normalized === 'blocked' || normalized === 'review' || normalized === 'done') return normalized;
+    return LEGACY_TASK_STATUS_MAP[normalized] || 'backlog';
+};
+
 type TaskPriority = 'low' | 'medium' | 'high';
 
 interface TaskItem {
@@ -25,14 +45,6 @@ interface AgentRosterEntry {
     id: string;
     name: string;
 }
-
-const nextTransitions: Record<TaskStatus, TaskStatus[]> = {
-    backlog: ['in_progress'],
-    in_progress: ['blocked', 'review'],
-    blocked: ['in_progress'],
-    review: ['done', 'in_progress'],
-    done: []
-};
 
 export function TaskBoard() {
     const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -52,7 +64,7 @@ export function TaskBoard() {
                     return prev.map(t => (t.id === existing.id ? {
                         ...t,
                         id: data.id || t.id,
-                        status: data.status || t.status,
+                        status: toCanonicalTaskStatus(data.status || t.status),
                         assigned_to: data.agentId ?? t.assigned_to,
                         status_reason: data.statusReason ?? t.status_reason,
                         priority: data.priority || t.priority,
@@ -63,7 +75,7 @@ export function TaskBoard() {
                     id: String(data.id || `${Date.now()}-${Math.random()}`),
                     title: data.task,
                     assigned_to: data.agentId || '',
-                    status: (data.status || 'backlog') as TaskStatus,
+                    status: toCanonicalTaskStatus(data.status),
                     status_reason: data.statusReason || null,
                     priority: data.priority || 'medium',
                     requires_approval: Boolean(data.requiresApproval)
@@ -78,7 +90,7 @@ export function TaskBoard() {
                 id: String(t.id),
                 title: t.title,
                 assigned_to: t.assigned_to || '',
-                status: (t.status || 'backlog') as TaskStatus,
+                status: toCanonicalTaskStatus(t.status),
                 status_reason: t.status_reason || null,
                 priority: t.priority || 'medium',
                 requires_approval: Boolean(t.requires_approval)
@@ -121,7 +133,7 @@ export function TaskBoard() {
     };
 
     const taskTone = (s: string): 'success' | 'warning' | 'default' => {
-        if (s === 'completed') return 'success';
+        if (s === 'done') return 'success';
         if (s === 'in_progress') return 'warning';
         return 'default';
     };
@@ -177,6 +189,9 @@ export function TaskBoard() {
                         </Toolbar>
                         <Toolbar style={{ marginTop: 3 }}>
                             <Chip tone={taskTone(task.status)}>{task.status.replace('_', ' ')}</Chip>
+                            <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textMuted }}>
+                                next: {(TASK_STATUS_TRANSITIONS[task.status] || []).join(', ') || 'none'}
+                            </div>
                             <div style={{ fontSize: tokens.typography.micro, color: tokens.color.textSecondary }}>
                                 → {task.assigned_to || 'Unassigned'}
                             </div>

@@ -2,11 +2,24 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
 
+type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+
+const LEGACY_TASK_STATUS_MAP: Record<string, TaskStatus> = {
+    pending: 'backlog',
+    completed: 'done'
+};
+
+const toCanonicalTaskStatus = (value: unknown): TaskStatus => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'backlog' || normalized === 'in_progress' || normalized === 'blocked' || normalized === 'review' || normalized === 'done') return normalized;
+    return LEGACY_TASK_STATUS_MAP[normalized] || 'backlog';
+};
+
 interface TaskItem {
     id: number | string;
     title: string;
     assigned_to?: string;
-    status: 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+    status: TaskStatus;
     progress?: number;
 }
 
@@ -59,7 +72,7 @@ export function ProjectProgressPanel() {
                         t.title === data.task
                             ? {
                                 ...t,
-                                status: data.status,
+                                status: toCanonicalTaskStatus(data.status),
                                 assigned_to: data.agentId,
                                 progress: typeof data.progress === 'number' ? data.progress : t.progress
                             }
@@ -70,7 +83,7 @@ export function ProjectProgressPanel() {
                     id: Date.now(),
                     title: data.task,
                     assigned_to: data.agentId,
-                    status: data.status || 'backlog',
+                    status: toCanonicalTaskStatus(data.status),
                     progress: typeof data.progress === 'number' ? data.progress : undefined
                 }];
             });
@@ -83,7 +96,7 @@ export function ProjectProgressPanel() {
                 id: task.id,
                 title: task.title,
                 assigned_to: task.assigned_to || '',
-                status: task.status || 'backlog',
+                status: toCanonicalTaskStatus(task.status),
                 progress: typeof task.progress === 'number' ? task.progress : undefined
             })));
         };

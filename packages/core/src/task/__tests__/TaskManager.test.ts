@@ -14,7 +14,7 @@ describe('TaskManager', () => {
         });
 
         expect(task.id).toBeDefined();
-        expect(task.status).toBe('pending');
+        expect(task.status).toBe('backlog');
 
         manager.assignTask(task.id, 'agent-1');
         const queue = manager.getAgentQueue('agent-1');
