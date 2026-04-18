@@ -1,8 +1,10 @@
 import express from 'express';
 import { Server } from 'colyseus';
 import { createServer } from 'http';
+import { randomUUID } from 'crypto';
 import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
+import { ArtifactStatus, MemoryStore } from './memory/MemoryStore';
 import { OfficeRoom } from './rooms/OfficeRoom';
 import { ExtensionRegistry } from './extensions/registry';
 import { ProjectWorkspace } from './projects/ProjectWorkspace';
