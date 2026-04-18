@@ -6,6 +6,7 @@ import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { randomUUID } from 'crypto';
 import type { InferenceConfig } from '@agent-office/core';
 
 interface HighlightEvent {
@@ -32,6 +33,12 @@ interface CompletedTaskRecord {
     agentName: string;
     completedAt: string;
     summaryPath: string;
+}
+
+interface TaskEvidenceState {
+    artifactExists: boolean;
+    toolExecutionSucceeded: boolean;
+    validatorApproved: boolean;
 }
 
 interface ApprovalRequest {
@@ -160,6 +167,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
+    private taskRecordIds: Map<string, string> = new Map();
     private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
@@ -685,7 +693,7 @@ Paired buddy: Sales Outreach.`,
                 agentState.action = 'work';
 
                 // Persist task
-                this.memoryStore.createTask(title, targetId);
+                this.registerTaskTracking(targetId, title).catch(() => {});
 
                 this.broadcast('chat', {
                     sender: 'System',
@@ -697,9 +705,10 @@ Paired buddy: Sales Outreach.`,
                     agentName: agentState.name,
                     task: title,
                     status: 'in_progress',
+                    statusReason: 'waiting_for_artifact',
+                    progress: 0,
                     fastTrackMode: this.fastTrackMode
                 });
-                this.seedTaskProgress(targetId, title);
             }
         });
 
@@ -1168,7 +1177,7 @@ Paired buddy: Sales Outreach.`,
                             if (targetAgent && targetState) {
                                 targetAgent.currentTask = title;
                                 targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
+                                await this.registerTaskTracking(targetId, title);
 
                                 this.broadcast('chat', {
                                     sender: coreAgent.config.name,
@@ -1179,9 +1188,10 @@ Paired buddy: Sales Outreach.`,
                                     agentName: targetAgent.config.name,
                                     task: title,
                                     status: 'in_progress',
+                                    statusReason: 'waiting_for_artifact',
+                                    progress: 0,
                                     fastTrackMode: this.fastTrackMode
                                 });
-                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1284,6 +1294,14 @@ Paired buddy: Sales Outreach.`,
                                 decision.toolCall.name,
                                 decision.toolCall.params
                             );
+                            const toolAuditLogId = await this.memoryStore.logToolAudit({
+                                actorId: id,
+                                actorRole: coreAgent.config.role || 'agent',
+                                toolName: decision.toolCall.name,
+                                paramsHash: this.memoryStore.hashToolParams(decision.toolCall.params),
+                                result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`
+                            });
+                            await this.captureTaskToolEvidence(id, decision.toolCall.name, decision.toolCall.params, result.success, toolAuditLogId);
 
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
@@ -1515,15 +1533,14 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95
             });
-            this.memoryStore.createTask(task, agentId).catch(() => {});
+            this.registerTaskTracking(agentId, task).catch(() => {});
             this.broadcast('chat', {
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
             });
             this.broadcast('task-update', {
-                agentId, agentName: agent.config.name, task, status: 'in_progress'
+                agentId, agentName: agent.config.name, task, status: 'in_progress', statusReason: 'waiting_for_artifact', progress: 0
             });
-            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -1555,54 +1572,136 @@ Paired buddy: Sales Outreach.`,
         return `${agentId}:${taskTitle}`;
     }
 
-    private seedTaskProgress(agentId: string, taskTitle: string) {
+    private async registerTaskTracking(agentId: string, taskTitle: string): Promise<void> {
         if (!taskTitle) return;
+        const taskId = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!taskId) return;
+        this.taskRecordIds.set(this.progressKey(agentId, taskTitle), taskId);
         this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async getOrCreateTaskRecordId(agentId: string, taskTitle: string): Promise<string | null> {
+        const key = this.progressKey(agentId, taskTitle);
+        const cached = this.taskRecordIds.get(key);
+        if (cached) return cached;
+        const existing = await this.memoryStore.findActiveTask(agentId, taskTitle);
+        if (existing?.id) {
+            this.taskRecordIds.set(key, existing.id);
+            return existing.id;
+        }
+        const created = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!created) return null;
+        this.taskRecordIds.set(key, created);
+        return created;
+    }
+
+    private async captureTaskToolEvidence(agentId: string, toolName: string, params: any, success: boolean, toolAuditLogId: number | null) {
+        const agent = this.coreAgents.get(agentId);
+        const taskTitle = agent?.currentTask;
+        if (!taskTitle || !success) return;
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        await this.memoryStore.addTaskEvidence({
+            id: `tev_${randomUUID()}`,
+            taskId: taskRecordId,
+            agentId,
+            evidenceType: 'tool_execution',
+            toolAuditLogId,
+            metadata: {
+                toolName,
+                params,
+            },
+            createdAt: this.state.officeTime,
+        });
+
+        const artifactPath = String(params?.path || '').trim();
+        if (artifactPath) {
+            await this.memoryStore.addTaskEvidence({
+                id: `tev_${randomUUID()}`,
+                taskId: taskRecordId,
+                agentId,
+                evidenceType: 'artifact',
+                artifactId: String(params?.fileId || ''),
+                artifactPath,
+                metadata: {
+                    source: 'tool_execution',
+                    toolName,
+                },
+                createdAt: this.state.officeTime,
+            });
+        }
+    }
+
+    private async evaluateTaskEvidence(taskId: string): Promise<TaskEvidenceState> {
+        const evidence = await this.memoryStore.getTaskEvidence(taskId);
+        let artifactExists = false;
+        let toolExecutionSucceeded = false;
+        let validatorApproved = false;
+
+        for (const item of evidence) {
+            if (!artifactExists && item.evidenceType === 'artifact' && item.artifactPath) {
+                try {
+                    await stat(this.resolveWorkspacePath(item.artifactPath));
+                    artifactExists = true;
+                } catch {}
+            }
+            if (!toolExecutionSucceeded && item.evidenceType === 'tool_execution' && item.toolAuditLogId) {
+                toolExecutionSucceeded = true;
+            }
+            if (!validatorApproved && item.evidenceType === 'validator' && item.validatorDecision === 'approved') {
+                validatorApproved = true;
+            }
+            if (artifactExists && toolExecutionSucceeded && validatorApproved) break;
+        }
+
+        return { artifactExists, toolExecutionSucceeded, validatorApproved };
+    }
+
+    private taskStatusReason(evidence: TaskEvidenceState): string {
+        if (evidence.validatorApproved) return 'validated';
+        if (evidence.artifactExists || evidence.toolExecutionSucceeded) return 'pending_validation';
+        return 'waiting_for_artifact';
     }
 
     private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
         const taskTitle = agent.currentTask;
         if (!taskTitle) return;
-
         const key = this.progressKey(agentId, taskTitle);
-        const current = this.taskProgress.get(key) ?? 0;
-        const baseWorkDelta = this.fastTrackMode ? 0.45 : 0.2;
-        const baseToolDelta = this.fastTrackMode ? 0.5 : 0.3;
-        const baseTalkDelta = this.fastTrackMode ? 0.02 : 0.08;
-        const delta = action === 'work'
-            ? baseWorkDelta
-            : action === 'use_tool'
-                ? baseToolDelta
-                : action === 'talk'
-                    ? baseTalkDelta
-                    : 0;
-        if (delta <= 0) return;
-
-        const next = Math.min(1, current + delta);
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        const evidence = await this.evaluateTaskEvidence(taskRecordId);
+        const checkpointsPassed = [evidence.artifactExists, evidence.toolExecutionSucceeded, evidence.validatorApproved].filter(Boolean).length;
+        const next = checkpointsPassed / 3;
+        const reason = this.taskStatusReason(evidence);
+        const shouldComplete = checkpointsPassed >= 1;
         this.taskProgress.set(key, next);
+
+        await this.memoryStore.updateTaskStatus({
+            taskId: taskRecordId,
+            status: shouldComplete ? 'done' : 'in_progress',
+            statusReason: reason,
+            progress: next,
+            completed: shouldComplete,
+        });
 
         this.broadcast('task-update', {
             agentId,
             agentName: agent.config.name,
             task: taskTitle,
-            status: next >= 1 ? 'completed' : 'in_progress',
+            status: shouldComplete ? 'done' : 'in_progress',
+            statusReason: reason,
             progress: next,
+            evidence,
+            action,
             fastTrackMode: this.fastTrackMode
         });
 
-        if (next < 1) return;
+        if (!shouldComplete) return;
 
         this.taskProgress.delete(key);
+        this.taskRecordIds.delete(key);
         agent.currentTask = '';
-        agentState.currentTask = '';
-
-        try {
-            const tasks = await this.memoryStore.getTasks();
-            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
-            if (match?.id) await this.memoryStore.completeTask(match.id);
-        } catch {
-            // Best-effort persistence only; task completion is still reflected in broadcast updates.
-        }
+        if (agentState) agentState.currentTask = '';
 
         this.emitHighlight(
             'task',
@@ -1986,6 +2085,27 @@ Paired buddy: Sales Outreach.`,
 
         if (req.fileContext?.fileId) {
             this.memoryStore.updateSharedFileStatus(req.fileContext.fileId, decision, req.id).catch((e) => console.error('updateSharedFileStatus', e));
+            const requester = this.coreAgents.get(req.requestedBy);
+            if (requester?.currentTask) {
+                const taskRecordId = await this.getOrCreateTaskRecordId(req.requestedBy, requester.currentTask);
+                if (taskRecordId) {
+                    await this.memoryStore.addTaskEvidence({
+                        id: `tev_${randomUUID()}`,
+                        taskId: taskRecordId,
+                        agentId: req.requestedBy,
+                        evidenceType: 'validator',
+                        artifactId: req.fileContext.fileId,
+                        artifactPath: req.fileContext.filePath,
+                        validatorDecision: decision,
+                        metadata: {
+                            approvalId: req.id,
+                            requestedAction: req.requestedAction,
+                        },
+                        createdAt: this.state.officeTime,
+                    });
+                    await this.advanceTaskProgress(req.requestedBy, requester, this.state.agents.get(req.requestedBy), 'validation');
+                }
+            }
             this.broadcast('chat', {
                 sender: '📎 File Review',
                 text: `File "${req.fileContext.fileName}" (${req.fileContext.filePath}) was ${decision} by CEO.`
@@ -2011,6 +2131,15 @@ Paired buddy: Sales Outreach.`,
                     this.broadcast('chat', { sender: '🏢 Office', text: `Hiring unblocked for ${req.requestedByName}.` });
                 } else {
                     const result = await this.toolExecutor.execute(req.pending.toolName, req.pending.params);
+                    const toolAuditLogId = await this.memoryStore.logToolAudit({
+                        actorId: req.requestedBy,
+                        actorRole: requester?.config.role || 'agent',
+                        toolName: req.pending.toolName,
+                        paramsHash: this.memoryStore.hashToolParams(req.pending.params),
+                        result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`,
+                        approvalId: req.id,
+                    });
+                    await this.captureTaskToolEvidence(req.requestedBy, req.pending.toolName, req.pending.params, result.success, toolAuditLogId);
                     this.broadcast('chat', {
                         sender: req.requestedByName,
                         text: `🔧 (post-approval) [${req.pending.toolName}]: ${result.success ? result.output.slice(0, 100) : result.error}`
@@ -2201,11 +2330,10 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95,
             });
-            this.memoryStore.createTask(a.task, a.id).catch(() => {});
+            this.registerTaskTracking(a.id, a.task).catch(() => {});
             this.broadcast('task-update', {
-                agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
+                agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress', statusReason: 'waiting_for_artifact', progress: 0
             });
-            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)

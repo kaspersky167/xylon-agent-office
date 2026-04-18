@@ -1,6 +1,7 @@
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
 import { MemoryEntry } from "@agent-office/core";
+import { createHash, randomUUID } from "crypto";
 
 export type SharedFileStatus =
   | "draft"
@@ -16,6 +17,19 @@ export interface ToolAuditRecord {
   paramsHash: string;
   result: string;
   approvalId?: string | null;
+  createdAt?: string;
+}
+
+export interface TaskEvidenceRecord {
+  id: string;
+  taskId: string;
+  agentId: string;
+  evidenceType: "artifact" | "tool_execution" | "validator";
+  artifactId?: string | null;
+  artifactPath?: string | null;
+  toolAuditLogId?: number | null;
+  validatorDecision?: "approved" | "rejected" | "pending" | null;
+  metadata?: Record<string, unknown> | null;
   createdAt?: string;
 }
 
@@ -108,10 +122,27 @@ export class MemoryStore {
                 requires_approval INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL DEFAULT 'system',
                 status_reason TEXT,
+                progress REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now')),
                 completed_at TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_tasks_assignment ON tasks(assigned_to, status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS task_evidence (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                artifact_id TEXT,
+                artifact_path TEXT,
+                tool_audit_log_id INTEGER,
+                validator_decision TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_evidence_task ON task_evidence(task_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_task_evidence_agent ON task_evidence(agent_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS office_layout (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,11 +272,8 @@ export class MemoryStore {
       );
     } catch {}
     try {
-      await this.db.exec("ALTER TABLE artifacts ADD COLUMN checksum TEXT");
-    } catch {}
-    try {
       await this.db.exec(
-        "ALTER TABLE artifacts ADD COLUMN exists_on_disk INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE tasks ADD COLUMN progress REAL NOT NULL DEFAULT 0",
       );
     } catch {}
 
@@ -354,13 +382,15 @@ export class MemoryStore {
     }));
   }
 
-  async createTask(title: string, assignedTo?: string): Promise<number> {
-    if (!this.db) return -1;
+  async createTask(title: string, assignedTo?: string): Promise<string> {
+    if (!this.db) return "";
+    const id = `task_${randomUUID()}`;
     const result = await this.db.run(
-      "INSERT INTO tasks (title, assigned_to) VALUES (?, ?)",
-      [title, assignedTo || null],
+      "INSERT INTO tasks (id, title, assigned_to, status, status_reason, progress) VALUES (?, ?, ?, 'in_progress', 'pending_evidence', 0)",
+      [id, title, assignedTo || null],
     );
-    return result.lastID || -1;
+    if (!result?.changes) return "";
+    return id;
   }
 
   async getTasks(): Promise<any[]> {
@@ -376,12 +406,107 @@ export class MemoryStore {
     );
   }
 
-  async completeTask(taskId: number): Promise<void> {
+  async completeTask(taskId: string): Promise<void> {
     if (!this.db) return;
     await this.db.run(
-      "UPDATE tasks SET status = 'completed', completed_at = datetime('now') WHERE id = ?",
+      "UPDATE tasks SET status = 'done', status_reason = 'validated', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
       [taskId],
     );
+  }
+
+  async updateTaskStatus(input: {
+    taskId: string;
+    status: TaskStatus;
+    statusReason?: string | null;
+    progress?: number;
+    completed?: boolean;
+  }): Promise<void> {
+    if (!this.db) return;
+    const progress = Number.isFinite(input.progress)
+      ? Math.max(0, Math.min(1, Number(input.progress)))
+      : null;
+    await this.db.run(
+      `UPDATE tasks
+       SET status = ?,
+           status_reason = ?,
+           progress = COALESCE(?, progress),
+           completed_at = CASE WHEN ? = 1 THEN datetime('now') ELSE completed_at END,
+           updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        input.status,
+        input.statusReason || null,
+        progress,
+        input.completed ? 1 : 0,
+        input.taskId,
+      ],
+    );
+  }
+
+  async findActiveTask(assignedTo: string, title: string): Promise<any | null> {
+    if (!this.db) return null;
+    return this.db.get(
+      `SELECT *
+       FROM tasks
+       WHERE assigned_to = ?
+         AND title = ?
+         AND status != 'done'
+       ORDER BY datetime(updated_at) DESC
+       LIMIT 1`,
+      [assignedTo, title],
+    );
+  }
+
+  async addTaskEvidence(input: TaskEvidenceRecord): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      `INSERT INTO task_evidence
+       (id, task_id, agent_id, evidence_type, artifact_id, artifact_path, tool_audit_log_id, validator_decision, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        input.id,
+        input.taskId,
+        input.agentId,
+        input.evidenceType,
+        input.artifactId || null,
+        input.artifactPath || null,
+        input.toolAuditLogId ?? null,
+        input.validatorDecision || null,
+        input.metadata ? JSON.stringify(input.metadata) : null,
+        input.createdAt || new Date().toISOString(),
+      ],
+    );
+  }
+
+  async getTaskEvidence(taskId: string): Promise<TaskEvidenceRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM task_evidence WHERE task_id = ? ORDER BY datetime(created_at) DESC",
+      [taskId],
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      taskId: row.task_id,
+      agentId: row.agent_id,
+      evidenceType: row.evidence_type,
+      artifactId: row.artifact_id || null,
+      artifactPath: row.artifact_path || null,
+      toolAuditLogId:
+        typeof row.tool_audit_log_id === "number" ? row.tool_audit_log_id : null,
+      validatorDecision: row.validator_decision || null,
+      metadata: row.metadata ? JSON.parse(row.metadata) : null,
+      createdAt: row.created_at,
+    }));
+  }
+
+  hashToolParams(params: any): string {
+    try {
+      return createHash("sha256")
+        .update(JSON.stringify(params ?? {}))
+        .digest("hex");
+    } catch {
+      return createHash("sha256").update(String(params)).digest("hex");
+    }
   }
 
   async saveLayout(name: string, layoutJson: string): Promise<void> {
@@ -635,9 +760,9 @@ export class MemoryStore {
     );
   }
 
-  async logToolAudit(input: ToolAuditRecord): Promise<void> {
-    if (!this.db) return;
-    await this.db.run(
+  async logToolAudit(input: ToolAuditRecord): Promise<number | null> {
+    if (!this.db) return null;
+    const result = await this.db.run(
       `INSERT INTO tool_audit_logs
              (actor_id, actor_role, tool_name, params_hash, result, approval_id)
              VALUES (?, ?, ?, ?, ?, ?)`,
@@ -650,6 +775,7 @@ export class MemoryStore {
         input.approvalId || null,
       ],
     );
+    return typeof result?.lastID === "number" ? result.lastID : null;
   }
 
   async upsertArtifact(
