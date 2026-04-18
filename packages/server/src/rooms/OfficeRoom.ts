@@ -5,8 +5,9 @@ import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
-import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { readFile, stat, mkdir, writeFile, readdir } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
+import { createHash } from 'crypto';
 
 interface HighlightEvent {
     type: string;
@@ -32,6 +33,16 @@ interface CompletedTaskRecord {
     agentName: string;
     completedAt: string;
     summaryPath: string;
+}
+
+interface ProjectContextPayload {
+    projectSlug: string;
+    projectBrief: string;
+    acceptanceCriteria: string[];
+    activeTask: string;
+    recentReviewNotes: string[];
+    artifactIndexSummary: string;
+    contextHash: string;
 }
 
 interface ApprovalRequest {
@@ -143,6 +154,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
     private mailMessages: MailMessage[] = [];
+    private currentProjectSlug = 'xylon';
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -177,6 +189,136 @@ export class OfficeRoom extends Room<OfficeState> {
             throw new Error('Invalid workspace file path.');
         }
         return fullPath;
+    }
+
+    private projectRoot(projectSlug: string): string {
+        return path.join(this.workspaceRoot, 'projects', projectSlug);
+    }
+
+    private async safeReadWorkspaceText(relativePath: string): Promise<string> {
+        try {
+            const absolutePath = this.resolveWorkspacePath(relativePath);
+            const content = await readFile(absolutePath, 'utf-8');
+            return content.trim();
+        } catch {
+            return '';
+        }
+    }
+
+    private summarizeArtifactPath(filePath: string): string {
+        const normalized = filePath.replace(/\\/g, '/');
+        const parts = normalized.split('/').filter(Boolean);
+        return parts.slice(-2).join('/');
+    }
+
+    private async buildProjectContext(agentId: string, activeTask: string): Promise<ProjectContextPayload> {
+        const projectSlug = this.currentProjectSlug || 'default';
+        const projectRoot = this.projectRoot(projectSlug);
+        const briefRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'project-brief.md'));
+        const criteriaRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'acceptance-criteria.md'));
+        const artifactIndexRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'artifact-index.md'));
+
+        const taskRows = await this.memoryStore.getTasks();
+        const activeTaskRow = taskRows.find((task) =>
+            task.assigned_to === agentId &&
+            ['in_progress', 'review', 'blocked', 'backlog'].includes(String(task.status || '').toLowerCase())
+        );
+
+        const reviewFromDb = taskRows
+            .filter((task) => task.assigned_to === agentId && String(task.status || '').toLowerCase() === 'review')
+            .slice(0, 4)
+            .map((task) => task.status_reason || `Task "${task.title}" is pending review.`);
+
+        const globalMemories = await this.memoryStore.loadMemories('agency:global', 40);
+        const reviewFromMemories = globalMemories
+            .filter((entry) => /\breview|revision|rework|acceptance\b/i.test(entry.content))
+            .slice(0, 4)
+            .map((entry) => entry.content);
+
+        let artifactSummary = artifactIndexRaw;
+        if (!artifactSummary) {
+            const artifactsDir = path.join(projectRoot, 'artifacts');
+            try {
+                const items = await readdir(artifactsDir);
+                artifactSummary = items.slice(0, 12).map((item) => `- ${item}`).join('\n');
+            } catch {
+                artifactSummary = '';
+            }
+        }
+        if (!artifactSummary && this.completedTasks.length > 0) {
+            artifactSummary = this.completedTasks
+                .slice(0, 8)
+                .map((item) => `- ${item.task} (${this.summarizeArtifactPath(item.summaryPath)})`)
+                .join('\n');
+        }
+
+        const acceptanceCriteria = criteriaRaw
+            ? criteriaRaw.split('\n').map((line) => line.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 8)
+            : ['Deliver outputs directly relevant to the active project brief and assigned task.'];
+
+        const projectBrief = briefRaw || `Project "${projectSlug}" is active. Use assigned task + acceptance criteria only.`;
+        const resolvedActiveTask = activeTaskRow?.title || activeTask || 'No active task assigned.';
+        const recentReviewNotes = [...reviewFromDb, ...reviewFromMemories].slice(0, 6);
+        const contextHash = createHash('sha256').update(JSON.stringify({
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactSummary
+        })).digest('hex');
+
+        return {
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactIndexSummary: artifactSummary || 'No project artifacts indexed yet.',
+            contextHash
+        };
+    }
+
+    private async persistProjectContextAudit(agentId: string, context: ProjectContextPayload): Promise<void> {
+        const logDir = this.resolveWorkspacePath(path.posix.join('projects', context.projectSlug, 'logs'));
+        await mkdir(logDir, { recursive: true });
+        const logPath = path.join(logDir, `${agentId}.jsonl`);
+        const row = JSON.stringify({
+            time: this.state.officeTime || new Date().toISOString(),
+            sessionId: this.sessionId,
+            agentId,
+            contextHash: context.contextHash,
+            activeTask: context.activeTask
+        });
+        await writeFile(logPath, `${row}\n`, { encoding: 'utf-8', flag: 'a' });
+    }
+
+    private decisionReferencesProjectContext(decision: any, context: ProjectContextPayload): boolean {
+        const payload = JSON.stringify({
+            thought: decision?.thought || '',
+            target: decision?.target || '',
+            message: decision?.message || '',
+            toolCall: decision?.toolCall || {}
+        }).toLowerCase();
+
+        const tokens = [
+            context.projectSlug.toLowerCase(),
+            ...context.activeTask.toLowerCase().split(/\W+/).filter((token) => token.length > 3).slice(0, 8),
+            ...context.acceptanceCriteria.join(' ').toLowerCase().split(/\W+/).filter((token) => token.length > 5).slice(0, 6)
+        ];
+
+        return tokens.some((token) => token && payload.includes(token));
+    }
+
+    private async routeTaskBackToReview(agentId: string, reason: string, taskTitle: string) {
+        await this.memoryStore.upsertTaskStatusByTitle(agentId, taskTitle, 'review', reason);
+        this.broadcast('task-update', {
+            agentId,
+            agentName: this.coreAgents.get(agentId)?.config.name || agentId,
+            task: taskTitle,
+            status: 'review',
+            reason
+        });
     }
 
     private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
@@ -1060,18 +1202,37 @@ Paired buddy: Sales Outreach.`,
                     }
                 });
 
-                coreAgent.think({
-                    time: this.state.officeTime,
-                    location: `${agentState.x},${agentState.y}`,
-                    nearbyAgents,
-                    currentTask: coreAgent.currentTask || null,
-                    recentMessages: coreAgent.getUnreadMessages(),
-                    memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision: any) => {
+                (async () => {
+                    const projectContext = await this.buildProjectContext(id, coreAgent.currentTask || '');
+                    await this.persistProjectContextAudit(id, projectContext);
+
+                    return coreAgent.think({
+                        time: this.state.officeTime,
+                        location: `${agentState.x},${agentState.y}`,
+                        nearbyAgents,
+                        currentTask: coreAgent.currentTask || null,
+                        recentMessages: coreAgent.getUnreadMessages(),
+                        memories: coreAgent.getRecentMemories(5),
+                        projectContext
+                    }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
                         agentState.thought = decision.thought;
+                    }
+
+                    if (coreAgent.currentTask && !this.decisionReferencesProjectContext(decision, projectContext)) {
+                        const reason = 'Guardrail: output did not reference active project/task context.';
+                        await this.routeTaskBackToReview(id, reason, coreAgent.currentTask);
+                        coreAgent.addMemory({
+                            content: `${reason} Routed "${coreAgent.currentTask}" to review.`,
+                            type: 'task_result',
+                            timestamp: this.state.officeTime,
+                            importance: 0.9
+                        });
+                        agentState.action = 'idle';
+                        setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                        return;
                     }
 
                     // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
@@ -1316,6 +1477,10 @@ Paired buddy: Sales Outreach.`,
                     console.error(`Agent ${id} think error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
+                })().catch((err) => {
+                    console.error(`Agent ${id} project-context error:`, err);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                });
             }
         });
 
@@ -1440,6 +1605,7 @@ Paired buddy: Sales Outreach.`,
             // /project xylon  → kicks off the Xylon Growth Sprint (ACME) scenario
             const which = (argStr || 'xylon').toLowerCase();
             if (which.startsWith('xylon') || which.startsWith('acme') || which === '') {
+                this.currentProjectSlug = 'xylon';
                 this.currentScenario = 'Xylon Growth Sprint';
                 this.applyScenarioKickoff('Xylon Growth Sprint');
             } else {
@@ -2085,6 +2251,7 @@ Paired buddy: Sales Outreach.`,
     // the lead, and a Statement of Work. Running this scenario exercises the
     // exact muscles the real company uses to win work.
     private kickoffXylonGrowthSprint() {
+        this.currentProjectSlug = 'xylon';
         const project = 'ACME Manufacturing — M365 Copilot rollout + oversharing remediation + landing page + SOW';
         const brief = [
             `NEW PROJECT: ${project}.`,

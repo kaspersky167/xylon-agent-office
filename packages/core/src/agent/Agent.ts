@@ -3,6 +3,16 @@ import { InferenceAdapter } from './InferenceAdapter';
 
 export type AgentStateStatus = 'IDLE' | 'PERCEIVING' | 'THINKING' | 'ACTING' | 'COMMUNICATING';
 
+export interface ProjectContextPayload {
+    projectSlug: string;
+    projectBrief: string;
+    acceptanceCriteria: string[];
+    activeTask: string;
+    recentReviewNotes: string[];
+    artifactIndexSummary: string;
+    contextHash?: string;
+}
+
 export interface Perception {
     time: string;
     location: string;
@@ -10,6 +20,7 @@ export interface Perception {
     currentTask: any | null;
     recentMessages: ConversationMessage[];
     memories: string[];
+    projectContext?: ProjectContextPayload | null;
 }
 
 export interface Decision {
@@ -113,6 +124,43 @@ export class Agent {
         this.memories = entries;
     }
 
+    private buildProjectContractSection(projectContext?: ProjectContextPayload | null): string {
+        if (!projectContext) return '';
+
+        const criteria = projectContext.acceptanceCriteria.length > 0
+            ? projectContext.acceptanceCriteria.map((item, index) => `${index + 1}. ${item}`).join('\n')
+            : '1. Use project brief and active task to produce directly relevant output.';
+
+        const notes = projectContext.recentReviewNotes.length > 0
+            ? projectContext.recentReviewNotes.map((note) => `- ${note}`).join('\n')
+            : '- No recent review notes.';
+
+        return `
+PROJECT CONTRACT (MANDATORY):
+Project: ${projectContext.projectSlug}
+Context hash: ${projectContext.contextHash || 'n/a'}
+Project brief:
+${projectContext.projectBrief}
+
+Acceptance criteria:
+${criteria}
+
+Active task:
+${projectContext.activeTask}
+
+Recent review notes:
+${notes}
+
+Artifact index summary:
+${projectContext.artifactIndexSummary}
+
+NON-OPTIONAL CONSTRAINTS:
+- Do not produce output unrelated to the project brief, acceptance criteria, and active task.
+- Your decision must explicitly reference task/project context in thought, message, target, or tool params.
+- If context is missing, ask for clarification instead of hallucinating scope.
+`;
+    }
+
     // --- Core Think Cycle ---
 
     async think(perception: Perception): Promise<Decision> {
@@ -141,6 +189,8 @@ export class Agent {
                 ? `Your assigned task: ${JSON.stringify(perception.currentTask)}`
                 : 'No task assigned yet.';
 
+            const projectContractSection = this.buildProjectContractSection(perception.projectContext);
+
             const prompt = `You are ${this.config.name}, a ${this.config.role} in a virtual office.
 Personality: ${this.config.personality.communicationStyle} style. Traits: ${JSON.stringify(this.config.personality.traits)}.
 System: ${this.config.inference.systemPrompt}
@@ -150,6 +200,7 @@ ${nearbyStr}
 ${taskStr}
 ${messageStr}
 ${memoryStr}
+${projectContractSection}
 
 You must decide your next action. Reply ONLY with a JSON object:
 {

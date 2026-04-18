@@ -342,6 +342,33 @@ export class MemoryStore {
     );
   }
 
+  async upsertTaskStatusByTitle(
+    assignedTo: string,
+    title: string,
+    status: TaskStatus,
+    reason?: string,
+  ): Promise<void> {
+    if (!this.db || !title?.trim()) return;
+    const existing = await this.db.get(
+      "SELECT id FROM tasks WHERE assigned_to = ? AND title = ? ORDER BY updated_at DESC LIMIT 1",
+      [assignedTo, title],
+    );
+
+    if (existing?.id) {
+      await this.db.run(
+        "UPDATE tasks SET status = ?, status_reason = ?, updated_at = datetime('now') WHERE id = ?",
+        [status, reason || null, existing.id],
+      );
+      return;
+    }
+
+    const newId = `${Date.now()}_${Math.floor(Math.random() * 1_000_000)}`;
+    await this.db.run(
+      "INSERT INTO tasks (id, title, assigned_to, status, status_reason, created_by) VALUES (?, ?, ?, ?, ?, ?)",
+      [newId, title, assignedTo, status, reason || null, 'system:guardrail'],
+    );
+  }
+
   async saveLayout(name: string, layoutJson: string): Promise<void> {
     if (!this.db) return;
     const existing = await this.db.get(
