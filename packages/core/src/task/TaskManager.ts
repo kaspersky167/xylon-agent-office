@@ -1,3 +1,9 @@
+import {
+    TaskStatus,
+    toCanonicalTaskStatus,
+    validateTaskStatusTransition
+} from './status';
+
 export interface Deliverable {
     type: string;
     url?: string;
@@ -15,7 +21,7 @@ export interface Task {
     dependencies: string[];      // Task IDs
     creator?: string;            // Agent ID
     assignee?: string;           // Agent ID
-    status: 'pending' | 'in_progress' | 'blocked' | 'completed';
+    status: TaskStatus;
     deliverable?: Deliverable;
 }
 
@@ -30,7 +36,7 @@ export class TaskManager {
         const newTask: Task = {
             ...task,
             id: this.generateId(),
-            status: 'pending',
+            status: 'backlog',
         };
         this.tasks.set(newTask.id, newTask);
         return newTask;
@@ -40,7 +46,7 @@ export class TaskManager {
         const task = this.tasks.get(taskId);
         if (task) {
             task.assignee = agentId;
-            if (task.status === 'pending') {
+            if (task.status === 'backlog') {
                 task.status = 'in_progress';
             }
         }
@@ -57,9 +63,13 @@ export class TaskManager {
 
     public updateTaskStatus(taskId: string, status: Task['status']): void {
         const task = this.tasks.get(taskId);
-        if (task) {
-            task.status = status;
+        if (!task) return;
+        const normalizedStatus = toCanonicalTaskStatus(status);
+        const validation = validateTaskStatusTransition(task.status, normalizedStatus);
+        if (!validation.valid) {
+            throw new Error(validation.reason);
         }
+        task.status = normalizedStatus;
     }
 
     public getTask(taskId: string): Task | undefined {
@@ -71,6 +81,6 @@ export class TaskManager {
         if (!task) return false;
 
         // Abstract hook for future LLM-based evaluation
-        return task.status === 'completed';
+        return task.status === 'done';
     }
 }

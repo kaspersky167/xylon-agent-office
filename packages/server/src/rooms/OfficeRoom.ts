@@ -1,6 +1,6 @@
 import { Room, Client } from 'colyseus';
 import { OfficeState } from '../schema/OfficeState';
-import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
+import { Agent, Office, OfficeConfig, ConversationMessage, TaskStatus, toCanonicalTaskStatus, validateTaskStatusTransition } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
@@ -670,7 +670,7 @@ Paired buddy: Sales Outreach.`,
                     text: `📋 Task "${title}" assigned to ${agentState.name}`
                 });
 
-                this.broadcast('task-update', {
+                this.emitCanonicalTaskUpdate({
                     agentId: targetId,
                     agentName: agentState.name,
                     task: title,
@@ -1152,7 +1152,7 @@ Paired buddy: Sales Outreach.`,
                                     sender: coreAgent.config.name,
                                     text: `📋 Created task "${title}" for ${targetAgent.config.name}`
                                 });
-                                this.broadcast('task-update', {
+                                this.emitCanonicalTaskUpdate({
                                     agentId: targetId,
                                     agentName: targetAgent.config.name,
                                     task: title,
@@ -1498,7 +1498,7 @@ Paired buddy: Sales Outreach.`,
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
             });
-            this.broadcast('task-update', {
+            this.emitCanonicalTaskUpdate({
                 agentId, agentName: agent.config.name, task, status: 'in_progress'
             });
             this.seedTaskProgress(agentId, task);
@@ -1509,6 +1509,49 @@ Paired buddy: Sales Outreach.`,
         this.broadcast('chat', { sender: '🏢 Office', text: `Unknown command: ${cmdRaw}` });
         help();
         return true;
+    }
+
+
+    private normalizeTaskStatus(rawStatus: unknown): TaskStatus {
+        return toCanonicalTaskStatus(rawStatus);
+    }
+
+    private emitCanonicalTaskUpdate(payload: {
+        agentId?: string;
+        agentName?: string;
+        task: string;
+        status?: unknown;
+        progress?: number;
+        fastTrackMode?: boolean;
+        statusReason?: string;
+        id?: string | number;
+        priority?: string;
+        requiresApproval?: boolean;
+        assigned_to?: string;
+    }) {
+        const canonicalStatus = this.normalizeTaskStatus(payload.status);
+        this.broadcast('task-update', {
+            ...payload,
+            status: canonicalStatus,
+        });
+    }
+
+    private validateAndNormalizeTaskTransition(params: {
+        from: unknown;
+        to: unknown;
+        context: string;
+    }): { ok: true; status: TaskStatus } | { ok: false; status: TaskStatus; reason: string } {
+        const from = this.normalizeTaskStatus(params.from);
+        const to = this.normalizeTaskStatus(params.to);
+        const validation = validateTaskStatusTransition(from, to);
+        if (!validation.valid) {
+            return {
+                ok: false,
+                status: from,
+                reason: `${validation.reason} Context: ${params.context}.`,
+            };
+        }
+        return { ok: true, status: to };
     }
 
     private resolveAgentHandle(handle: string): string | null {
@@ -1559,11 +1602,36 @@ Paired buddy: Sales Outreach.`,
         const next = Math.min(1, current + delta);
         this.taskProgress.set(key, next);
 
-        this.broadcast('task-update', {
+        const currentTaskStatus: TaskStatus = 'in_progress';
+        const proposedStatus: TaskStatus = next >= 1 ? 'done' : 'in_progress';
+        const transition = this.validateAndNormalizeTaskTransition({
+            from: currentTaskStatus,
+            to: proposedStatus,
+            context: `advanceTaskProgress:${agentId}:${taskTitle}`
+        });
+
+        if (!transition.ok) {
+            this.emitCanonicalTaskUpdate({
+                agentId,
+                agentName: agent.config.name,
+                task: taskTitle,
+                status: transition.status,
+                progress: next,
+                fastTrackMode: this.fastTrackMode,
+                statusReason: transition.reason,
+            });
+            this.broadcast('chat', {
+                sender: '⚠️ Task Guard',
+                text: transition.reason,
+            });
+            return;
+        }
+
+        this.emitCanonicalTaskUpdate({
             agentId,
             agentName: agent.config.name,
             task: taskTitle,
-            status: next >= 1 ? 'completed' : 'in_progress',
+            status: transition.status,
             progress: next,
             fastTrackMode: this.fastTrackMode
         });
@@ -1576,7 +1644,7 @@ Paired buddy: Sales Outreach.`,
 
         try {
             const tasks = await this.memoryStore.getTasks();
-            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
+            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'done');
             if (match?.id) await this.memoryStore.completeTask(match.id);
         } catch {
             // Best-effort persistence only; task completion is still reflected in broadcast updates.
@@ -2180,7 +2248,7 @@ Paired buddy: Sales Outreach.`,
                 importance: 0.95,
             });
             this.memoryStore.createTask(a.task, a.id).catch(() => {});
-            this.broadcast('task-update', {
+            this.emitCanonicalTaskUpdate({
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
             this.seedTaskProgress(a.id, a.task);
@@ -2408,7 +2476,10 @@ Paired buddy: Sales Outreach.`,
         console.log(client.sessionId, "joined the office room!");
         // Send existing tasks to newly joined client
         this.memoryStore.getTasks().then(tasks => {
-            client.send('tasks-sync', tasks);
+            client.send('tasks-sync', tasks.map((task: any) => ({
+                ...task,
+                status: this.normalizeTaskStatus(task.status),
+            })));
         });
         client.send('relationship-update', this.buildRelationshipPayload());
         client.send('fast-track-state', { enabled: this.fastTrackMode });

@@ -2,6 +2,19 @@ import React, { createContext, useContext, useEffect, useMemo, useReducer } from
 import { eventBus } from '../events';
 import { getColyseusRoom } from '../game/Game';
 
+type TaskStatus = 'backlog' | 'in_progress' | 'blocked' | 'review' | 'done';
+
+const LEGACY_TASK_STATUS_MAP: Record<string, TaskStatus> = {
+    pending: 'backlog',
+    completed: 'done'
+};
+
+const toCanonicalTaskStatus = (value: unknown): TaskStatus => {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'backlog' || normalized === 'in_progress' || normalized === 'blocked' || normalized === 'review' || normalized === 'done') return normalized;
+    return LEGACY_TASK_STATUS_MAP[normalized] || 'backlog';
+};
+
 export type PanelKey =
     | 'desktop'
     | 'advanced'
@@ -20,7 +33,7 @@ export interface TaskItem {
     id: number | string;
     title: string;
     assigned_to?: string;
-    status: string;
+    status: TaskStatus;
     progress?: number;
 }
 
@@ -45,7 +58,7 @@ export interface AgentSnapshot {
     id: string;
     name: string;
     role: string;
-    status: string;
+    status: TaskStatus;
     currentTask: string;
     mood: number;
     reputation: number;
@@ -58,7 +71,7 @@ type UIState = {
     agents: Record<string, AgentSnapshot>;
     panelVisibility: Record<PanelKey, boolean>;
     filters: {
-        taskStatus: 'all' | 'pending' | 'in_progress' | 'completed';
+        taskStatus: 'all' | TaskStatus;
         search: string;
         approvalsOnly: boolean;
     };
@@ -217,7 +230,7 @@ export function UIStoreProvider({ children }: { children: React.ReactNode }) {
                     id: data.id || Date.now(),
                     title: data.task,
                     assigned_to: data.agentId,
-                    status: data.status || 'pending',
+                    status: toCanonicalTaskStatus(data.status),
                     progress: typeof data.progress === 'number' ? data.progress : undefined
                 }
             });
@@ -232,7 +245,7 @@ export function UIStoreProvider({ children }: { children: React.ReactNode }) {
                     id: task.id,
                     title: task.title,
                     assigned_to: task.assigned_to || '',
-                    status: task.status || 'pending',
+                    status: toCanonicalTaskStatus(task.status),
                     progress: typeof task.progress === 'number' ? task.progress : undefined
                 }))
             });
