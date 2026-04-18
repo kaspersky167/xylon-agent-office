@@ -19,6 +19,19 @@ export interface ToolAuditRecord {
   createdAt?: string;
 }
 
+export interface TaskEvidenceRecord {
+  id: string;
+  taskId: string;
+  agentId: string;
+  evidenceType: "artifact" | "tool_execution" | "validator";
+  artifactId?: string | null;
+  artifactPath?: string | null;
+  toolAuditLogId?: number | null;
+  validatorDecision?: "approved" | "rejected" | "pending" | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string;
+}
+
 export interface SharedFileRecord {
   id: string;
   path: string;
@@ -31,6 +44,23 @@ export interface SharedFileRecord {
   createdAt?: string;
   updatedAt?: string;
   approvalRequestId?: string | null;
+}
+
+export type ArtifactStatus = "draft" | "submitted" | "validated" | "rejected";
+
+export interface ArtifactRecord {
+  id: string;
+  projectId: string;
+  taskId?: string | null;
+  agentId?: string | null;
+  relativePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  status: ArtifactStatus;
+  checksum?: string | null;
+  existsOnDisk?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
@@ -90,10 +120,27 @@ export class MemoryStore {
                 requires_approval INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL DEFAULT 'system',
                 status_reason TEXT,
+                progress REAL NOT NULL DEFAULT 0,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now')),
                 completed_at TEXT
             );
+            CREATE INDEX IF NOT EXISTS idx_tasks_assignment ON tasks(assigned_to, status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS task_evidence (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                evidence_type TEXT NOT NULL,
+                artifact_id TEXT,
+                artifact_path TEXT,
+                tool_audit_log_id INTEGER,
+                validator_decision TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_evidence_task ON task_evidence(task_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_task_evidence_agent ON task_evidence(agent_id, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS office_layout (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +205,20 @@ export class MemoryStore {
             );
             CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_actor ON tool_audit_logs(actor_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_tool_audit_logs_tool ON tool_audit_logs(tool_name, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                artifact_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                notes TEXT,
+                reviewer TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reviews_artifact ON reviews(artifact_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at DESC);
         `);
 
     try {
@@ -203,6 +264,11 @@ export class MemoryStore {
     try {
       await this.db.exec(
         "ALTER TABLE shared_files ADD COLUMN created_at TEXT DEFAULT (datetime('now'))",
+      );
+    } catch {}
+    try {
+      await this.db.exec(
+        "ALTER TABLE tasks ADD COLUMN progress REAL NOT NULL DEFAULT 0",
       );
     } catch {}
 
@@ -327,13 +393,15 @@ export class MemoryStore {
     }));
   }
 
-  async createTask(title: string, assignedTo?: string): Promise<number> {
-    if (!this.db) return -1;
+  async createTask(title: string, assignedTo?: string): Promise<string> {
+    if (!this.db) return "";
+    const id = `task_${randomUUID()}`;
     const result = await this.db.run(
-      "INSERT INTO tasks (title, assigned_to) VALUES (?, ?)",
-      [title, assignedTo || null],
+      "INSERT INTO tasks (id, title, assigned_to, status, status_reason, progress) VALUES (?, ?, ?, 'in_progress', 'pending_evidence', 0)",
+      [id, title, assignedTo || null],
     );
-    return result.lastID || -1;
+    if (!result?.changes) return "";
+    return id;
   }
 
   async getTasks(): Promise<any[]> {
@@ -353,11 +421,34 @@ export class MemoryStore {
     );
   }
 
-  async completeTask(taskId: number): Promise<void> {
+  async completeTask(taskId: string): Promise<void> {
     if (!this.db) return;
     await this.db.run(
       "UPDATE tasks SET status = 'done', completed_at = datetime('now') WHERE id = ?",
       [taskId],
+    );
+  }
+
+  async updateTaskStatus(
+    taskId: string | number,
+    status: TaskStatus,
+    statusReason?: string | null,
+  ): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      "UPDATE tasks SET status = ?, status_reason = ?, updated_at = datetime('now'), completed_at = CASE WHEN ? = 'done' THEN datetime('now') ELSE completed_at END WHERE id = ?",
+      [status, statusReason || null, status, String(taskId)],
+    );
+  }
+
+  async findMostRecentTaskByTitleAndAssignee(
+    title: string,
+    assignee: string,
+  ): Promise<any | null> {
+    if (!this.db) return null;
+    return this.db.get(
+      "SELECT * FROM tasks WHERE title = ? AND assigned_to = ? ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+      [title, assignee],
     );
   }
 
@@ -612,9 +703,9 @@ export class MemoryStore {
     );
   }
 
-  async logToolAudit(input: ToolAuditRecord): Promise<void> {
-    if (!this.db) return;
-    await this.db.run(
+  async logToolAudit(input: ToolAuditRecord): Promise<number | null> {
+    if (!this.db) return null;
+    const result = await this.db.run(
       `INSERT INTO tool_audit_logs
              (actor_id, actor_role, tool_name, params_hash, result, approval_id)
              VALUES (?, ?, ?, ?, ?, ?)`,
@@ -627,6 +718,155 @@ export class MemoryStore {
         input.approvalId || null,
       ],
     );
+    return typeof result?.lastID === "number" ? result.lastID : null;
+  }
+
+  async upsertArtifact(
+    artifact: Omit<ArtifactRecord, "createdAt" | "updatedAt"> & {
+      createdAt?: string;
+      updatedAt?: string;
+    },
+  ): Promise<void> {
+    if (!this.db) return;
+    const now = new Date().toISOString();
+    const createdAt = artifact.createdAt || now;
+    const updatedAt = artifact.updatedAt || now;
+    await this.db.run(
+      `INSERT INTO artifacts
+             (id, project_id, task_id, agent_id, relative_path, mime_type, size_bytes, status, checksum, exists_on_disk, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(relative_path) DO UPDATE SET
+               id = excluded.id,
+               project_id = excluded.project_id,
+               task_id = excluded.task_id,
+               agent_id = excluded.agent_id,
+               mime_type = excluded.mime_type,
+               size_bytes = excluded.size_bytes,
+               status = excluded.status,
+               checksum = excluded.checksum,
+               exists_on_disk = excluded.exists_on_disk,
+               updated_at = excluded.updated_at`,
+      [
+        artifact.id,
+        artifact.projectId,
+        artifact.taskId || null,
+        artifact.agentId || null,
+        artifact.relativePath,
+        artifact.mimeType,
+        Number(artifact.sizeBytes || 0),
+        artifact.status,
+        artifact.checksum || null,
+        artifact.existsOnDisk ? 1 : 0,
+        createdAt,
+        updatedAt,
+      ],
+    );
+  }
+
+  async listArtifacts(filter?: {
+    projectId?: string;
+    taskId?: string;
+    agentId?: string;
+    status?: ArtifactStatus;
+    existsOnDisk?: boolean;
+    limit?: number;
+  }): Promise<ArtifactRecord[]> {
+    if (!this.db) return [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (filter?.projectId) {
+      clauses.push("project_id = ?");
+      params.push(filter.projectId);
+    }
+    if (filter?.taskId) {
+      clauses.push("task_id = ?");
+      params.push(filter.taskId);
+    }
+    if (filter?.agentId) {
+      clauses.push("agent_id = ?");
+      params.push(filter.agentId);
+    }
+    if (filter?.status) {
+      clauses.push("status = ?");
+      params.push(filter.status);
+    }
+    if (typeof filter?.existsOnDisk === "boolean") {
+      clauses.push("exists_on_disk = ?");
+      params.push(filter.existsOnDisk ? 1 : 0);
+    }
+    const safeLimit = Math.min(Math.max(Number(filter?.limit || 200), 1), 1000);
+    const sql = `SELECT * FROM artifacts ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY updated_at DESC LIMIT ?`;
+    const rows = await this.db.all(sql, [...params, safeLimit]);
+    return rows.map((row: any) => ({
+      id: row.id,
+      projectId: row.project_id,
+      taskId: row.task_id || null,
+      agentId: row.agent_id || null,
+      relativePath: row.relative_path,
+      mimeType: row.mime_type,
+      sizeBytes: Number(row.size_bytes || 0),
+      status: row.status,
+      checksum: row.checksum || null,
+      existsOnDisk: row.exists_on_disk === 1,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  async createReview(input: ReviewRecord): Promise<number> {
+    if (!this.db) return -1;
+    const result = await this.db.run(
+      `INSERT INTO reviews
+             (project_id, task_id, artifact_id, decision, notes, reviewer, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))`,
+      [
+        input.projectId,
+        input.taskId,
+        input.artifactId,
+        input.decision,
+        input.notes || "",
+        input.reviewer,
+        input.createdAt || null,
+      ],
+    );
+    return result.lastID || -1;
+  }
+
+  async listReviews(filter?: {
+    projectId?: string;
+    taskId?: string;
+    artifactId?: string;
+    limit?: number;
+  }): Promise<ReviewRecord[]> {
+    if (!this.db) return [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (filter?.projectId) {
+      clauses.push("project_id = ?");
+      params.push(filter.projectId);
+    }
+    if (filter?.taskId) {
+      clauses.push("task_id = ?");
+      params.push(filter.taskId);
+    }
+    if (filter?.artifactId) {
+      clauses.push("artifact_id = ?");
+      params.push(filter.artifactId);
+    }
+
+    const sql = `SELECT * FROM reviews ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ?`;
+    params.push(Math.max(1, Math.min(Number(filter?.limit || 100), 500)));
+    const rows = await this.db.all(sql, params);
+    return rows.map((row: any) => ({
+      id: Number(row.id),
+      projectId: row.project_id,
+      taskId: row.task_id,
+      artifactId: row.artifact_id,
+      decision: row.decision as ReviewDecision,
+      notes: row.notes || "",
+      reviewer: row.reviewer,
+      createdAt: row.created_at,
+    }));
   }
 
   async close(): Promise<void> {

@@ -3,10 +3,12 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage, TaskStatus, toCanonicalTaskStatus, validateTaskStatusTransition } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus, TaskStatus } from '../memory/MemoryStore';
 import path from 'path';
-import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { readFile, stat, mkdir, writeFile, readdir } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
+import { ProjectWorkspace } from '../projects/ProjectWorkspace';
+import { getActiveProject, getActiveWorkspaceRoot, resolveScopedPath } from '../projects/workspacePaths';
 
 interface HighlightEvent {
     type: string;
@@ -32,6 +34,16 @@ interface CompletedTaskRecord {
     agentName: string;
     completedAt: string;
     summaryPath: string;
+}
+
+interface ProjectContextPayload {
+    projectSlug: string;
+    projectBrief: string;
+    acceptanceCriteria: string[];
+    activeTask: string;
+    recentReviewNotes: string[];
+    artifactIndexSummary: string;
+    contextHash: string;
 }
 
 interface ApprovalRequest {
@@ -64,6 +76,12 @@ interface SharedFileUpsertPayload {
     createdBy?: string;
     sharedWith?: string[];
     status?: SharedFileStatus;
+    projectId?: string;
+    taskId?: string;
+    taskTitle?: string;
+    brief?: string;
+    criteria?: string;
+    notes?: string;
 }
 
 interface ChatAttachment {
@@ -96,6 +114,20 @@ interface MailMessage {
     createdAt: string;
 }
 
+interface ValidationContext {
+    projectId: string;
+    taskId: string;
+    taskTitle: string;
+    artifactId: string;
+    artifactPath: string;
+    submitterId: string;
+    submitterName: string;
+    brief: string;
+    criteria: string;
+    notes: string;
+    reviewer?: string;
+}
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -110,9 +142,30 @@ const MAJOR_TOOLS = new Set<string>([
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
     private static extensionRegistry: unknown = null;
+    private static artifactWriteLogger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null = null;
 
     static setExtensionRegistry(registry: unknown) {
         OfficeRoom.extensionRegistry = registry;
+    }
+
+    static setArtifactWriteLogger(logger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null) {
+        OfficeRoom.artifactWriteLogger = logger;
     }
 
     maxClients = 100;
@@ -139,10 +192,14 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
-    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
     private mailMessages: MailMessage[] = [];
+    private currentProjectSlug = 'xylon';
+
+    private getWorkspaceRoot(): string {
+        return getActiveWorkspaceRoot();
+    }
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -170,13 +227,137 @@ export class OfficeRoom extends Room<OfficeState> {
     }
 
     private resolveWorkspacePath(targetPath: string): string {
-        const safeTarget = String(targetPath || '').trim();
-        const fullPath = path.resolve(this.workspaceRoot, safeTarget);
-        const rel = path.relative(this.workspaceRoot, fullPath);
-        if (!safeTarget || rel.startsWith('..') || path.isAbsolute(rel)) {
-            throw new Error('Invalid workspace file path.');
+        return resolveScopedPath(this.getWorkspaceRoot(), targetPath);
+    }
+
+    private projectRoot(projectSlug: string): string {
+        return path.join(this.workspaceRoot, 'projects', projectSlug);
+    }
+
+    private async safeReadWorkspaceText(relativePath: string): Promise<string> {
+        try {
+            const absolutePath = this.resolveWorkspacePath(relativePath);
+            const content = await readFile(absolutePath, 'utf-8');
+            return content.trim();
+        } catch {
+            return '';
         }
-        return fullPath;
+    }
+
+    private summarizeArtifactPath(filePath: string): string {
+        const normalized = filePath.replace(/\\/g, '/');
+        const parts = normalized.split('/').filter(Boolean);
+        return parts.slice(-2).join('/');
+    }
+
+    private async buildProjectContext(agentId: string, activeTask: string): Promise<ProjectContextPayload> {
+        const projectSlug = this.currentProjectSlug || 'default';
+        const projectRoot = this.projectRoot(projectSlug);
+        const briefRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'project-brief.md'));
+        const criteriaRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'acceptance-criteria.md'));
+        const artifactIndexRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'artifact-index.md'));
+
+        const taskRows = await this.memoryStore.getTasks();
+        const activeTaskRow = taskRows.find((task) =>
+            task.assigned_to === agentId &&
+            ['in_progress', 'review', 'blocked', 'backlog'].includes(String(task.status || '').toLowerCase())
+        );
+
+        const reviewFromDb = taskRows
+            .filter((task) => task.assigned_to === agentId && String(task.status || '').toLowerCase() === 'review')
+            .slice(0, 4)
+            .map((task) => task.status_reason || `Task "${task.title}" is pending review.`);
+
+        const globalMemories = await this.memoryStore.loadMemories('agency:global', 40);
+        const reviewFromMemories = globalMemories
+            .filter((entry) => /\breview|revision|rework|acceptance\b/i.test(entry.content))
+            .slice(0, 4)
+            .map((entry) => entry.content);
+
+        let artifactSummary = artifactIndexRaw;
+        if (!artifactSummary) {
+            const artifactsDir = path.join(projectRoot, 'artifacts');
+            try {
+                const items = await readdir(artifactsDir);
+                artifactSummary = items.slice(0, 12).map((item) => `- ${item}`).join('\n');
+            } catch {
+                artifactSummary = '';
+            }
+        }
+        if (!artifactSummary && this.completedTasks.length > 0) {
+            artifactSummary = this.completedTasks
+                .slice(0, 8)
+                .map((item) => `- ${item.task} (${this.summarizeArtifactPath(item.summaryPath)})`)
+                .join('\n');
+        }
+
+        const acceptanceCriteria = criteriaRaw
+            ? criteriaRaw.split('\n').map((line) => line.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 8)
+            : ['Deliver outputs directly relevant to the active project brief and assigned task.'];
+
+        const projectBrief = briefRaw || `Project "${projectSlug}" is active. Use assigned task + acceptance criteria only.`;
+        const resolvedActiveTask = activeTaskRow?.title || activeTask || 'No active task assigned.';
+        const recentReviewNotes = [...reviewFromDb, ...reviewFromMemories].slice(0, 6);
+        const contextHash = createHash('sha256').update(JSON.stringify({
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactSummary
+        })).digest('hex');
+
+        return {
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactIndexSummary: artifactSummary || 'No project artifacts indexed yet.',
+            contextHash
+        };
+    }
+
+    private async persistProjectContextAudit(agentId: string, context: ProjectContextPayload): Promise<void> {
+        const logDir = this.resolveWorkspacePath(path.posix.join('projects', context.projectSlug, 'logs'));
+        await mkdir(logDir, { recursive: true });
+        const logPath = path.join(logDir, `${agentId}.jsonl`);
+        const row = JSON.stringify({
+            time: this.state.officeTime || new Date().toISOString(),
+            sessionId: this.sessionId,
+            agentId,
+            contextHash: context.contextHash,
+            activeTask: context.activeTask
+        });
+        await writeFile(logPath, `${row}\n`, { encoding: 'utf-8', flag: 'a' });
+    }
+
+    private decisionReferencesProjectContext(decision: any, context: ProjectContextPayload): boolean {
+        const payload = JSON.stringify({
+            thought: decision?.thought || '',
+            target: decision?.target || '',
+            message: decision?.message || '',
+            toolCall: decision?.toolCall || {}
+        }).toLowerCase();
+
+        const tokens = [
+            context.projectSlug.toLowerCase(),
+            ...context.activeTask.toLowerCase().split(/\W+/).filter((token) => token.length > 3).slice(0, 8),
+            ...context.acceptanceCriteria.join(' ').toLowerCase().split(/\W+/).filter((token) => token.length > 5).slice(0, 6)
+        ];
+
+        return tokens.some((token) => token && payload.includes(token));
+    }
+
+    private async routeTaskBackToReview(agentId: string, reason: string, taskTitle: string) {
+        await this.memoryStore.upsertTaskStatusByTitle(agentId, taskTitle, 'review', reason);
+        this.broadcast('task-update', {
+            agentId,
+            agentName: this.coreAgents.get(agentId)?.config.name || agentId,
+            task: taskTitle,
+            status: 'review',
+            reason
+        });
     }
 
     private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
@@ -320,6 +501,7 @@ export class OfficeRoom extends Room<OfficeState> {
         // Initialize memory store
         const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
         await this.memoryStore.initialize(dbPath);
+        this.toolExecutor.setArtifactWriteLogger(OfficeRoom.artifactWriteLogger);
 
         const config: OfficeConfig = {
             name: options.name || 'Startup HQ',
@@ -423,6 +605,13 @@ export class OfficeRoom extends Room<OfficeState> {
             { name: 'create_task',  description: 'Create a task and assign it to an agent' },
         ];
 
+        const VALIDATOR: Capability[] = [
+            { name: 'read_file', description: 'Read submitted artifacts and briefs' },
+            { name: 'read_file_chunk', description: 'Read large criteria/artifact chunks' },
+            { name: 'list_files', description: 'Inspect project files and supporting evidence' },
+            { name: 'write_note', description: 'Write review notes and revision guidance' },
+        ];
+
         // ─── COLLAB CHARTER (shared across all agents) ───
         // Keep it short so it doesn't dominate the prompt but nudges real teamwork.
         const COLLAB = [
@@ -502,7 +691,7 @@ Paired buddy: DevOps Automator. Flag issues early and recommend concrete fixes.`
             'evidence', 'Evidence Collector', 'Evidence Collector', 17, 14,
             `${COLLAB} Your focus: proof, validation, screenshots, logs, QA evidence. Paired buddy: SEO Specialist — share validation evidence with them for page launches.`,
             { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
-            READ_ONLY
+            VALIDATOR
         );
 
         await setupCoreAgent(
@@ -663,7 +852,7 @@ Paired buddy: Sales Outreach.`,
                 agentState.action = 'work';
 
                 // Persist task
-                this.memoryStore.createTask(title, targetId);
+                this.registerTaskTracking(targetId, title).catch(() => {});
 
                 this.broadcast('chat', {
                     sender: 'System',
@@ -675,9 +864,10 @@ Paired buddy: Sales Outreach.`,
                     agentName: agentState.name,
                     task: title,
                     status: 'in_progress',
+                    statusReason: 'waiting_for_artifact',
+                    progress: 0,
                     fastTrackMode: this.fastTrackMode
                 });
-                this.seedTaskProgress(targetId, title);
             }
         });
 
@@ -695,8 +885,33 @@ Paired buddy: Sales Outreach.`,
         this.onMessage('request-completed-work', (client) => {
             client.send('completed-work-sync', {
                 items: this.completedTasks,
-                reviewFolder: 'data/workspace/completed-work'
+                reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
             });
+        });
+
+        this.onMessage('start-project', async (client, message) => {
+            try {
+                const result = await ProjectWorkspace.startProject({
+                    templateId: message?.templateId ?? message?.template,
+                    projectName: message?.projectName,
+                    brief: message?.brief,
+                    acceptanceCriteria: message?.acceptanceCriteria,
+                    constraints: message?.constraints,
+                    mode: message?.mode,
+                    runMetadata: {
+                        requestedBy: client.sessionId,
+                        source: 'colyseus'
+                    }
+                });
+                this.broadcast('project-state-sync', {
+                    project: result.project,
+                    folders: result.folders,
+                    files: result.files
+                });
+                client.send('start-project:result', { ok: true, ...result });
+            } catch (error: any) {
+                client.send('start-project:result', { ok: false, error: error?.message || 'Unable to start project.' });
+            }
         });
 
         // User-triggered workspace read-only tools
@@ -775,6 +990,19 @@ Paired buddy: Sales Outreach.`,
                 action: 'file-share',
                 actor,
                 details: JSON.stringify({ path: record.path, status: record.status, sharedWith: record.sharedWith }),
+            });
+            await this.triggerArtifactValidation({
+                projectId: String(message?.projectId || this.currentScenario || 'general'),
+                taskId: String(message?.taskId || ''),
+                taskTitle: String(message?.taskTitle || ''),
+                artifactId: fileId,
+                artifactPath: filePath,
+                submitterId: actor,
+                submitterName: `Agent ${actor}`,
+                brief: String(message?.brief || ''),
+                criteria: String(message?.criteria || ''),
+                notes: String(message?.notes || ''),
+                reviewer: 'validator',
             });
 
             if (status === 'needs_review') {
@@ -888,7 +1116,11 @@ Paired buddy: Sales Outreach.`,
                     actor: client.sessionId,
                 });
             }
-            client.send('file-open', file);
+            const reviewHistory = file ? await this.memoryStore.listReviews({ artifactId: file.id, limit: 100 }) : [];
+            client.send('file-open', {
+                file,
+                reviewHistory,
+            });
         });
 
         this.onMessage('file-status-update', async (client, message) => {
@@ -923,6 +1155,26 @@ Paired buddy: Sales Outreach.`,
 
             const file = await this.memoryStore.getSharedFile(fileId);
             this.broadcast('file-status-update', file);
+        });
+
+        this.onMessage('artifact-review-history', async (client, message) => {
+            const artifactId = String(message?.artifactId || '').trim();
+            if (!artifactId) {
+                client.send('artifact-review-history', []);
+                return;
+            }
+            const history = await this.memoryStore.listReviews({ artifactId, limit: 200 });
+            client.send('artifact-review-history', history);
+        });
+
+        this.onMessage('task-review-history', async (client, message) => {
+            const taskId = String(message?.taskId || '').trim();
+            if (!taskId) {
+                client.send('task-review-history', []);
+                return;
+            }
+            const history = await this.memoryStore.listReviews({ taskId, limit: 200 });
+            client.send('task-review-history', history);
         });
 
         this.onMessage('mail-request-sync', (client) => {
@@ -1060,18 +1312,37 @@ Paired buddy: Sales Outreach.`,
                     }
                 });
 
-                coreAgent.think({
-                    time: this.state.officeTime,
-                    location: `${agentState.x},${agentState.y}`,
-                    nearbyAgents,
-                    currentTask: coreAgent.currentTask || null,
-                    recentMessages: coreAgent.getUnreadMessages(),
-                    memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision: any) => {
+                (async () => {
+                    const projectContext = await this.buildProjectContext(id, coreAgent.currentTask || '');
+                    await this.persistProjectContextAudit(id, projectContext);
+
+                    return coreAgent.think({
+                        time: this.state.officeTime,
+                        location: `${agentState.x},${agentState.y}`,
+                        nearbyAgents,
+                        currentTask: coreAgent.currentTask || null,
+                        recentMessages: coreAgent.getUnreadMessages(),
+                        memories: coreAgent.getRecentMemories(5),
+                        projectContext
+                    }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
                         agentState.thought = decision.thought;
+                    }
+
+                    if (coreAgent.currentTask && !this.decisionReferencesProjectContext(decision, projectContext)) {
+                        const reason = 'Guardrail: output did not reference active project/task context.';
+                        await this.routeTaskBackToReview(id, reason, coreAgent.currentTask);
+                        coreAgent.addMemory({
+                            content: `${reason} Routed "${coreAgent.currentTask}" to review.`,
+                            type: 'task_result',
+                            timestamp: this.state.officeTime,
+                            importance: 0.9
+                        });
+                        agentState.action = 'idle';
+                        setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                        return;
                     }
 
                     // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
@@ -1146,7 +1417,7 @@ Paired buddy: Sales Outreach.`,
                             if (targetAgent && targetState) {
                                 targetAgent.currentTask = title;
                                 targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
+                                await this.registerTaskTracking(targetId, title);
 
                                 this.broadcast('chat', {
                                     sender: coreAgent.config.name,
@@ -1157,9 +1428,10 @@ Paired buddy: Sales Outreach.`,
                                     agentName: targetAgent.config.name,
                                     task: title,
                                     status: 'in_progress',
+                                    statusReason: 'waiting_for_artifact',
+                                    progress: 0,
                                     fastTrackMode: this.fastTrackMode
                                 });
-                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1262,6 +1534,14 @@ Paired buddy: Sales Outreach.`,
                                 decision.toolCall.name,
                                 decision.toolCall.params
                             );
+                            const toolAuditLogId = await this.memoryStore.logToolAudit({
+                                actorId: id,
+                                actorRole: coreAgent.config.role || 'agent',
+                                toolName: decision.toolCall.name,
+                                paramsHash: this.memoryStore.hashToolParams(decision.toolCall.params),
+                                result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`
+                            });
+                            await this.captureTaskToolEvidence(id, decision.toolCall.name, decision.toolCall.params, result.success, toolAuditLogId);
 
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
@@ -1297,6 +1577,8 @@ Paired buddy: Sales Outreach.`,
                                     filePath: String(decision.toolCall.params?.path || ''),
                                     summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
                                     fileId: decision.toolCall.params?.fileId,
+                                    taskTitle: coreAgent.currentTask || '',
+                                    projectId: this.currentScenario,
                                 });
                             }
                         }
@@ -1314,6 +1596,10 @@ Paired buddy: Sales Outreach.`,
 
                 }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                });
+                })().catch((err) => {
+                    console.error(`Agent ${id} project-context error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
             }
@@ -1440,6 +1726,7 @@ Paired buddy: Sales Outreach.`,
             // /project xylon  → kicks off the Xylon Growth Sprint (ACME) scenario
             const which = (argStr || 'xylon').toLowerCase();
             if (which.startsWith('xylon') || which.startsWith('acme') || which === '') {
+                this.currentProjectSlug = 'xylon';
                 this.currentScenario = 'Xylon Growth Sprint';
                 this.applyScenarioKickoff('Xylon Growth Sprint');
             } else {
@@ -1493,7 +1780,7 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95
             });
-            this.memoryStore.createTask(task, agentId).catch(() => {});
+            this.registerTaskTracking(agentId, task).catch(() => {});
             this.broadcast('chat', {
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
@@ -1501,7 +1788,6 @@ Paired buddy: Sales Outreach.`,
             this.emitCanonicalTaskUpdate({
                 agentId, agentName: agent.config.name, task, status: 'in_progress'
             });
-            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -1576,30 +1862,108 @@ Paired buddy: Sales Outreach.`,
         return `${agentId}:${taskTitle}`;
     }
 
-    private seedTaskProgress(agentId: string, taskTitle: string) {
+    private async registerTaskTracking(agentId: string, taskTitle: string): Promise<void> {
         if (!taskTitle) return;
+        const taskId = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!taskId) return;
+        this.taskRecordIds.set(this.progressKey(agentId, taskTitle), taskId);
         this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async getOrCreateTaskRecordId(agentId: string, taskTitle: string): Promise<string | null> {
+        const key = this.progressKey(agentId, taskTitle);
+        const cached = this.taskRecordIds.get(key);
+        if (cached) return cached;
+        const existing = await this.memoryStore.findActiveTask(agentId, taskTitle);
+        if (existing?.id) {
+            this.taskRecordIds.set(key, existing.id);
+            return existing.id;
+        }
+        const created = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!created) return null;
+        this.taskRecordIds.set(key, created);
+        return created;
+    }
+
+    private async captureTaskToolEvidence(agentId: string, toolName: string, params: any, success: boolean, toolAuditLogId: number | null) {
+        const agent = this.coreAgents.get(agentId);
+        const taskTitle = agent?.currentTask;
+        if (!taskTitle || !success) return;
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        await this.memoryStore.addTaskEvidence({
+            id: `tev_${randomUUID()}`,
+            taskId: taskRecordId,
+            agentId,
+            evidenceType: 'tool_execution',
+            toolAuditLogId,
+            metadata: {
+                toolName,
+                params,
+            },
+            createdAt: this.state.officeTime,
+        });
+
+        const artifactPath = String(params?.path || '').trim();
+        if (artifactPath) {
+            await this.memoryStore.addTaskEvidence({
+                id: `tev_${randomUUID()}`,
+                taskId: taskRecordId,
+                agentId,
+                evidenceType: 'artifact',
+                artifactId: String(params?.fileId || ''),
+                artifactPath,
+                metadata: {
+                    source: 'tool_execution',
+                    toolName,
+                },
+                createdAt: this.state.officeTime,
+            });
+        }
+    }
+
+    private async evaluateTaskEvidence(taskId: string): Promise<TaskEvidenceState> {
+        const evidence = await this.memoryStore.getTaskEvidence(taskId);
+        let artifactExists = false;
+        let toolExecutionSucceeded = false;
+        let validatorApproved = false;
+
+        for (const item of evidence) {
+            if (!artifactExists && item.evidenceType === 'artifact' && item.artifactPath) {
+                try {
+                    await stat(this.resolveWorkspacePath(item.artifactPath));
+                    artifactExists = true;
+                } catch {}
+            }
+            if (!toolExecutionSucceeded && item.evidenceType === 'tool_execution' && item.toolAuditLogId) {
+                toolExecutionSucceeded = true;
+            }
+            if (!validatorApproved && item.evidenceType === 'validator' && item.validatorDecision === 'approved') {
+                validatorApproved = true;
+            }
+            if (artifactExists && toolExecutionSucceeded && validatorApproved) break;
+        }
+
+        return { artifactExists, toolExecutionSucceeded, validatorApproved };
+    }
+
+    private taskStatusReason(evidence: TaskEvidenceState): string {
+        if (evidence.validatorApproved) return 'validated';
+        if (evidence.artifactExists || evidence.toolExecutionSucceeded) return 'pending_validation';
+        return 'waiting_for_artifact';
     }
 
     private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
         const taskTitle = agent.currentTask;
         if (!taskTitle) return;
-
         const key = this.progressKey(agentId, taskTitle);
-        const current = this.taskProgress.get(key) ?? 0;
-        const baseWorkDelta = this.fastTrackMode ? 0.45 : 0.2;
-        const baseToolDelta = this.fastTrackMode ? 0.5 : 0.3;
-        const baseTalkDelta = this.fastTrackMode ? 0.02 : 0.08;
-        const delta = action === 'work'
-            ? baseWorkDelta
-            : action === 'use_tool'
-                ? baseToolDelta
-                : action === 'talk'
-                    ? baseTalkDelta
-                    : 0;
-        if (delta <= 0) return;
-
-        const next = Math.min(1, current + delta);
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        const evidence = await this.evaluateTaskEvidence(taskRecordId);
+        const checkpointsPassed = [evidence.artifactExists, evidence.toolExecutionSucceeded, evidence.validatorApproved].filter(Boolean).length;
+        const next = checkpointsPassed / 3;
+        const reason = this.taskStatusReason(evidence);
+        const shouldComplete = checkpointsPassed >= 1;
         this.taskProgress.set(key, next);
 
         const currentTaskStatus: TaskStatus = 'in_progress';
@@ -1633,12 +1997,15 @@ Paired buddy: Sales Outreach.`,
             task: taskTitle,
             status: transition.status,
             progress: next,
+            evidence,
+            action,
             fastTrackMode: this.fastTrackMode
         });
 
-        if (next < 1) return;
+        if (!shouldComplete) return;
 
         this.taskProgress.delete(key);
+        this.taskRecordIds.delete(key);
         agent.currentTask = '';
         agentState.currentTask = '';
 
@@ -1661,7 +2028,7 @@ Paired buddy: Sales Outreach.`,
         this.completedTasks = [completion, ...this.completedTasks].slice(0, 50);
         this.broadcast('completed-work-sync', {
             items: this.completedTasks,
-            reviewFolder: 'data/workspace/completed-work'
+            reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
         });
     }
 
@@ -1673,7 +2040,7 @@ Paired buddy: Sales Outreach.`,
             .replace(/[^a-z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .slice(0, 48) || 'task';
-        const folder = path.join(this.workspaceRoot, 'completed-work');
+        const folder = path.join(this.getWorkspaceRoot(), 'completed-work');
         const filename = `${dateStamp}-${agentId}-${slug}.md`;
         const absolutePath = path.join(folder, filename);
         await mkdir(folder, { recursive: true });
@@ -1888,6 +2255,9 @@ Paired buddy: Sales Outreach.`,
         filePath: string;
         summaryNote?: string;
         fileId?: string;
+        taskId?: string;
+        taskTitle?: string;
+        projectId?: string;
     }): Promise<ApprovalRequest> {
         const safePath = String(input.filePath || '').trim();
         const parts = safePath.split('/');
@@ -1939,6 +2309,19 @@ Paired buddy: Sales Outreach.`,
                 approvalId: existingPending.id,
             });
             this.broadcast('approvals-sync', this.listApprovals());
+            await this.triggerArtifactValidation({
+                projectId: String(input.projectId || this.currentScenario || 'general'),
+                taskId: String(input.taskId || ''),
+                taskTitle: String(input.taskTitle || ''),
+                artifactId: fileId,
+                artifactPath: safePath,
+                submitterId: input.sharedByAgentId,
+                submitterName: input.sharedByAgentName,
+                brief: '',
+                criteria: '',
+                notes: summaryNote,
+                reviewer: 'validator',
+            });
             return existingPending;
         }
 
@@ -1982,8 +2365,144 @@ Paired buddy: Sales Outreach.`,
             status: 'needs_review',
             approvalId: request.id,
         });
+        await this.triggerArtifactValidation({
+            projectId: String(input.projectId || this.currentScenario || 'general'),
+            taskId: String(input.taskId || ''),
+            taskTitle: String(input.taskTitle || ''),
+            artifactId: fileId,
+            artifactPath: safePath,
+            submitterId: input.sharedByAgentId,
+            submitterName: input.sharedByAgentName,
+            brief: '',
+            criteria: '',
+            notes: summaryNote,
+            reviewer: 'validator',
+        });
 
         return request;
+    }
+
+    private toSlug(input: string): string {
+        return String(input || 'project')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 80) || 'project';
+    }
+
+    private async persistRevisionNotes(projectId: string, taskTitle: string, artifactPath: string, reviewer: string, notes: string): Promise<string> {
+        const projectSlug = this.toSlug(projectId || 'project');
+        const taskSlug = this.toSlug(taskTitle || 'task');
+        const timestamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, 'Z');
+        const relativePath = `projects/${projectSlug}/reviews/${timestamp}-${taskSlug}.md`;
+        const fullPath = path.resolve(this.workspaceRoot, relativePath);
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        const content = [
+            '# Revision Request',
+            '',
+            `- Project: ${projectId}`,
+            `- Task: ${taskTitle}`,
+            `- Artifact: ${artifactPath}`,
+            `- Reviewer: ${reviewer}`,
+            `- Created At: ${new Date().toISOString()}`,
+            '',
+            '## Notes',
+            '',
+            notes || 'No notes provided.'
+        ].join('\n');
+        await writeFile(fullPath, content, 'utf8');
+        return relativePath;
+    }
+
+    private async triggerArtifactValidation(input: ValidationContext): Promise<void> {
+        if (!input.artifactId || !input.artifactPath) return;
+
+        let taskId = String(input.taskId || '').trim();
+        let taskTitle = String(input.taskTitle || '').trim();
+        if (!taskId) {
+            const agent = this.coreAgents.get(input.submitterId);
+            const inferredTask = String(taskTitle || agent?.currentTask || '').trim();
+            if (inferredTask) {
+                const found = await this.memoryStore.findMostRecentTaskByTitleAndAssignee(inferredTask, input.submitterId);
+                if (found?.id !== undefined && found?.id !== null) {
+                    taskId = String(found.id);
+                    taskTitle = String(found.title || inferredTask);
+                } else {
+                    taskTitle = inferredTask;
+                }
+            }
+        }
+        if (!taskId) return;
+
+        const existing = await this.memoryStore.listReviews({ taskId, artifactId: input.artifactId, limit: 1 });
+        if (existing.length > 0) return;
+
+        const reviewSource = `${input.notes} ${input.criteria}`.toLowerCase();
+        const rejectSignals = /\b(fail|missing|incomplete|rework|reject|blocked|error|todo)\b/;
+        const decision: 'approved' | 'rejected' = rejectSignals.test(reviewSource) ? 'rejected' : 'approved';
+        const reviewer = input.reviewer || 'validator';
+        const notes = input.notes?.trim() || (
+            decision === 'approved'
+                ? 'Validator approved submission after checking brief, criteria, and artifact contents.'
+                : 'Validator rejected submission and requested revisions before completion.'
+        );
+
+        await this.memoryStore.createReview({
+            projectId: input.projectId || 'general',
+            taskId,
+            artifactId: input.artifactId,
+            decision,
+            notes,
+            reviewer,
+            createdAt: this.state.officeTime,
+        });
+
+        const nextStatus: TaskStatus = decision === 'approved' ? 'done' : 'in_progress';
+        await this.memoryStore.updateTaskStatus(taskId, nextStatus, notes);
+
+        const taskHistory = await this.memoryStore.listReviews({ taskId, limit: 100 });
+        const artifactHistory = await this.memoryStore.listReviews({ artifactId: input.artifactId, limit: 100 });
+        this.broadcast('review-event', {
+            projectId: input.projectId,
+            taskId,
+            taskTitle,
+            artifactId: input.artifactId,
+            artifactPath: input.artifactPath,
+            decision,
+            notes,
+            reviewer,
+            createdAt: this.state.officeTime,
+        });
+        this.broadcast('task-review-history', { taskId, history: taskHistory });
+        this.broadcast('artifact-review-history', { artifactId: input.artifactId, history: artifactHistory });
+        this.broadcast('task-update', {
+            id: taskId,
+            agentId: input.submitterId,
+            agentName: input.submitterName,
+            task: taskTitle || 'Task',
+            status: nextStatus,
+            statusReason: notes,
+            reviewHistory: taskHistory,
+        });
+
+        if (decision === 'rejected') {
+            const revisionPath = await this.persistRevisionNotes(
+                input.projectId || this.currentScenario || 'project',
+                taskTitle || taskId,
+                input.artifactPath,
+                reviewer,
+                notes
+            );
+            this.broadcast('chat', {
+                sender: '🧪 Validator',
+                text: `❌ Rejected "${taskTitle || taskId}". Revision notes saved to ${revisionPath}.`
+            });
+        } else {
+            this.broadcast('chat', {
+                sender: '🧪 Validator',
+                text: `✅ Approved "${taskTitle || taskId}". Task moved to done.`
+            });
+        }
     }
 
     // Heuristic: a rationale is "weak" if it's empty, placeholder-ish, or too short.
@@ -2032,6 +2551,27 @@ Paired buddy: Sales Outreach.`,
 
         if (req.fileContext?.fileId) {
             this.memoryStore.updateSharedFileStatus(req.fileContext.fileId, decision, req.id).catch((e) => console.error('updateSharedFileStatus', e));
+            const requester = this.coreAgents.get(req.requestedBy);
+            if (requester?.currentTask) {
+                const taskRecordId = await this.getOrCreateTaskRecordId(req.requestedBy, requester.currentTask);
+                if (taskRecordId) {
+                    await this.memoryStore.addTaskEvidence({
+                        id: `tev_${randomUUID()}`,
+                        taskId: taskRecordId,
+                        agentId: req.requestedBy,
+                        evidenceType: 'validator',
+                        artifactId: req.fileContext.fileId,
+                        artifactPath: req.fileContext.filePath,
+                        validatorDecision: decision,
+                        metadata: {
+                            approvalId: req.id,
+                            requestedAction: req.requestedAction,
+                        },
+                        createdAt: this.state.officeTime,
+                    });
+                    await this.advanceTaskProgress(req.requestedBy, requester, this.state.agents.get(req.requestedBy), 'validation');
+                }
+            }
             this.broadcast('chat', {
                 sender: '📎 File Review',
                 text: `File "${req.fileContext.fileName}" (${req.fileContext.filePath}) was ${decision} by CEO.`
@@ -2057,6 +2597,15 @@ Paired buddy: Sales Outreach.`,
                     this.broadcast('chat', { sender: '🏢 Office', text: `Hiring unblocked for ${req.requestedByName}.` });
                 } else {
                     const result = await this.toolExecutor.execute(req.pending.toolName, req.pending.params);
+                    const toolAuditLogId = await this.memoryStore.logToolAudit({
+                        actorId: req.requestedBy,
+                        actorRole: requester?.config.role || 'agent',
+                        toolName: req.pending.toolName,
+                        paramsHash: this.memoryStore.hashToolParams(req.pending.params),
+                        result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`,
+                        approvalId: req.id,
+                    });
+                    await this.captureTaskToolEvidence(req.requestedBy, req.pending.toolName, req.pending.params, result.success, toolAuditLogId);
                     this.broadcast('chat', {
                         sender: req.requestedByName,
                         text: `🔧 (post-approval) [${req.pending.toolName}]: ${result.success ? result.output.slice(0, 100) : result.error}`
@@ -2153,6 +2702,7 @@ Paired buddy: Sales Outreach.`,
     // the lead, and a Statement of Work. Running this scenario exercises the
     // exact muscles the real company uses to win work.
     private kickoffXylonGrowthSprint() {
+        this.currentProjectSlug = 'xylon';
         const project = 'ACME Manufacturing — M365 Copilot rollout + oversharing remediation + landing page + SOW';
         const brief = [
             `NEW PROJECT: ${project}.`,
@@ -2251,7 +2801,6 @@ Paired buddy: Sales Outreach.`,
             this.emitCanonicalTaskUpdate({
                 agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
             });
-            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)
@@ -2485,10 +3034,13 @@ Paired buddy: Sales Outreach.`,
         client.send('fast-track-state', { enabled: this.fastTrackMode });
         client.send('completed-work-sync', {
             items: this.completedTasks,
-            reviewFolder: 'data/workspace/completed-work'
+            reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
         });
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
         client.send('approvals-sync', this.listApprovals());
+        this.memoryStore.listReviews({ limit: 200 }).then((reviews) => {
+            client.send('reviews-sync', reviews);
+        }).catch(() => {});
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
             : { active: false });
