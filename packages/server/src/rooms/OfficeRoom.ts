@@ -3,7 +3,7 @@ import { OfficeState } from '../schema/OfficeState';
 import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
 import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
+import { MemoryStore, SharedFileRecord, SharedFileStatus, TaskStatus } from '../memory/MemoryStore';
 import path from 'path';
 import { readFile, stat, mkdir, writeFile, readdir } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
@@ -76,6 +76,12 @@ interface SharedFileUpsertPayload {
     createdBy?: string;
     sharedWith?: string[];
     status?: SharedFileStatus;
+    projectId?: string;
+    taskId?: string;
+    taskTitle?: string;
+    brief?: string;
+    criteria?: string;
+    notes?: string;
 }
 
 interface ChatAttachment {
@@ -106,6 +112,20 @@ interface MailMessage {
     body: string;
     attachments: MailAttachment[];
     createdAt: string;
+}
+
+interface ValidationContext {
+    projectId: string;
+    taskId: string;
+    taskTitle: string;
+    artifactId: string;
+    artifactPath: string;
+    submitterId: string;
+    submitterName: string;
+    brief: string;
+    criteria: string;
+    notes: string;
+    reviewer?: string;
 }
 
 // Tool names that always require CEO approval when invoked by a non-CEO agent
@@ -585,6 +605,13 @@ export class OfficeRoom extends Room<OfficeState> {
             { name: 'create_task',  description: 'Create a task and assign it to an agent' },
         ];
 
+        const VALIDATOR: Capability[] = [
+            { name: 'read_file', description: 'Read submitted artifacts and briefs' },
+            { name: 'read_file_chunk', description: 'Read large criteria/artifact chunks' },
+            { name: 'list_files', description: 'Inspect project files and supporting evidence' },
+            { name: 'write_note', description: 'Write review notes and revision guidance' },
+        ];
+
         // ─── COLLAB CHARTER (shared across all agents) ───
         // Keep it short so it doesn't dominate the prompt but nudges real teamwork.
         const COLLAB = [
@@ -664,7 +691,7 @@ Paired buddy: DevOps Automator. Flag issues early and recommend concrete fixes.`
             'evidence', 'Evidence Collector', 'Evidence Collector', 17, 14,
             `${COLLAB} Your focus: proof, validation, screenshots, logs, QA evidence. Paired buddy: SEO Specialist — share validation evidence with them for page launches.`,
             { traits: { openness: 0.7, conscientiousness: 0.95, extraversion: 0.4, agreeableness: 0.7, neuroticism: 0.2 }, communicationStyle: 'technical' },
-            READ_ONLY
+            VALIDATOR
         );
 
         await setupCoreAgent(
@@ -964,6 +991,19 @@ Paired buddy: Sales Outreach.`,
                 actor,
                 details: JSON.stringify({ path: record.path, status: record.status, sharedWith: record.sharedWith }),
             });
+            await this.triggerArtifactValidation({
+                projectId: String(message?.projectId || this.currentScenario || 'general'),
+                taskId: String(message?.taskId || ''),
+                taskTitle: String(message?.taskTitle || ''),
+                artifactId: fileId,
+                artifactPath: filePath,
+                submitterId: actor,
+                submitterName: `Agent ${actor}`,
+                brief: String(message?.brief || ''),
+                criteria: String(message?.criteria || ''),
+                notes: String(message?.notes || ''),
+                reviewer: 'validator',
+            });
 
             if (status === 'needs_review') {
                 const approval = this.createApproval({
@@ -1076,7 +1116,11 @@ Paired buddy: Sales Outreach.`,
                     actor: client.sessionId,
                 });
             }
-            client.send('file-open', file);
+            const reviewHistory = file ? await this.memoryStore.listReviews({ artifactId: file.id, limit: 100 }) : [];
+            client.send('file-open', {
+                file,
+                reviewHistory,
+            });
         });
 
         this.onMessage('file-status-update', async (client, message) => {
@@ -1111,6 +1155,26 @@ Paired buddy: Sales Outreach.`,
 
             const file = await this.memoryStore.getSharedFile(fileId);
             this.broadcast('file-status-update', file);
+        });
+
+        this.onMessage('artifact-review-history', async (client, message) => {
+            const artifactId = String(message?.artifactId || '').trim();
+            if (!artifactId) {
+                client.send('artifact-review-history', []);
+                return;
+            }
+            const history = await this.memoryStore.listReviews({ artifactId, limit: 200 });
+            client.send('artifact-review-history', history);
+        });
+
+        this.onMessage('task-review-history', async (client, message) => {
+            const taskId = String(message?.taskId || '').trim();
+            if (!taskId) {
+                client.send('task-review-history', []);
+                return;
+            }
+            const history = await this.memoryStore.listReviews({ taskId, limit: 200 });
+            client.send('task-review-history', history);
         });
 
         this.onMessage('mail-request-sync', (client) => {
@@ -1513,6 +1577,8 @@ Paired buddy: Sales Outreach.`,
                                     filePath: String(decision.toolCall.params?.path || ''),
                                     summaryNote: decision.toolCall.params?.summaryNote || decision.thought || 'File requires CEO review.',
                                     fileId: decision.toolCall.params?.fileId,
+                                    taskTitle: coreAgent.currentTask || '',
+                                    projectId: this.currentScenario,
                                 });
                             }
                         }
@@ -2122,6 +2188,9 @@ Paired buddy: Sales Outreach.`,
         filePath: string;
         summaryNote?: string;
         fileId?: string;
+        taskId?: string;
+        taskTitle?: string;
+        projectId?: string;
     }): Promise<ApprovalRequest> {
         const safePath = String(input.filePath || '').trim();
         const parts = safePath.split('/');
@@ -2173,6 +2242,19 @@ Paired buddy: Sales Outreach.`,
                 approvalId: existingPending.id,
             });
             this.broadcast('approvals-sync', this.listApprovals());
+            await this.triggerArtifactValidation({
+                projectId: String(input.projectId || this.currentScenario || 'general'),
+                taskId: String(input.taskId || ''),
+                taskTitle: String(input.taskTitle || ''),
+                artifactId: fileId,
+                artifactPath: safePath,
+                submitterId: input.sharedByAgentId,
+                submitterName: input.sharedByAgentName,
+                brief: '',
+                criteria: '',
+                notes: summaryNote,
+                reviewer: 'validator',
+            });
             return existingPending;
         }
 
@@ -2216,8 +2298,144 @@ Paired buddy: Sales Outreach.`,
             status: 'needs_review',
             approvalId: request.id,
         });
+        await this.triggerArtifactValidation({
+            projectId: String(input.projectId || this.currentScenario || 'general'),
+            taskId: String(input.taskId || ''),
+            taskTitle: String(input.taskTitle || ''),
+            artifactId: fileId,
+            artifactPath: safePath,
+            submitterId: input.sharedByAgentId,
+            submitterName: input.sharedByAgentName,
+            brief: '',
+            criteria: '',
+            notes: summaryNote,
+            reviewer: 'validator',
+        });
 
         return request;
+    }
+
+    private toSlug(input: string): string {
+        return String(input || 'project')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 80) || 'project';
+    }
+
+    private async persistRevisionNotes(projectId: string, taskTitle: string, artifactPath: string, reviewer: string, notes: string): Promise<string> {
+        const projectSlug = this.toSlug(projectId || 'project');
+        const taskSlug = this.toSlug(taskTitle || 'task');
+        const timestamp = new Date().toISOString().replace(/:/g, '-').replace(/\..+$/, 'Z');
+        const relativePath = `projects/${projectSlug}/reviews/${timestamp}-${taskSlug}.md`;
+        const fullPath = path.resolve(this.workspaceRoot, relativePath);
+        await mkdir(path.dirname(fullPath), { recursive: true });
+        const content = [
+            '# Revision Request',
+            '',
+            `- Project: ${projectId}`,
+            `- Task: ${taskTitle}`,
+            `- Artifact: ${artifactPath}`,
+            `- Reviewer: ${reviewer}`,
+            `- Created At: ${new Date().toISOString()}`,
+            '',
+            '## Notes',
+            '',
+            notes || 'No notes provided.'
+        ].join('\n');
+        await writeFile(fullPath, content, 'utf8');
+        return relativePath;
+    }
+
+    private async triggerArtifactValidation(input: ValidationContext): Promise<void> {
+        if (!input.artifactId || !input.artifactPath) return;
+
+        let taskId = String(input.taskId || '').trim();
+        let taskTitle = String(input.taskTitle || '').trim();
+        if (!taskId) {
+            const agent = this.coreAgents.get(input.submitterId);
+            const inferredTask = String(taskTitle || agent?.currentTask || '').trim();
+            if (inferredTask) {
+                const found = await this.memoryStore.findMostRecentTaskByTitleAndAssignee(inferredTask, input.submitterId);
+                if (found?.id !== undefined && found?.id !== null) {
+                    taskId = String(found.id);
+                    taskTitle = String(found.title || inferredTask);
+                } else {
+                    taskTitle = inferredTask;
+                }
+            }
+        }
+        if (!taskId) return;
+
+        const existing = await this.memoryStore.listReviews({ taskId, artifactId: input.artifactId, limit: 1 });
+        if (existing.length > 0) return;
+
+        const reviewSource = `${input.notes} ${input.criteria}`.toLowerCase();
+        const rejectSignals = /\b(fail|missing|incomplete|rework|reject|blocked|error|todo)\b/;
+        const decision: 'approved' | 'rejected' = rejectSignals.test(reviewSource) ? 'rejected' : 'approved';
+        const reviewer = input.reviewer || 'validator';
+        const notes = input.notes?.trim() || (
+            decision === 'approved'
+                ? 'Validator approved submission after checking brief, criteria, and artifact contents.'
+                : 'Validator rejected submission and requested revisions before completion.'
+        );
+
+        await this.memoryStore.createReview({
+            projectId: input.projectId || 'general',
+            taskId,
+            artifactId: input.artifactId,
+            decision,
+            notes,
+            reviewer,
+            createdAt: this.state.officeTime,
+        });
+
+        const nextStatus: TaskStatus = decision === 'approved' ? 'done' : 'in_progress';
+        await this.memoryStore.updateTaskStatus(taskId, nextStatus, notes);
+
+        const taskHistory = await this.memoryStore.listReviews({ taskId, limit: 100 });
+        const artifactHistory = await this.memoryStore.listReviews({ artifactId: input.artifactId, limit: 100 });
+        this.broadcast('review-event', {
+            projectId: input.projectId,
+            taskId,
+            taskTitle,
+            artifactId: input.artifactId,
+            artifactPath: input.artifactPath,
+            decision,
+            notes,
+            reviewer,
+            createdAt: this.state.officeTime,
+        });
+        this.broadcast('task-review-history', { taskId, history: taskHistory });
+        this.broadcast('artifact-review-history', { artifactId: input.artifactId, history: artifactHistory });
+        this.broadcast('task-update', {
+            id: taskId,
+            agentId: input.submitterId,
+            agentName: input.submitterName,
+            task: taskTitle || 'Task',
+            status: nextStatus,
+            statusReason: notes,
+            reviewHistory: taskHistory,
+        });
+
+        if (decision === 'rejected') {
+            const revisionPath = await this.persistRevisionNotes(
+                input.projectId || this.currentScenario || 'project',
+                taskTitle || taskId,
+                input.artifactPath,
+                reviewer,
+                notes
+            );
+            this.broadcast('chat', {
+                sender: '🧪 Validator',
+                text: `❌ Rejected "${taskTitle || taskId}". Revision notes saved to ${revisionPath}.`
+            });
+        } else {
+            this.broadcast('chat', {
+                sender: '🧪 Validator',
+                text: `✅ Approved "${taskTitle || taskId}". Task moved to done.`
+            });
+        }
     }
 
     // Heuristic: a rationale is "weak" if it's empty, placeholder-ish, or too short.
@@ -2739,8 +2957,12 @@ Paired buddy: Sales Outreach.`,
     onJoin(client: Client, options: any) {
         console.log(client.sessionId, "joined the office room!");
         // Send existing tasks to newly joined client
-        this.memoryStore.getTasks().then(tasks => {
-            client.send('tasks-sync', tasks);
+        this.memoryStore.getTasks().then(async tasks => {
+            const enrichedTasks = await Promise.all(tasks.map(async (task: any) => ({
+                ...task,
+                reviewHistory: await this.memoryStore.listReviews({ taskId: String(task.id), limit: 50 })
+            })));
+            client.send('tasks-sync', enrichedTasks);
         });
         client.send('relationship-update', this.buildRelationshipPayload());
         client.send('fast-track-state', { enabled: this.fastTrackMode });
@@ -2750,7 +2972,9 @@ Paired buddy: Sales Outreach.`,
         });
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
         client.send('approvals-sync', this.listApprovals());
-        client.send('project-state-sync', { project: getActiveProject() });
+        this.memoryStore.listReviews({ limit: 200 }).then((reviews) => {
+            client.send('reviews-sync', reviews);
+        }).catch(() => {});
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
             : { active: false });
