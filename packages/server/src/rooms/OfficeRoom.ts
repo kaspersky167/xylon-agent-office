@@ -110,9 +110,30 @@ const MAJOR_TOOLS = new Set<string>([
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
     private static extensionRegistry: unknown = null;
+    private static artifactWriteLogger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null = null;
 
     static setExtensionRegistry(registry: unknown) {
         OfficeRoom.extensionRegistry = registry;
+    }
+
+    static setArtifactWriteLogger(logger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null) {
+        OfficeRoom.artifactWriteLogger = logger;
     }
 
     maxClients = 100;
@@ -320,6 +341,7 @@ export class OfficeRoom extends Room<OfficeState> {
         // Initialize memory store
         const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
         await this.memoryStore.initialize(dbPath);
+        this.toolExecutor.setArtifactWriteLogger(OfficeRoom.artifactWriteLogger);
 
         const config: OfficeConfig = {
             name: options.name || 'Startup HQ',
