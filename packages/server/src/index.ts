@@ -16,6 +16,7 @@ import {
 // Setup Express
 const app = express();
 app.use(express.json());
+const memoryStore = new MemoryStore();
 
 // Basic REST API for Office Management
 app.get('/api/offices', (req, res) => {
@@ -70,6 +71,54 @@ const resolveWorkspacePath = (targetPath: string): string => {
 const guessMimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase();
     return EXTENSION_TO_MIME[ext] || 'application/octet-stream';
+};
+
+const parseArtifactPath = (relativePath: string): {
+    projectId: string;
+    approved: boolean;
+} => {
+    const normalized = relativePath.split(path.sep).join('/');
+    const match = normalized.match(/^projects\/([^/]+)\/([^/]+)\//);
+    if (!match) {
+        return { projectId: 'unscoped', approved: false };
+    }
+    const subfolder = match[2];
+    return {
+        projectId: match[1],
+        approved: ['artifacts', 'uploads', 'generated', 'outputs'].includes(subfolder)
+    };
+};
+
+const upsertArtifactFromPath = async (relativePath: string, context?: {
+    taskId?: string;
+    agentId?: string;
+    status?: ArtifactStatus;
+    checksum?: string;
+}) => {
+    const fullPath = resolveWorkspacePath(relativePath);
+    let exists = false;
+    let sizeBytes = 0;
+    try {
+        const fileStats = await stat(fullPath);
+        exists = fileStats.isFile();
+        sizeBytes = fileStats.size;
+    } catch {
+        exists = false;
+    }
+    const parsed = parseArtifactPath(relativePath);
+    const status: ArtifactStatus = context?.status || (parsed.approved && exists ? 'validated' : 'rejected');
+    await memoryStore.upsertArtifact({
+        id: randomUUID(),
+        projectId: parsed.projectId,
+        taskId: context?.taskId || null,
+        agentId: context?.agentId || null,
+        relativePath: relativePath.split(path.sep).join('/'),
+        mimeType: guessMimeType(relativePath),
+        sizeBytes,
+        status,
+        checksum: context?.checksum || null,
+        existsOnDisk: exists
+    });
 };
 
 const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
@@ -155,6 +204,11 @@ app.post('/api/workspace-files/save', async (req, res) => {
         const fullPath = resolveWorkspacePath(targetPath);
         await mkdir(path.dirname(fullPath), { recursive: true });
         await writeFile(fullPath, content, 'utf-8');
+        await upsertArtifactFromPath(targetPath, {
+            taskId: typeof req.body?.taskId === 'string' ? req.body.taskId : undefined,
+            agentId: typeof req.body?.agentId === 'string' ? req.body.agentId : 'user',
+            status: 'draft'
+        });
         res.json({ ok: true, path: targetPath });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to save workspace file.' });
@@ -170,18 +224,69 @@ app.post('/api/workspace-files/upload', async (req, res) => {
         const buffer = Buffer.from(normalized, 'base64');
         await mkdir(path.dirname(fullPath), { recursive: true });
         await writeFile(fullPath, buffer);
+        await upsertArtifactFromPath(targetPath, {
+            taskId: typeof req.body?.taskId === 'string' ? req.body.taskId : undefined,
+            agentId: typeof req.body?.agentId === 'string' ? req.body.agentId : 'user',
+            status: 'submitted'
+        });
         res.json({ ok: true, path: targetPath, size: buffer.length });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to upload workspace file.' });
     }
 });
 
+app.get('/api/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: typeof req.query.project_id === 'string' ? req.query.project_id : undefined,
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        res.json({ ok: true, artifacts, rootHint: workspaceRoot });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list artifacts.' });
+    }
+});
+
+app.get('/api/projects/:projectId/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: String(req.params.projectId || '').trim(),
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        res.json({ ok: true, artifacts, rootHint: path.join(workspaceRoot, 'projects', req.params.projectId, 'artifacts') });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list project artifacts.' });
+    }
+});
+
 const bootstrap = async () => {
+    const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
+    await memoryStore.initialize(dbPath);
     const configuredExtensionFolder = process.env.AGENT_EXTENSION_DIR
         ? path.resolve(process.cwd(), process.env.AGENT_EXTENSION_DIR)
         : path.resolve(__dirname, 'extensions', 'builtin');
     const extensionRegistry = await ExtensionRegistry.loadFromFolder(configuredExtensionFolder);
     OfficeRoom.setExtensionRegistry(extensionRegistry);
+    OfficeRoom.setArtifactWriteLogger(async (entry) => {
+        await upsertArtifactFromPath(entry.relativePath, {
+            agentId: entry.actorId,
+            status: entry.status
+        });
+    });
     console.log(`[Extensions] Active hooks: ${extensionRegistry.list().join(', ') || 'none'}`);
 
     // Create HTTP and Colyseus server

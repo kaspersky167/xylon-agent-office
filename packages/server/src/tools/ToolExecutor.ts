@@ -29,6 +29,15 @@ export interface ToolAuditEntry {
 }
 
 type ToolAuditLogger = (entry: ToolAuditEntry) => Promise<void> | void;
+type ArtifactWriteLogger = (entry: {
+  relativePath: string;
+  absolutePath: string;
+  mimeType: string;
+  sizeBytes: number;
+  actorId?: string;
+  status: "draft" | "submitted" | "validated" | "rejected";
+  existsOnDisk: boolean;
+}) => Promise<void> | void;
 
 // Frugality guard — shared across all ToolExecutor instances in the process.
 // Tavily charges 1 credit per basic search result (up to 5 results = 1 credit).
@@ -58,13 +67,22 @@ interface ToolResearchPayload {
 export class ToolExecutor {
   private tavilyClient: TavilyClient | null = null;
   private auditLogger: ToolAuditLogger | null = null;
+  private artifactWriteLogger: ArtifactWriteLogger | null = null;
 
-  constructor(options?: { auditLogger?: ToolAuditLogger }) {
+  constructor(options?: {
+    auditLogger?: ToolAuditLogger;
+    artifactWriteLogger?: ArtifactWriteLogger;
+  }) {
     this.auditLogger = options?.auditLogger || null;
+    this.artifactWriteLogger = options?.artifactWriteLogger || null;
   }
 
   setAuditLogger(logger: ToolAuditLogger | null) {
     this.auditLogger = logger;
+  }
+
+  setArtifactWriteLogger(logger: ArtifactWriteLogger | null) {
+    this.artifactWriteLogger = logger;
   }
 
   private getTavilyClient(): TavilyClient | null {
@@ -153,7 +171,11 @@ export class ToolExecutor {
           );
           break;
         case "write_file":
-          result = await this.writeFile(safeParams.path, safeParams.content);
+          result = await this.writeFile(
+            safeParams.path,
+            safeParams.content,
+            safeContext,
+          );
           break;
         case "run_command":
           result = await this.runCommand(safeParams.command);
@@ -597,17 +619,56 @@ export class ToolExecutor {
   private async writeFile(
     filePath: string,
     content: string,
+    context?: ToolExecutionContext,
   ): Promise<ToolResult> {
-    const { writeFile, mkdir } = await import("fs/promises");
+    const { writeFile, mkdir, stat } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
       const safePath = resolveScopedPath(workspaceRoot, filePath);
       await mkdir(pathModule.dirname(safePath), { recursive: true });
       await writeFile(safePath, content, "utf-8");
+      const metadata = await stat(safePath);
+      const relativePath = pathModule
+        .relative(workspaceRoot, safePath)
+        .replace(/\\/g, "/");
+      const allowedPattern =
+        /^projects\/[^/]+\/(?:artifacts|uploads|generated|outputs)\//;
+      const existsOnDisk = metadata.isFile();
+      if (this.artifactWriteLogger) {
+        await this.artifactWriteLogger({
+          relativePath,
+          absolutePath: safePath,
+          mimeType: this.guessMimeType(relativePath),
+          sizeBytes: metadata.size,
+          actorId: context?.actorId,
+          status:
+            allowedPattern.test(relativePath) && existsOnDisk
+              ? "validated"
+              : "rejected",
+          existsOnDisk,
+        });
+      }
       return { success: true, output: `Written to ${safePath}` };
     } catch (e: any) {
       return { success: false, output: "", error: e.message };
     }
+  }
+
+  private guessMimeType(filePath: string): string {
+    const ext = pathModule.extname(filePath).toLowerCase();
+    const map: Record<string, string> = {
+      ".md": "text/markdown",
+      ".txt": "text/plain",
+      ".json": "application/json",
+      ".html": "text/html",
+      ".htm": "text/html",
+      ".csv": "text/csv",
+      ".js": "text/javascript",
+      ".ts": "text/typescript",
+      ".tsx": "text/tsx",
+      ".jsx": "text/jsx",
+    };
+    return map[ext] || "application/octet-stream";
   }
 
   private runCommand(command: string): Promise<ToolResult> {

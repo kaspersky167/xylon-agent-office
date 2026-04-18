@@ -5,7 +5,7 @@ import { OllamaAdapter, OpenAICompatibleAdapter } from '@agent-office/adapters';
 import { ToolExecutor } from '../tools/ToolExecutor';
 import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/MemoryStore';
 import path from 'path';
-import { readFile, stat, mkdir, writeFile } from 'fs/promises';
+import { readFile, stat, mkdir, writeFile, readdir } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
 import { ProjectWorkspace } from '../projects/ProjectWorkspace';
 import { getActiveProject, getActiveWorkspaceRoot, resolveScopedPath } from '../projects/workspacePaths';
@@ -34,6 +34,16 @@ interface CompletedTaskRecord {
     agentName: string;
     completedAt: string;
     summaryPath: string;
+}
+
+interface ProjectContextPayload {
+    projectSlug: string;
+    projectBrief: string;
+    acceptanceCriteria: string[];
+    activeTask: string;
+    recentReviewNotes: string[];
+    artifactIndexSummary: string;
+    contextHash: string;
 }
 
 interface ApprovalRequest {
@@ -112,9 +122,30 @@ const MAJOR_TOOLS = new Set<string>([
 export class OfficeRoom extends Room<OfficeState> {
     private static activeRoom: OfficeRoom | null = null;
     private static extensionRegistry: unknown = null;
+    private static artifactWriteLogger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null = null;
 
     static setExtensionRegistry(registry: unknown) {
         OfficeRoom.extensionRegistry = registry;
+    }
+
+    static setArtifactWriteLogger(logger: ((entry: {
+        relativePath: string;
+        absolutePath: string;
+        mimeType: string;
+        sizeBytes: number;
+        actorId?: string;
+        status: 'draft' | 'submitted' | 'validated' | 'rejected';
+        existsOnDisk: boolean;
+    }) => Promise<void> | void) | null) {
+        OfficeRoom.artifactWriteLogger = logger;
     }
 
     maxClients = 100;
@@ -144,6 +175,7 @@ export class OfficeRoom extends Room<OfficeState> {
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
     private mailMessages: MailMessage[] = [];
+    private currentProjectSlug = 'xylon';
 
     private getWorkspaceRoot(): string {
         return getActiveWorkspaceRoot();
@@ -176,6 +208,136 @@ export class OfficeRoom extends Room<OfficeState> {
 
     private resolveWorkspacePath(targetPath: string): string {
         return resolveScopedPath(this.getWorkspaceRoot(), targetPath);
+    }
+
+    private projectRoot(projectSlug: string): string {
+        return path.join(this.workspaceRoot, 'projects', projectSlug);
+    }
+
+    private async safeReadWorkspaceText(relativePath: string): Promise<string> {
+        try {
+            const absolutePath = this.resolveWorkspacePath(relativePath);
+            const content = await readFile(absolutePath, 'utf-8');
+            return content.trim();
+        } catch {
+            return '';
+        }
+    }
+
+    private summarizeArtifactPath(filePath: string): string {
+        const normalized = filePath.replace(/\\/g, '/');
+        const parts = normalized.split('/').filter(Boolean);
+        return parts.slice(-2).join('/');
+    }
+
+    private async buildProjectContext(agentId: string, activeTask: string): Promise<ProjectContextPayload> {
+        const projectSlug = this.currentProjectSlug || 'default';
+        const projectRoot = this.projectRoot(projectSlug);
+        const briefRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'project-brief.md'));
+        const criteriaRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'acceptance-criteria.md'));
+        const artifactIndexRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'artifact-index.md'));
+
+        const taskRows = await this.memoryStore.getTasks();
+        const activeTaskRow = taskRows.find((task) =>
+            task.assigned_to === agentId &&
+            ['in_progress', 'review', 'blocked', 'backlog'].includes(String(task.status || '').toLowerCase())
+        );
+
+        const reviewFromDb = taskRows
+            .filter((task) => task.assigned_to === agentId && String(task.status || '').toLowerCase() === 'review')
+            .slice(0, 4)
+            .map((task) => task.status_reason || `Task "${task.title}" is pending review.`);
+
+        const globalMemories = await this.memoryStore.loadMemories('agency:global', 40);
+        const reviewFromMemories = globalMemories
+            .filter((entry) => /\breview|revision|rework|acceptance\b/i.test(entry.content))
+            .slice(0, 4)
+            .map((entry) => entry.content);
+
+        let artifactSummary = artifactIndexRaw;
+        if (!artifactSummary) {
+            const artifactsDir = path.join(projectRoot, 'artifacts');
+            try {
+                const items = await readdir(artifactsDir);
+                artifactSummary = items.slice(0, 12).map((item) => `- ${item}`).join('\n');
+            } catch {
+                artifactSummary = '';
+            }
+        }
+        if (!artifactSummary && this.completedTasks.length > 0) {
+            artifactSummary = this.completedTasks
+                .slice(0, 8)
+                .map((item) => `- ${item.task} (${this.summarizeArtifactPath(item.summaryPath)})`)
+                .join('\n');
+        }
+
+        const acceptanceCriteria = criteriaRaw
+            ? criteriaRaw.split('\n').map((line) => line.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 8)
+            : ['Deliver outputs directly relevant to the active project brief and assigned task.'];
+
+        const projectBrief = briefRaw || `Project "${projectSlug}" is active. Use assigned task + acceptance criteria only.`;
+        const resolvedActiveTask = activeTaskRow?.title || activeTask || 'No active task assigned.';
+        const recentReviewNotes = [...reviewFromDb, ...reviewFromMemories].slice(0, 6);
+        const contextHash = createHash('sha256').update(JSON.stringify({
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactSummary
+        })).digest('hex');
+
+        return {
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactIndexSummary: artifactSummary || 'No project artifacts indexed yet.',
+            contextHash
+        };
+    }
+
+    private async persistProjectContextAudit(agentId: string, context: ProjectContextPayload): Promise<void> {
+        const logDir = this.resolveWorkspacePath(path.posix.join('projects', context.projectSlug, 'logs'));
+        await mkdir(logDir, { recursive: true });
+        const logPath = path.join(logDir, `${agentId}.jsonl`);
+        const row = JSON.stringify({
+            time: this.state.officeTime || new Date().toISOString(),
+            sessionId: this.sessionId,
+            agentId,
+            contextHash: context.contextHash,
+            activeTask: context.activeTask
+        });
+        await writeFile(logPath, `${row}\n`, { encoding: 'utf-8', flag: 'a' });
+    }
+
+    private decisionReferencesProjectContext(decision: any, context: ProjectContextPayload): boolean {
+        const payload = JSON.stringify({
+            thought: decision?.thought || '',
+            target: decision?.target || '',
+            message: decision?.message || '',
+            toolCall: decision?.toolCall || {}
+        }).toLowerCase();
+
+        const tokens = [
+            context.projectSlug.toLowerCase(),
+            ...context.activeTask.toLowerCase().split(/\W+/).filter((token) => token.length > 3).slice(0, 8),
+            ...context.acceptanceCriteria.join(' ').toLowerCase().split(/\W+/).filter((token) => token.length > 5).slice(0, 6)
+        ];
+
+        return tokens.some((token) => token && payload.includes(token));
+    }
+
+    private async routeTaskBackToReview(agentId: string, reason: string, taskTitle: string) {
+        await this.memoryStore.upsertTaskStatusByTitle(agentId, taskTitle, 'review', reason);
+        this.broadcast('task-update', {
+            agentId,
+            agentName: this.coreAgents.get(agentId)?.config.name || agentId,
+            task: taskTitle,
+            status: 'review',
+            reason
+        });
     }
 
     private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
@@ -319,6 +481,7 @@ export class OfficeRoom extends Room<OfficeState> {
         // Initialize memory store
         const dbPath = process.env.OFFICE_MEMORY_DB_PATH || process.env.DATABASE_URL || './data/office-memory.db';
         await this.memoryStore.initialize(dbPath);
+        this.toolExecutor.setArtifactWriteLogger(OfficeRoom.artifactWriteLogger);
 
         const config: OfficeConfig = {
             name: options.name || 'Startup HQ',
@@ -662,7 +825,7 @@ Paired buddy: Sales Outreach.`,
                 agentState.action = 'work';
 
                 // Persist task
-                this.memoryStore.createTask(title, targetId);
+                this.registerTaskTracking(targetId, title).catch(() => {});
 
                 this.broadcast('chat', {
                     sender: 'System',
@@ -674,9 +837,10 @@ Paired buddy: Sales Outreach.`,
                     agentName: agentState.name,
                     task: title,
                     status: 'in_progress',
+                    statusReason: 'waiting_for_artifact',
+                    progress: 0,
                     fastTrackMode: this.fastTrackMode
                 });
-                this.seedTaskProgress(targetId, title);
             }
         });
 
@@ -1084,18 +1248,37 @@ Paired buddy: Sales Outreach.`,
                     }
                 });
 
-                coreAgent.think({
-                    time: this.state.officeTime,
-                    location: `${agentState.x},${agentState.y}`,
-                    nearbyAgents,
-                    currentTask: coreAgent.currentTask || null,
-                    recentMessages: coreAgent.getUnreadMessages(),
-                    memories: coreAgent.getRecentMemories(5)
-                }).then(async (decision: any) => {
+                (async () => {
+                    const projectContext = await this.buildProjectContext(id, coreAgent.currentTask || '');
+                    await this.persistProjectContextAudit(id, projectContext);
+
+                    return coreAgent.think({
+                        time: this.state.officeTime,
+                        location: `${agentState.x},${agentState.y}`,
+                        nearbyAgents,
+                        currentTask: coreAgent.currentTask || null,
+                        recentMessages: coreAgent.getUnreadMessages(),
+                        memories: coreAgent.getRecentMemories(5),
+                        projectContext
+                    }).then(async (decision: any) => {
                     agentState.action = decision.action;
 
                     if (decision.thought) {
                         agentState.thought = decision.thought;
+                    }
+
+                    if (coreAgent.currentTask && !this.decisionReferencesProjectContext(decision, projectContext)) {
+                        const reason = 'Guardrail: output did not reference active project/task context.';
+                        await this.routeTaskBackToReview(id, reason, coreAgent.currentTask);
+                        coreAgent.addMemory({
+                            content: `${reason} Routed "${coreAgent.currentTask}" to review.`,
+                            type: 'task_result',
+                            timestamp: this.state.officeTime,
+                            importance: 0.9
+                        });
+                        agentState.action = 'idle';
+                        setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                        return;
                     }
 
                     // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
@@ -1170,7 +1353,7 @@ Paired buddy: Sales Outreach.`,
                             if (targetAgent && targetState) {
                                 targetAgent.currentTask = title;
                                 targetState.currentTask = title;
-                                await this.memoryStore.createTask(title, targetId);
+                                await this.registerTaskTracking(targetId, title);
 
                                 this.broadcast('chat', {
                                     sender: coreAgent.config.name,
@@ -1181,9 +1364,10 @@ Paired buddy: Sales Outreach.`,
                                     agentName: targetAgent.config.name,
                                     task: title,
                                     status: 'in_progress',
+                                    statusReason: 'waiting_for_artifact',
+                                    progress: 0,
                                     fastTrackMode: this.fastTrackMode
                                 });
-                                this.seedTaskProgress(targetId, title);
                                 this.emitHighlight(
                                     'task',
                                     `${coreAgent.config.name} assigned work`,
@@ -1286,6 +1470,14 @@ Paired buddy: Sales Outreach.`,
                                 decision.toolCall.name,
                                 decision.toolCall.params
                             );
+                            const toolAuditLogId = await this.memoryStore.logToolAudit({
+                                actorId: id,
+                                actorRole: coreAgent.config.role || 'agent',
+                                toolName: decision.toolCall.name,
+                                paramsHash: this.memoryStore.hashToolParams(decision.toolCall.params),
+                                result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`
+                            });
+                            await this.captureTaskToolEvidence(id, decision.toolCall.name, decision.toolCall.params, result.success, toolAuditLogId);
 
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
@@ -1338,6 +1530,10 @@ Paired buddy: Sales Outreach.`,
 
                 }).catch((err: any) => {
                     console.error(`Agent ${id} think error:`, err);
+                    setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
+                });
+                })().catch((err) => {
+                    console.error(`Agent ${id} project-context error:`, err);
                     setTimeout(() => this.thinkingLocks.set(id, false), this.fastTrackMode ? 4500 : 15000);
                 });
             }
@@ -1464,6 +1660,7 @@ Paired buddy: Sales Outreach.`,
             // /project xylon  → kicks off the Xylon Growth Sprint (ACME) scenario
             const which = (argStr || 'xylon').toLowerCase();
             if (which.startsWith('xylon') || which.startsWith('acme') || which === '') {
+                this.currentProjectSlug = 'xylon';
                 this.currentScenario = 'Xylon Growth Sprint';
                 this.applyScenarioKickoff('Xylon Growth Sprint');
             } else {
@@ -1517,15 +1714,14 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95
             });
-            this.memoryStore.createTask(task, agentId).catch(() => {});
+            this.registerTaskTracking(agentId, task).catch(() => {});
             this.broadcast('chat', {
                 sender: '🏢 Office',
                 text: `📌 CEO assigned "${task}" → ${agent.config.name}`
             });
             this.broadcast('task-update', {
-                agentId, agentName: agent.config.name, task, status: 'in_progress'
+                agentId, agentName: agent.config.name, task, status: 'in_progress', statusReason: 'waiting_for_artifact', progress: 0
             });
-            this.seedTaskProgress(agentId, task);
             return true;
         }
 
@@ -1557,54 +1753,136 @@ Paired buddy: Sales Outreach.`,
         return `${agentId}:${taskTitle}`;
     }
 
-    private seedTaskProgress(agentId: string, taskTitle: string) {
+    private async registerTaskTracking(agentId: string, taskTitle: string): Promise<void> {
         if (!taskTitle) return;
+        const taskId = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!taskId) return;
+        this.taskRecordIds.set(this.progressKey(agentId, taskTitle), taskId);
         this.taskProgress.set(this.progressKey(agentId, taskTitle), 0);
+    }
+
+    private async getOrCreateTaskRecordId(agentId: string, taskTitle: string): Promise<string | null> {
+        const key = this.progressKey(agentId, taskTitle);
+        const cached = this.taskRecordIds.get(key);
+        if (cached) return cached;
+        const existing = await this.memoryStore.findActiveTask(agentId, taskTitle);
+        if (existing?.id) {
+            this.taskRecordIds.set(key, existing.id);
+            return existing.id;
+        }
+        const created = await this.memoryStore.createTask(taskTitle, agentId);
+        if (!created) return null;
+        this.taskRecordIds.set(key, created);
+        return created;
+    }
+
+    private async captureTaskToolEvidence(agentId: string, toolName: string, params: any, success: boolean, toolAuditLogId: number | null) {
+        const agent = this.coreAgents.get(agentId);
+        const taskTitle = agent?.currentTask;
+        if (!taskTitle || !success) return;
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        await this.memoryStore.addTaskEvidence({
+            id: `tev_${randomUUID()}`,
+            taskId: taskRecordId,
+            agentId,
+            evidenceType: 'tool_execution',
+            toolAuditLogId,
+            metadata: {
+                toolName,
+                params,
+            },
+            createdAt: this.state.officeTime,
+        });
+
+        const artifactPath = String(params?.path || '').trim();
+        if (artifactPath) {
+            await this.memoryStore.addTaskEvidence({
+                id: `tev_${randomUUID()}`,
+                taskId: taskRecordId,
+                agentId,
+                evidenceType: 'artifact',
+                artifactId: String(params?.fileId || ''),
+                artifactPath,
+                metadata: {
+                    source: 'tool_execution',
+                    toolName,
+                },
+                createdAt: this.state.officeTime,
+            });
+        }
+    }
+
+    private async evaluateTaskEvidence(taskId: string): Promise<TaskEvidenceState> {
+        const evidence = await this.memoryStore.getTaskEvidence(taskId);
+        let artifactExists = false;
+        let toolExecutionSucceeded = false;
+        let validatorApproved = false;
+
+        for (const item of evidence) {
+            if (!artifactExists && item.evidenceType === 'artifact' && item.artifactPath) {
+                try {
+                    await stat(this.resolveWorkspacePath(item.artifactPath));
+                    artifactExists = true;
+                } catch {}
+            }
+            if (!toolExecutionSucceeded && item.evidenceType === 'tool_execution' && item.toolAuditLogId) {
+                toolExecutionSucceeded = true;
+            }
+            if (!validatorApproved && item.evidenceType === 'validator' && item.validatorDecision === 'approved') {
+                validatorApproved = true;
+            }
+            if (artifactExists && toolExecutionSucceeded && validatorApproved) break;
+        }
+
+        return { artifactExists, toolExecutionSucceeded, validatorApproved };
+    }
+
+    private taskStatusReason(evidence: TaskEvidenceState): string {
+        if (evidence.validatorApproved) return 'validated';
+        if (evidence.artifactExists || evidence.toolExecutionSucceeded) return 'pending_validation';
+        return 'waiting_for_artifact';
     }
 
     private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
         const taskTitle = agent.currentTask;
         if (!taskTitle) return;
-
         const key = this.progressKey(agentId, taskTitle);
-        const current = this.taskProgress.get(key) ?? 0;
-        const baseWorkDelta = this.fastTrackMode ? 0.45 : 0.2;
-        const baseToolDelta = this.fastTrackMode ? 0.5 : 0.3;
-        const baseTalkDelta = this.fastTrackMode ? 0.02 : 0.08;
-        const delta = action === 'work'
-            ? baseWorkDelta
-            : action === 'use_tool'
-                ? baseToolDelta
-                : action === 'talk'
-                    ? baseTalkDelta
-                    : 0;
-        if (delta <= 0) return;
-
-        const next = Math.min(1, current + delta);
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        const evidence = await this.evaluateTaskEvidence(taskRecordId);
+        const checkpointsPassed = [evidence.artifactExists, evidence.toolExecutionSucceeded, evidence.validatorApproved].filter(Boolean).length;
+        const next = checkpointsPassed / 3;
+        const reason = this.taskStatusReason(evidence);
+        const shouldComplete = checkpointsPassed >= 1;
         this.taskProgress.set(key, next);
+
+        await this.memoryStore.updateTaskStatus({
+            taskId: taskRecordId,
+            status: shouldComplete ? 'done' : 'in_progress',
+            statusReason: reason,
+            progress: next,
+            completed: shouldComplete,
+        });
 
         this.broadcast('task-update', {
             agentId,
             agentName: agent.config.name,
             task: taskTitle,
-            status: next >= 1 ? 'completed' : 'in_progress',
+            status: shouldComplete ? 'done' : 'in_progress',
+            statusReason: reason,
             progress: next,
+            evidence,
+            action,
             fastTrackMode: this.fastTrackMode
         });
 
-        if (next < 1) return;
+        if (!shouldComplete) return;
 
         this.taskProgress.delete(key);
+        this.taskRecordIds.delete(key);
         agent.currentTask = '';
-        agentState.currentTask = '';
-
-        try {
-            const tasks = await this.memoryStore.getTasks();
-            const match = tasks.find((t) => t.title === taskTitle && t.assigned_to === agentId && t.status !== 'completed');
-            if (match?.id) await this.memoryStore.completeTask(match.id);
-        } catch {
-            // Best-effort persistence only; task completion is still reflected in broadcast updates.
-        }
+        if (agentState) agentState.currentTask = '';
 
         this.emitHighlight(
             'task',
@@ -1988,6 +2266,27 @@ Paired buddy: Sales Outreach.`,
 
         if (req.fileContext?.fileId) {
             this.memoryStore.updateSharedFileStatus(req.fileContext.fileId, decision, req.id).catch((e) => console.error('updateSharedFileStatus', e));
+            const requester = this.coreAgents.get(req.requestedBy);
+            if (requester?.currentTask) {
+                const taskRecordId = await this.getOrCreateTaskRecordId(req.requestedBy, requester.currentTask);
+                if (taskRecordId) {
+                    await this.memoryStore.addTaskEvidence({
+                        id: `tev_${randomUUID()}`,
+                        taskId: taskRecordId,
+                        agentId: req.requestedBy,
+                        evidenceType: 'validator',
+                        artifactId: req.fileContext.fileId,
+                        artifactPath: req.fileContext.filePath,
+                        validatorDecision: decision,
+                        metadata: {
+                            approvalId: req.id,
+                            requestedAction: req.requestedAction,
+                        },
+                        createdAt: this.state.officeTime,
+                    });
+                    await this.advanceTaskProgress(req.requestedBy, requester, this.state.agents.get(req.requestedBy), 'validation');
+                }
+            }
             this.broadcast('chat', {
                 sender: '📎 File Review',
                 text: `File "${req.fileContext.fileName}" (${req.fileContext.filePath}) was ${decision} by CEO.`
@@ -2013,6 +2312,15 @@ Paired buddy: Sales Outreach.`,
                     this.broadcast('chat', { sender: '🏢 Office', text: `Hiring unblocked for ${req.requestedByName}.` });
                 } else {
                     const result = await this.toolExecutor.execute(req.pending.toolName, req.pending.params);
+                    const toolAuditLogId = await this.memoryStore.logToolAudit({
+                        actorId: req.requestedBy,
+                        actorRole: requester?.config.role || 'agent',
+                        toolName: req.pending.toolName,
+                        paramsHash: this.memoryStore.hashToolParams(req.pending.params),
+                        result: result.success ? `success:${result.output.slice(0, 500)}` : `failed:${(result.error || result.output || '').slice(0, 500)}`,
+                        approvalId: req.id,
+                    });
+                    await this.captureTaskToolEvidence(req.requestedBy, req.pending.toolName, req.pending.params, result.success, toolAuditLogId);
                     this.broadcast('chat', {
                         sender: req.requestedByName,
                         text: `🔧 (post-approval) [${req.pending.toolName}]: ${result.success ? result.output.slice(0, 100) : result.error}`
@@ -2109,6 +2417,7 @@ Paired buddy: Sales Outreach.`,
     // the lead, and a Statement of Work. Running this scenario exercises the
     // exact muscles the real company uses to win work.
     private kickoffXylonGrowthSprint() {
+        this.currentProjectSlug = 'xylon';
         const project = 'ACME Manufacturing — M365 Copilot rollout + oversharing remediation + landing page + SOW';
         const brief = [
             `NEW PROJECT: ${project}.`,
@@ -2203,11 +2512,10 @@ Paired buddy: Sales Outreach.`,
                 timestamp: this.state.officeTime,
                 importance: 0.95,
             });
-            this.memoryStore.createTask(a.task, a.id).catch(() => {});
+            this.registerTaskTracking(a.id, a.task).catch(() => {});
             this.broadcast('task-update', {
-                agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress'
+                agentId: a.id, agentName: agent.config.name, task: a.task, status: 'in_progress', statusReason: 'waiting_for_artifact', progress: 0
             });
-            this.seedTaskProgress(a.id, a.task);
         }
 
         // CEO brief (no approval gate, just awareness)
