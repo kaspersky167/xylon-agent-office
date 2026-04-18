@@ -83,18 +83,22 @@ const parseArtifactPath = (
   projectId: string;
   approved: boolean;
 } => {
-  const normalized = relativePath.split(path.sep).join("/");
-  const match = normalized.match(/^projects\/([^/]+)\/([^/]+)\//);
-  if (!match) {
-    return { projectId: "unscoped", approved: false };
-  }
-  const subfolder = match[2];
-  return {
-    projectId: match[1],
-    approved: ["artifacts", "uploads", "generated", "outputs"].includes(
-      subfolder,
-    ),
-  };
+    const activeProject = getActiveProject();
+    const normalized = relativePath.split(path.sep).join('/');
+    const match = normalized.match(/^projects\/([^/]+)\/([^/]+)\//);
+    if (!match) {
+        const directSubfolderMatch = normalized.match(/^([^/]+)\//);
+        const subfolder = directSubfolderMatch?.[1] || '';
+        return {
+            projectId: activeProject?.projectSlug || 'unscoped',
+            approved: ['artifacts', 'uploads', 'generated', 'outputs', 'completed-work'].includes(subfolder)
+        };
+    }
+    const subfolder = match[2];
+    return {
+        projectId: match[1],
+        approved: ['artifacts', 'uploads', 'generated', 'outputs', 'completed-work'].includes(subfolder)
+    };
 };
 
 const upsertArtifactFromPath = async (
@@ -314,13 +318,29 @@ app.get("/api/task-runs", async (req, res) => {
   }
 });
 
-app.post("/api/task-runs/:runId/cancel", async (req, res) => {
-  try {
-    if (!taskRunRuntime) {
-      res
-        .status(503)
-        .json({ ok: false, error: "Task runtime is not initialized." });
-      return;
+app.get('/api/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: typeof req.query.project_id === 'string'
+                ? req.query.project_id
+                : getActiveProject()?.projectSlug,
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        res.json({
+            ok: true,
+            artifacts,
+            project: getActiveProject(),
+            rootHint: getActiveWorkspaceRoot()
+        });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list artifacts.' });
     }
     const run = await taskRunRuntime.cancelRun(
       String(req.params.runId || "").trim(),
@@ -340,30 +360,27 @@ app.post("/api/task-runs/:runId/cancel", async (req, res) => {
   }
 });
 
-app.post("/api/workspace-files/save", async (req, res) => {
-  try {
-    const targetPath = String(req.body?.path || "").trim();
-    const content =
-      typeof req.body?.content === "string" ? req.body.content : "";
-    const fullPath = resolveWorkspacePath(targetPath);
-    await mkdir(path.dirname(fullPath), { recursive: true });
-    await writeFile(fullPath, content, "utf-8");
-    await upsertArtifactFromPath(targetPath, {
-      taskId:
-        typeof req.body?.taskId === "string" ? req.body.taskId : undefined,
-      agentId:
-        typeof req.body?.agentId === "string" ? req.body.agentId : "user",
-      status: "draft",
-    });
-    res.json({ ok: true, path: targetPath });
-  } catch (error: any) {
-    res
-      .status(400)
-      .json({
-        ok: false,
-        error: error?.message || "Unable to save workspace file.",
-      });
-  }
+app.get('/api/projects/:projectId/artifacts', async (req, res) => {
+    try {
+        const existsFilter = typeof req.query.exists_on_disk === 'string'
+            ? req.query.exists_on_disk === 'true'
+            : undefined;
+        const artifacts = await memoryStore.listArtifacts({
+            projectId: String(req.params.projectId || '').trim(),
+            taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
+            agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
+            status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
+            existsOnDisk: existsFilter,
+            limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
+        });
+        const activeProject = getActiveProject();
+        const projectArtifactsRoot = activeProject?.projectSlug === req.params.projectId
+            ? path.join(activeProject.projectRoot, 'artifacts')
+            : path.join(getGlobalWorkspaceRoot(), 'projects', req.params.projectId, 'artifacts');
+        res.json({ ok: true, artifacts, rootHint: projectArtifactsRoot });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to list project artifacts.' });
+    }
 });
 
 app.post("/api/workspace-files/upload", async (req, res) => {

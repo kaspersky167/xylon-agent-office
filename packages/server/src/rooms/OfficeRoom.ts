@@ -151,6 +151,10 @@ interface TaskEvidenceState {
   validatorApproved: boolean;
 }
 
+export const shouldMarkTaskDone = (evidence: TaskEvidenceState): boolean => {
+    return evidence.artifactExists && evidence.toolExecutionSucceeded && evidence.validatorApproved;
+};
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
   "hire_agent",
@@ -174,90 +178,338 @@ export class OfficeRoom extends Room<OfficeState> {
         actorId?: string;
         status: "draft" | "submitted" | "validated" | "rejected";
         existsOnDisk: boolean;
-      }) => Promise<void> | void)
-    | null = null;
+    }) => Promise<void> | void) | null) {
+        OfficeRoom.artifactWriteLogger = logger;
+    }
 
-  static setExtensionRegistry(registry: unknown) {
-    OfficeRoom.extensionRegistry = registry;
-  }
+    maxClients = 100;
+    private office!: Office;
+    private demoTickCount = 0;
+    private coreAgents: Map<string, Agent> = new Map();
+    private thinkingLocks: Map<string, boolean> = new Map();
+    private ollamaAdapter = new OllamaAdapter('http://localhost:11434');
+    private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter = this.ollamaAdapter;
+    private inferenceProvider: InferenceConfig['provider'] = 'ollama';
+    private defaultModel = process.env.AGENT_MODEL || process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-latest';
+    private hireCount = 0; // Counter for generating unique IDs
+    private toolExecutor = new ToolExecutor();
+    private memoryStore = new MemoryStore();
+    private sessionId = `session_${Date.now()}`;
+    private currentScenario = 'Free Play';
+    private highlights: HighlightEvent[] = [];
+    private chaosHistory: Array<{ event: string; label: string; time: string }> = [];
+    private relationships: Map<string, RelationshipEdge> = new Map();
+    private audienceVotes: Record<string, number> = {};
+    private currentLayout: any[] = [];
+    private approvals: Map<string, ApprovalRequest> = new Map();
+    private meetingActive = false;
+    private meetingEndsAt = 0;
+    private meetingTopic = '';
+    private taskProgress: Map<string, number> = new Map();
+    private taskRecordIds: Map<string, string> = new Map();
+    private completedTasks: CompletedTaskRecord[] = [];
+    private fastTrackMode = true;
+    private mailMessages: MailMessage[] = [];
+    private currentProjectSlug = 'xylon';
+    private simulationInterval?: NodeJS.Timeout;
 
-  static setArtifactWriteLogger(
-    logger:
-      | ((entry: {
-          relativePath: string;
-          absolutePath: string;
-          mimeType: string;
-          sizeBytes: number;
-          actorId?: string;
-          status: "draft" | "submitted" | "validated" | "rejected";
-          existsOnDisk: boolean;
-        }) => Promise<void> | void)
-      | null,
-  ) {
-    OfficeRoom.artifactWriteLogger = logger;
-  }
+    private getWorkspaceRoot(): string {
+        return getActiveWorkspaceRoot();
+    }
 
-  maxClients = 100;
-  private office!: Office;
-  private demoTickCount = 0;
-  private coreAgents: Map<string, Agent> = new Map();
-  private thinkingLocks: Map<string, boolean> = new Map();
-  private ollamaAdapter = new OllamaAdapter("http://localhost:11434");
-  private inferenceAdapter: OllamaAdapter | OpenAICompatibleAdapter =
-    this.ollamaAdapter;
-  private inferenceProvider: InferenceConfig["provider"] = "ollama";
-  private defaultModel =
-    process.env.AGENT_MODEL ||
-    process.env.CLAUDE_MODEL ||
-    "claude-3-5-sonnet-latest";
-  private hireCount = 0; // Counter for generating unique IDs
-  private toolExecutor = new ToolExecutor();
-  private memoryStore = new MemoryStore();
-  private sessionId = `session_${Date.now()}`;
-  private currentScenario = "Free Play";
-  private highlights: HighlightEvent[] = [];
-  private chaosHistory: Array<{ event: string; label: string; time: string }> =
-    [];
-  private relationships: Map<string, RelationshipEdge> = new Map();
-  private audienceVotes: Record<string, number> = {};
-  private currentLayout: any[] = [];
-  private approvals: Map<string, ApprovalRequest> = new Map();
-  private meetingActive = false;
-  private meetingEndsAt = 0;
-  private meetingTopic = "";
-  private taskProgress: Map<string, number> = new Map();
-  private taskRecordIds: Map<string, string> = new Map();
-  private completedTasks: CompletedTaskRecord[] = [];
-  private fastTrackMode = true;
-  private mailMessages: MailMessage[] = [];
-  private currentProjectSlug = "xylon";
-  private simulationInterval?: NodeJS.Timeout;
+    private getMimeType(filePath: string): string {
+        const ext = path.extname(filePath).toLowerCase();
+        const map: Record<string, string> = {
+            '.md': 'text/markdown',
+            '.txt': 'text/plain',
+            '.json': 'application/json',
+            '.js': 'text/javascript',
+            '.ts': 'text/typescript',
+            '.tsx': 'text/tsx',
+            '.jsx': 'text/jsx',
+            '.html': 'text/html',
+            '.css': 'text/css',
+            '.png': 'image/png',
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.pdf': 'application/pdf',
+            '.csv': 'text/csv',
+            '.yml': 'text/yaml',
+            '.yaml': 'text/yaml'
+        };
+        return map[ext] || 'application/octet-stream';
+    }
 
-  private getWorkspaceRoot(): string {
-    return getActiveWorkspaceRoot();
-  }
+    private resolveWorkspacePath(targetPath: string): string {
+        return resolveScopedPath(this.getWorkspaceRoot(), targetPath);
+    }
 
-  private getMimeType(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    const map: Record<string, string> = {
-      ".md": "text/markdown",
-      ".txt": "text/plain",
-      ".json": "application/json",
-      ".js": "text/javascript",
-      ".ts": "text/typescript",
-      ".tsx": "text/tsx",
-      ".jsx": "text/jsx",
-      ".html": "text/html",
-      ".css": "text/css",
-      ".png": "image/png",
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".gif": "image/gif",
-      ".svg": "image/svg+xml",
-      ".pdf": "application/pdf",
-      ".csv": "text/csv",
-      ".yml": "text/yaml",
-      ".yaml": "text/yaml",
+    private projectRoot(projectSlug: string): string {
+        const activeProject = getActiveProject();
+        if (activeProject?.projectSlug === projectSlug) {
+            return activeProject.projectRoot;
+        }
+        return path.join(this.getWorkspaceRoot(), 'projects', projectSlug);
+    }
+
+    private async safeReadWorkspaceText(relativePath: string): Promise<string> {
+        try {
+            const absolutePath = this.resolveWorkspacePath(relativePath);
+            const content = await readFile(absolutePath, 'utf-8');
+            return content.trim();
+        } catch {
+            return '';
+        }
+    }
+
+    private summarizeArtifactPath(filePath: string): string {
+        const normalized = filePath.replace(/\\/g, '/');
+        const parts = normalized.split('/').filter(Boolean);
+        return parts.slice(-2).join('/');
+    }
+
+    private async buildProjectContext(agentId: string, activeTask: string): Promise<ProjectContextPayload> {
+        const activeProject = getActiveProject();
+        const projectSlug = activeProject?.projectSlug || this.currentProjectSlug || 'default';
+        const projectRoot = this.projectRoot(projectSlug);
+        const briefCandidates = [
+            path.posix.join('brief', 'brief.md'),
+            path.posix.join('projects', projectSlug, 'project-brief.md')
+        ];
+        const criteriaCandidates = [
+            path.posix.join('brief', 'acceptance-criteria.md'),
+            path.posix.join('projects', projectSlug, 'acceptance-criteria.md')
+        ];
+        const artifactIndexCandidates = [
+            path.posix.join('context', 'artifact-index.md'),
+            path.posix.join('projects', projectSlug, 'artifact-index.md')
+        ];
+
+        const readFirstNonEmpty = async (candidates: string[]) => {
+            for (const candidate of candidates) {
+                const content = await this.safeReadWorkspaceText(candidate);
+                if (content) return content;
+            }
+            return '';
+        };
+
+        const briefRaw = await readFirstNonEmpty(briefCandidates);
+        const criteriaRaw = await readFirstNonEmpty(criteriaCandidates);
+        const artifactIndexRaw = await readFirstNonEmpty(artifactIndexCandidates);
+
+        const taskRows = await this.memoryStore.getTasks();
+        const activeTaskRow = taskRows.find((task) =>
+            task.assigned_to === agentId &&
+            ['in_progress', 'review', 'blocked', 'backlog'].includes(String(task.status || '').toLowerCase())
+        );
+
+        const reviewFromDb = taskRows
+            .filter((task) => task.assigned_to === agentId && String(task.status || '').toLowerCase() === 'review')
+            .slice(0, 4)
+            .map((task) => task.status_reason || `Task "${task.title}" is pending review.`);
+
+        const globalMemories = await this.memoryStore.loadMemories('agency:global', 40);
+        const reviewFromMemories = globalMemories
+            .filter((entry) => /\breview|revision|rework|acceptance\b/i.test(entry.content))
+            .slice(0, 4)
+            .map((entry) => entry.content);
+
+        let artifactSummary = artifactIndexRaw;
+        if (!artifactSummary) {
+            const artifactsDir = path.join(projectRoot, 'artifacts');
+            try {
+                const items = await readdir(artifactsDir);
+                artifactSummary = items.slice(0, 12).map((item) => `- ${item}`).join('\n');
+            } catch {
+                artifactSummary = '';
+            }
+        }
+        if (!artifactSummary && this.completedTasks.length > 0) {
+            artifactSummary = this.completedTasks
+                .slice(0, 8)
+                .map((item) => `- ${item.task} (${this.summarizeArtifactPath(item.summaryPath)})`)
+                .join('\n');
+        }
+
+        const acceptanceCriteria = criteriaRaw
+            ? criteriaRaw.split('\n').map((line) => line.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 8)
+            : ['Deliver outputs directly relevant to the active project brief and assigned task.'];
+
+        const projectBrief = briefRaw || `Project "${projectSlug}" is active. Use assigned task + acceptance criteria only.`;
+        const resolvedActiveTask = activeTaskRow?.title || activeTask || 'No active task assigned.';
+        const recentReviewNotes = [...reviewFromDb, ...reviewFromMemories].slice(0, 6);
+        const contextHash = createHash('sha256').update(JSON.stringify({
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactSummary
+        })).digest('hex');
+
+        return {
+            projectSlug,
+            projectBrief,
+            acceptanceCriteria,
+            activeTask: resolvedActiveTask,
+            recentReviewNotes,
+            artifactIndexSummary: artifactSummary || 'No project artifacts indexed yet.',
+            contextHash
+        };
+    }
+
+    private async persistProjectContextAudit(agentId: string, context: ProjectContextPayload): Promise<void> {
+        const logDir = this.resolveWorkspacePath(path.posix.join('projects', context.projectSlug, 'logs'));
+        await mkdir(logDir, { recursive: true });
+        const logPath = path.join(logDir, `${agentId}.jsonl`);
+        const row = JSON.stringify({
+            time: this.state.officeTime || new Date().toISOString(),
+            sessionId: this.sessionId,
+            agentId,
+            contextHash: context.contextHash,
+            activeTask: context.activeTask
+        });
+        await writeFile(logPath, `${row}\n`, { encoding: 'utf-8', flag: 'a' });
+    }
+
+    private decisionReferencesProjectContext(decision: any, context: ProjectContextPayload): boolean {
+        const payload = JSON.stringify({
+            thought: decision?.thought || '',
+            target: decision?.target || '',
+            message: decision?.message || '',
+            toolCall: decision?.toolCall || {}
+        }).toLowerCase();
+
+        const tokens = [
+            context.projectSlug.toLowerCase(),
+            ...context.activeTask.toLowerCase().split(/\W+/).filter((token) => token.length > 3).slice(0, 8),
+            ...context.acceptanceCriteria.join(' ').toLowerCase().split(/\W+/).filter((token) => token.length > 5).slice(0, 6)
+        ];
+
+        return tokens.some((token) => token && payload.includes(token));
+    }
+
+    private async routeTaskBackToReview(agentId: string, reason: string, taskTitle: string) {
+        await this.memoryStore.upsertTaskStatusByTitle(agentId, taskTitle, 'review', reason);
+        this.broadcast('task-update', {
+            agentId,
+            agentName: this.coreAgents.get(agentId)?.config.name || agentId,
+            task: taskTitle,
+            status: 'review',
+            reason
+        });
+    }
+
+    private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
+        if (!input || typeof input !== 'object') return null;
+
+        const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : '';
+        const filePath = typeof input.path === 'string' && input.path.trim() ? input.path.trim() : '';
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '';
+        const mimeType = typeof input.mimeType === 'string' && input.mimeType.trim() ? input.mimeType.trim() : '';
+        const size = Number(input.size);
+        const sharedBy = typeof input.sharedBy === 'string' && input.sharedBy.trim()
+            ? input.sharedBy.trim()
+            : defaultSharedBy;
+
+        const sharedWith = Array.isArray(input.sharedWith)
+            ? input.sharedWith
+                .filter((entry: unknown) => typeof entry === 'string')
+                .map((entry: string) => entry.trim())
+                .filter(Boolean)
+            : [];
+
+        const createdAtRaw = typeof input.createdAt === 'string' ? input.createdAt : '';
+        const createdAtDate = createdAtRaw ? new Date(createdAtRaw) : new Date();
+        const createdAt = Number.isNaN(createdAtDate.getTime())
+            ? new Date().toISOString()
+            : createdAtDate.toISOString();
+
+        if (!id || !filePath || !name || !mimeType || !Number.isFinite(size) || size < 0) return null;
+
+        return {
+            id,
+            path: filePath,
+            name,
+            mimeType,
+            size: Math.floor(size),
+            sharedBy,
+            sharedWith,
+            createdAt
+        };
+    }
+
+    private parseChatAttachments(raw: any, defaultSharedBy: string): ChatAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((item) => this.normalizeChatAttachment(item, defaultSharedBy))
+            .filter((item): item is ChatAttachment => Boolean(item));
+    }
+
+    private normalizeMailAttachments(raw: any): MailAttachment[] {
+        if (!Array.isArray(raw)) return [];
+        return raw
+            .map((entry: any) => {
+                const filePath = String(entry?.path || '').trim();
+                if (!filePath) return null;
+                return {
+                    path: filePath,
+                    name: String(entry?.name || path.basename(filePath)),
+                    mimeType: String(entry?.mimeType || this.getMimeType(filePath)),
+                    size: Number.isFinite(Number(entry?.size)) ? Math.max(0, Math.floor(Number(entry.size))) : 0
+                } as MailAttachment;
+            })
+            .filter((item: MailAttachment | null): item is MailAttachment => Boolean(item));
+    }
+
+    private pushMail(message: MailMessage) {
+        this.mailMessages.push(message);
+        if (this.mailMessages.length > 250) this.mailMessages = this.mailMessages.slice(-250);
+        this.broadcast('mail-sync', { messages: this.mailMessages.slice(-150) });
+    }
+
+    // Furniture interaction points: named locations agents can walk to
+    private furnitureTargets: Record<string, { x: number; y: number; type: string }> = {
+        // ─── ENGINEERING POD (pod of 4, left side) ───
+        // Pair: Frontend + Backend / Pair: DevOps + Security
+        'frontend-desk':    { x: 5,  y: 10, type: 'desk' },
+        'backend-desk':     { x: 8,  y: 10, type: 'desk' },
+        'devops-desk':      { x: 5,  y: 14, type: 'desk' },
+        'security-desk':    { x: 8,  y: 14, type: 'desk' },
+
+        // ─── OPS / STRATEGY POD (pod of 4, center) ───
+        // Pair: Shepherd + Reality / Pair: Evidence + SEO
+        'shepherd-desk':    { x: 17, y: 10, type: 'desk' },
+        'reality-desk':     { x: 20, y: 10, type: 'desk' },
+        'evidence-desk':    { x: 17, y: 14, type: 'desk' },
+        'seo-desk':         { x: 20, y: 14, type: 'desk' },
+
+        // ─── GROWTH POD (small pod of 2, right side) ───
+        // Pair: Sales + Proposal
+        'sales-desk':       { x: 29, y: 10, type: 'desk' },
+        'proposal-desk':    { x: 32, y: 10, type: 'desk' },
+
+        // ─── CEO PRIVATE OFFICE (separated, bottom-right) ───
+        'ceo-desk':         { x: 32, y: 30, type: 'desk' },
+        'ceo-office-wall-1':{ x: 28, y: 27, type: 'wall' },
+        'ceo-office-wall-2':{ x: 28, y: 33, type: 'wall' },
+        'ceo-office-door':  { x: 28, y: 30, type: 'door' },
+
+        // ─── SHARED FURNITURE ───
+        'meeting-table':  { x: 20, y: 22, type: 'table' },
+        'coffee-machine': { x: 5,  y: 30, type: 'appliance' },
+        'whiteboard':     { x: 20, y: 5,  type: 'board' },
+        'water-cooler':   { x: 12, y: 30, type: 'appliance' },
+        'bookshelf':      { x: 17, y: 30, type: 'furniture' },
+        'beanbag':        { x: 24, y: 30, type: 'seating' },
+        // Extra desks for dynamically hired agents
+        'hire_0-desk': { x: 22, y: 18, type: 'desk' },
+        'hire_1-desk': { x: 22, y: 23, type: 'desk' },
+        'hire_2-desk': { x: 25, y: 18, type: 'desk' },
+        'hire_3-desk': { x: 25, y: 8,  type: 'desk' },
+        'hire_4-desk': { x: 32, y: 18, type: 'desk' },
     };
     return map[ext] || "application/octet-stream";
   }
@@ -1477,26 +1729,31 @@ Paired buddy: Sales Outreach.`,
           reviewer: "validator",
         });
 
-        if (status === "needs_review") {
-          const approval = this.createApproval({
-            requestedBy: actor,
-            requestedByName: `File Owner (${actor})`,
-            requestedAction: `Review shared file: ${record.name}`,
-            rationale: `File "${record.name}" was marked needs_review and requires CEO approval before broad sharing.`,
-            isMajor: false,
-          });
-          await this.memoryStore.updateSharedFileStatus(
-            fileId,
-            "needs_review",
-            approval.id,
-          );
-          await this.memoryStore.logShareAction({
-            fileId,
-            action: "approval-requested",
-            actor: "system",
-            details: approval.id,
-          });
-        }
+        this.onMessage('start-project', async (client, message) => {
+            try {
+                const result = await ProjectWorkspace.startProject({
+                    templateId: message?.templateId ?? message?.template,
+                    projectName: message?.projectName,
+                    brief: message?.brief,
+                    acceptanceCriteria: message?.acceptanceCriteria,
+                    constraints: message?.constraints,
+                    mode: message?.mode,
+                    runMetadata: {
+                        requestedBy: client.sessionId,
+                        source: 'colyseus'
+                    }
+                });
+                this.broadcast('project-state-sync', {
+                    project: result.project,
+                    folders: result.folders,
+                    files: result.files
+                });
+                this.currentProjectSlug = result.project.projectSlug;
+                client.send('start-project:result', { ok: true, ...result });
+            } catch (error: any) {
+                client.send('start-project:result', { ok: false, error: error?.message || 'Unable to start project.' });
+            }
+        });
 
         client.send("file-share-ack", { id: fileId });
         const files = await this.memoryStore.listSharedFiles();
@@ -2449,15 +2706,75 @@ Paired buddy: Sales Outreach.`,
           sender: "🏢 Office",
           text: "Task description required after the agent handle.",
         });
-        return true;
-      }
-      const agentId = this.resolveAgentHandle(handle);
-      const agent = agentId ? this.coreAgents.get(agentId) : undefined;
-      const state = agentId ? this.state.agents.get(agentId) : undefined;
-      if (!agent || !state || !agentId) {
-        this.broadcast("chat", {
-          sender: "🏢 Office",
-          text: `Unknown agent: @${handle}`,
+
+        const artifactPath = String(params?.path || '').trim();
+        if (artifactPath) {
+            await this.memoryStore.addTaskEvidence({
+                id: `tev_${randomUUID()}`,
+                taskId: taskRecordId,
+                agentId,
+                evidenceType: 'artifact',
+                artifactId: String(params?.fileId || ''),
+                artifactPath,
+                metadata: {
+                    source: 'tool_execution',
+                    toolName,
+                },
+                createdAt: this.state.officeTime,
+            });
+        }
+    }
+
+    private async evaluateTaskEvidence(taskId: string): Promise<TaskEvidenceState> {
+        const evidence = await this.memoryStore.getTaskEvidence(taskId);
+        let artifactExists = false;
+        let toolExecutionSucceeded = false;
+        let validatorApproved = false;
+
+        for (const item of evidence) {
+            if (!artifactExists && item.evidenceType === 'artifact' && item.artifactPath) {
+                try {
+                    await stat(this.resolveWorkspacePath(item.artifactPath));
+                    artifactExists = true;
+                } catch {}
+            }
+            if (!toolExecutionSucceeded && item.evidenceType === 'tool_execution' && item.toolAuditLogId) {
+                toolExecutionSucceeded = true;
+            }
+            if (!validatorApproved && item.evidenceType === 'validator' && item.validatorDecision === 'approved') {
+                validatorApproved = true;
+            }
+            if (artifactExists && toolExecutionSucceeded && validatorApproved) break;
+        }
+
+        return { artifactExists, toolExecutionSucceeded, validatorApproved };
+    }
+
+    private taskStatusReason(evidence: TaskEvidenceState): string {
+        if (evidence.validatorApproved) return 'validated';
+        if (evidence.artifactExists || evidence.toolExecutionSucceeded) return 'pending_validation';
+        return 'waiting_for_artifact';
+    }
+
+    private async advanceTaskProgress(agentId: string, agent: Agent, agentState: any, action: string) {
+        const taskTitle = agent.currentTask;
+        if (!taskTitle) return;
+        const key = this.progressKey(agentId, taskTitle);
+        const taskRecordId = await this.getOrCreateTaskRecordId(agentId, taskTitle);
+        if (!taskRecordId) return;
+        const evidence = await this.evaluateTaskEvidence(taskRecordId);
+        const checkpointsPassed = [evidence.artifactExists, evidence.toolExecutionSucceeded, evidence.validatorApproved].filter(Boolean).length;
+        const next = checkpointsPassed / 3;
+        const reason = this.taskStatusReason(evidence);
+        const shouldComplete = shouldMarkTaskDone(evidence);
+        this.taskProgress.set(key, next);
+
+        const currentTaskStatus: TaskStatus = 'in_progress';
+        const proposedStatus: TaskStatus = shouldComplete ? 'done' : 'in_progress';
+        const transition = this.validateAndNormalizeTaskTransition({
+            from: currentTaskStatus,
+            to: proposedStatus,
+            context: `advanceTaskProgress:${agentId}:${taskTitle}`
         });
         return true;
       }

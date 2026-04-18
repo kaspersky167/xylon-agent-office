@@ -363,7 +363,7 @@ export class MemoryStore {
                 project_id TEXT NOT NULL,
                 task_id TEXT,
                 agent_id TEXT,
-                relative_path TEXT NOT NULL UNIQUE,
+                relative_path TEXT NOT NULL,
                 mime_type TEXT NOT NULL,
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'draft',
@@ -372,100 +372,10 @@ export class MemoryStore {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, updated_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_project_path ON artifacts(project_id, relative_path);
             CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_agent ON artifacts(agent_id, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status, updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS worker_slots (
-                id TEXT PRIMARY KEY,
-                slot_index INTEGER NOT NULL UNIQUE,
-                status TEXT NOT NULL DEFAULT 'idle',
-                current_task_run_id TEXT,
-                heartbeat_at TEXT,
-                metadata_json TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS skill_profiles (
-                id TEXT PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                display_name TEXT NOT NULL,
-                description TEXT,
-                capabilities_json TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS task_runs (
-                id TEXT PRIMARY KEY,
-                project_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                brief TEXT NOT NULL DEFAULT '',
-                acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
-                status TEXT NOT NULL DEFAULT 'queued',
-                queue_position INTEGER,
-                requested_by TEXT NOT NULL DEFAULT 'system',
-                assigned_worker_slot_id TEXT,
-                parent_task_run_id TEXT,
-                skill_profile_id TEXT,
-                max_iterations INTEGER NOT NULL DEFAULT 8,
-                iteration_count INTEGER NOT NULL DEFAULT 0,
-                context_json TEXT,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                started_at TEXT,
-                completed_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status, created_at ASC);
-            CREATE INDEX IF NOT EXISTS idx_task_runs_project ON task_runs(project_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_task_runs_parent ON task_runs(parent_task_run_id, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS task_steps (
-                id TEXT PRIMARY KEY,
-                task_run_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                instruction TEXT NOT NULL DEFAULT '',
-                output TEXT,
-                artifact_path TEXT,
-                delegated_task_run_id TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                completed_at TEXT
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_steps_run_ordinal ON task_steps(task_run_id, ordinal);
-            CREATE INDEX IF NOT EXISTS idx_task_steps_status ON task_steps(status, updated_at DESC);
-
-            CREATE TABLE IF NOT EXISTS step_attempts (
-                id TEXT PRIMARY KEY,
-                task_step_id TEXT NOT NULL,
-                attempt_number INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                worker_slot_id TEXT,
-                input_json TEXT,
-                output_json TEXT,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                completed_at TEXT
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_step_attempts_unique ON step_attempts(task_step_id, attempt_number);
-            CREATE INDEX IF NOT EXISTS idx_step_attempts_step ON step_attempts(task_step_id, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS delegation_records (
-                id TEXT PRIMARY KEY,
-                parent_task_run_id TEXT NOT NULL,
-                parent_task_step_id TEXT NOT NULL,
-                child_task_run_id TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'spawned',
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegation_records(parent_task_run_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_delegation_child ON delegation_records(child_task_run_id, created_at DESC);
         `);
 
     try {
@@ -1063,7 +973,7 @@ export class MemoryStore {
       `INSERT INTO artifacts
              (id, project_id, task_id, agent_id, relative_path, mime_type, size_bytes, status, checksum, exists_on_disk, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(relative_path) DO UPDATE SET
+             ON CONFLICT(project_id, relative_path) DO UPDATE SET
                id = excluded.id,
                project_id = excluded.project_id,
                task_id = excluded.task_id,
