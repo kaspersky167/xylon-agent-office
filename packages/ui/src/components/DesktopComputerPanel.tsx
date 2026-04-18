@@ -18,6 +18,11 @@ interface DesktopFileItem {
     updatedAt?: string;
     mimeType?: string;
     name?: string;
+    projectId?: string;
+    taskId?: string | null;
+    agentId?: string | null;
+    status?: 'draft' | 'submitted' | 'validated' | 'rejected';
+    existsOnDisk?: boolean;
 }
 
 interface DesktopFilePreview {
@@ -138,6 +143,7 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
     const [mailSubject, setMailSubject] = useState('Work request');
     const [mailBody, setMailBody] = useState('');
     const [mailAttachments, setMailAttachments] = useState<MailAttachment[]>([]);
+    const [rootHint, setRootHint] = useState<string>('');
 
     const selectedFile = selectedPath ? files.find((item) => item.path === selectedPath) : undefined;
     const filteredMail = useMemo(() => {
@@ -150,17 +156,23 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
 
     const loadWorkspaceFiles = async () => {
         try {
-            const response = await fetch('/api/workspace-files');
+            const response = await fetch('/api/artifacts?limit=500');
             const payload = await response.json();
             if (!response.ok || !payload?.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-            const rows = Array.isArray(payload?.files) ? payload.files : [];
+            const rows = Array.isArray(payload?.artifacts) ? payload.artifacts : [];
+            setRootHint(typeof payload?.rootHint === 'string' ? payload.rootHint : '');
             setFiles(rows.map((item: any) => ({
-                path: String(item?.path || ''),
+                path: String(item?.relativePath || item?.path || ''),
                 type: 'file',
-                size: typeof item?.size === 'number' ? item.size : undefined,
-                updatedAt: typeof item?.createdAt === 'string' ? item.createdAt : undefined,
+                size: typeof item?.sizeBytes === 'number' ? item.sizeBytes : (typeof item?.size === 'number' ? item.size : undefined),
+                updatedAt: typeof item?.updatedAt === 'string' ? item.updatedAt : undefined,
                 mimeType: typeof item?.mimeType === 'string' ? item.mimeType : undefined,
-                name: typeof item?.name === 'string' ? item.name : undefined
+                name: typeof item?.name === 'string' ? item.name : String(item?.relativePath || '').split('/').pop(),
+                projectId: typeof item?.projectId === 'string' ? item.projectId : undefined,
+                taskId: typeof item?.taskId === 'string' ? item.taskId : null,
+                agentId: typeof item?.agentId === 'string' ? item.agentId : null,
+                status: typeof item?.status === 'string' ? item.status : undefined,
+                existsOnDisk: Boolean(item?.existsOnDisk)
             })).filter((item: DesktopFileItem) => item.path));
         } catch (err: any) {
             setError(err?.message || 'Could not load workspace files.');
@@ -349,11 +361,14 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
 
                         <div style={{ border: `1px solid ${tokens.color.borderSoft}`, borderRadius: tokens.radius.md, padding: 10, overflow: 'auto', ...controlRoomStyles.scroll }}>
                             <div style={{ fontSize: 11, color: tokens.color.textSecondary, marginBottom: 8 }}>
-                                {selectedFile ? `Preview: ${selectedFile.path}` : 'Preview'}
-                            </div>
-                            {renderPreviewContent(preview, loadingPreview, error)}
+                            {selectedFile ? `Preview: ${selectedFile.path}` : 'Preview'}
+                            {selectedFile?.existsOnDisk && (
+                                <Chip tone="accent">real file on disk</Chip>
+                            )}
                         </div>
-                    </Panel>
+                        {renderPreviewContent(preview, loadingPreview, error)}
+                    </div>
+                </Panel>
 
                     <Panel tone="muted" style={{ padding: tokens.spacing.sm, display: 'flex', flexDirection: 'column' }}>
                         <SectionHeader title="Inbox" subtitle={`Threaded agent mailbox (${filteredMail.length})`} />
@@ -387,6 +402,39 @@ export function DesktopComputerPanel({ isOpen, onClose }: DesktopComputerPanelPr
                         </div>
                     </Panel>
                 </div>
+
+                <Panel tone="muted" style={{ padding: tokens.spacing.sm }}>
+                    <SectionHeader title="Artifact Browser" subtitle={`Absolute root hint: ${rootHint || 'N/A'}`} />
+                    <div style={{ overflowX: 'auto' }}>
+                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                            <thead>
+                                <tr style={{ textAlign: 'left', borderBottom: `1px solid ${tokens.color.borderSoft}` }}>
+                                    <th style={{ padding: '6px 8px' }}>Filename</th>
+                                    <th style={{ padding: '6px 8px' }}>Path</th>
+                                    <th style={{ padding: '6px 8px' }}>Agent</th>
+                                    <th style={{ padding: '6px 8px' }}>Task</th>
+                                    <th style={{ padding: '6px 8px' }}>Updated</th>
+                                    <th style={{ padding: '6px 8px' }}>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {files.map((file) => (
+                                    <tr key={`artifact-${file.path}`} style={{ borderBottom: `1px solid ${tokens.color.borderSoft}` }}>
+                                        <td style={{ padding: '6px 8px' }}>{file.name || file.path.split('/').pop() || file.path}</td>
+                                        <td style={{ padding: '6px 8px' }}>{file.path}</td>
+                                        <td style={{ padding: '6px 8px' }}>{file.agentId || '—'}</td>
+                                        <td style={{ padding: '6px 8px' }}>{file.taskId || '—'}</td>
+                                        <td style={{ padding: '6px 8px' }}>{file.updatedAt ? new Date(file.updatedAt).toLocaleString() : '—'}</td>
+                                        <td style={{ padding: '6px 8px' }}>
+                                            {file.status || 'draft'}
+                                            {file.existsOnDisk ? ' • on disk' : ' • missing'}
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </Panel>
             </div>
         </FloatingPanel>
     );
