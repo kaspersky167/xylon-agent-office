@@ -1,7 +1,11 @@
 import sqlite3 from "sqlite3";
 import { open, Database } from "sqlite";
 import { createHash, randomUUID } from "crypto";
-import { MemoryEntry, TaskStatus, toCanonicalTaskStatus } from "@agent-office/core";
+import {
+  MemoryEntry,
+  TaskStatus,
+  toCanonicalTaskStatus,
+} from "@agent-office/core";
 
 export type SharedFileStatus =
   | "draft"
@@ -77,7 +81,100 @@ export interface ReviewRecord {
   createdAt?: string;
 }
 
-export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
+export type TaskPriority = "low" | "medium" | "high" | "critical";
+
+export type TaskRunStatus =
+  | "queued"
+  | "running"
+  | "waiting"
+  | "retrying"
+  | "blocked"
+  | "review"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface WorkerSlotRecord {
+  id: string;
+  slotIndex: number;
+  status: "idle" | "busy" | "offline";
+  currentTaskRunId?: string | null;
+  heartbeatAt?: string | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface SkillProfileRecord {
+  id: string;
+  slug: string;
+  displayName: string;
+  description?: string | null;
+  capabilities: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface TaskRunRecord {
+  id: string;
+  projectId: string;
+  title: string;
+  brief: string;
+  acceptanceCriteria: string[];
+  status: TaskRunStatus;
+  queuePosition?: number | null;
+  requestedBy: string;
+  assignedWorkerSlotId?: string | null;
+  parentTaskRunId?: string | null;
+  skillProfileId?: string | null;
+  maxIterations: number;
+  iterationCount: number;
+  contextJson?: Record<string, unknown> | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+}
+
+export interface TaskStepRecord {
+  id: string;
+  taskRunId: string;
+  ordinal: number;
+  title: string;
+  status: TaskRunStatus;
+  instruction: string;
+  output?: string | null;
+  artifactPath?: string | null;
+  delegatedTaskRunId?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  completedAt?: string | null;
+}
+
+export interface StepAttemptRecord {
+  id: string;
+  taskStepId: string;
+  attemptNumber: number;
+  status: TaskRunStatus;
+  workerSlotId?: string | null;
+  inputJson?: Record<string, unknown> | null;
+  outputJson?: Record<string, unknown> | null;
+  errorMessage?: string | null;
+  createdAt?: string;
+  completedAt?: string | null;
+}
+
+export interface DelegationRecord {
+  id: string;
+  parentTaskRunId: string;
+  parentTaskStepId: string;
+  childTaskRunId: string;
+  reason: string;
+  status: "spawned" | "accepted" | "completed" | "failed" | "cancelled";
+  createdAt?: string;
+  updatedAt?: string;
+}
 
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length) return 0;
@@ -98,6 +195,33 @@ export class MemoryStore {
 
   constructor(ollamaUrl: string = "http://localhost:11434") {
     this.ollamaUrl = ollamaUrl;
+  }
+
+  private mapTaskRunRow(row: any): TaskRunRecord {
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      title: row.title,
+      brief: row.brief || "",
+      acceptanceCriteria: row.acceptance_criteria_json
+        ? JSON.parse(row.acceptance_criteria_json)
+        : [],
+      status: row.status,
+      queuePosition:
+        row.queue_position == null ? null : Number(row.queue_position),
+      requestedBy: row.requested_by,
+      assignedWorkerSlotId: row.assigned_worker_slot_id || null,
+      parentTaskRunId: row.parent_task_run_id || null,
+      skillProfileId: row.skill_profile_id || null,
+      maxIterations: Number(row.max_iterations || 8),
+      iterationCount: Number(row.iteration_count || 0),
+      contextJson: row.context_json ? JSON.parse(row.context_json) : null,
+      errorMessage: row.error_message || null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      startedAt: row.started_at || null,
+      completedAt: row.completed_at || null,
+    };
   }
 
   async initialize(dbPath: string = "./data/office-memory.db") {
@@ -233,6 +357,115 @@ export class MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_reviews_artifact ON reviews(artifact_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT,
+                agent_id TEXT,
+                relative_path TEXT NOT NULL UNIQUE,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'draft',
+                checksum TEXT,
+                exists_on_disk INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS worker_slots (
+                id TEXT PRIMARY KEY,
+                slot_index INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'idle',
+                current_task_run_id TEXT,
+                heartbeat_at TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_profiles (
+                id TEXT PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                description TEXT,
+                capabilities_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS task_runs (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                brief TEXT NOT NULL DEFAULT '',
+                acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'queued',
+                queue_position INTEGER,
+                requested_by TEXT NOT NULL DEFAULT 'system',
+                assigned_worker_slot_id TEXT,
+                parent_task_run_id TEXT,
+                skill_profile_id TEXT,
+                max_iterations INTEGER NOT NULL DEFAULT 8,
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                context_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                started_at TEXT,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_task_runs_project ON task_runs(project_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_task_runs_parent ON task_runs(parent_task_run_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS task_steps (
+                id TEXT PRIMARY KEY,
+                task_run_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                instruction TEXT NOT NULL DEFAULT '',
+                output TEXT,
+                artifact_path TEXT,
+                delegated_task_run_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_steps_run_ordinal ON task_steps(task_run_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_task_steps_status ON task_steps(status, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS step_attempts (
+                id TEXT PRIMARY KEY,
+                task_step_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                worker_slot_id TEXT,
+                input_json TEXT,
+                output_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                completed_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_step_attempts_unique ON step_attempts(task_step_id, attempt_number);
+            CREATE INDEX IF NOT EXISTS idx_step_attempts_step ON step_attempts(task_step_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS delegation_records (
+                id TEXT PRIMARY KEY,
+                parent_task_run_id TEXT NOT NULL,
+                parent_task_step_id TEXT NOT NULL,
+                child_task_run_id TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'spawned',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_delegation_parent ON delegation_records(parent_task_run_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_delegation_child ON delegation_records(child_task_run_id, created_at DESC);
         `);
 
     try {
@@ -420,7 +653,9 @@ export class MemoryStore {
 
   async getTasks(): Promise<any[]> {
     if (!this.db) return [];
-    const rows = await this.db.all("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50");
+    const rows = await this.db.all(
+      "SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50",
+    );
     return rows.map((row: any) => ({
       ...row,
       status: toCanonicalTaskStatus(row.status),
@@ -475,7 +710,10 @@ export class MemoryStore {
     await this.updateTaskStatus(existing.id, status, statusReason);
   }
 
-  async findActiveTask(agentId: string, taskTitle: string): Promise<any | null> {
+  async findActiveTask(
+    agentId: string,
+    taskTitle: string,
+  ): Promise<any | null> {
     if (!this.db) return null;
     return this.db.get(
       "SELECT * FROM tasks WHERE assigned_to = ? AND title = ? AND status != 'done' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
@@ -803,7 +1041,8 @@ export class MemoryStore {
       evidenceType: row.evidence_type,
       artifactId: row.artifact_id || null,
       artifactPath: row.artifact_path || null,
-      toolAuditLogId: row.tool_audit_log_id == null ? null : Number(row.tool_audit_log_id),
+      toolAuditLogId:
+        row.tool_audit_log_id == null ? null : Number(row.tool_audit_log_id),
       validatorDecision: row.validator_decision || null,
       metadata: row.metadata ? JSON.parse(row.metadata) : null,
       createdAt: row.created_at,
@@ -897,6 +1136,379 @@ export class MemoryStore {
       status: row.status,
       checksum: row.checksum || null,
       existsOnDisk: row.exists_on_disk === 1,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  async ensureWorkerSlots(poolSize: number): Promise<void> {
+    if (!this.db) return;
+    const safePoolSize = Math.max(1, Math.min(Number(poolSize || 1), 64));
+    for (let i = 0; i < safePoolSize; i++) {
+      await this.db.run(
+        `INSERT INTO worker_slots (id, slot_index, status, created_at, updated_at)
+         VALUES (?, ?, 'idle', datetime('now'), datetime('now'))
+         ON CONFLICT(slot_index) DO NOTHING`,
+        [`worker-slot-${i + 1}`, i + 1],
+      );
+    }
+  }
+
+  async listWorkerSlots(): Promise<WorkerSlotRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM worker_slots ORDER BY slot_index ASC",
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      slotIndex: Number(row.slot_index),
+      status: row.status,
+      currentTaskRunId: row.current_task_run_id || null,
+      heartbeatAt: row.heartbeat_at || null,
+      metadata: row.metadata_json ? JSON.parse(row.metadata_json) : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  async updateWorkerSlot(
+    slotId: string,
+    patch: Partial<WorkerSlotRecord>,
+  ): Promise<void> {
+    if (!this.db) return;
+    const existing = await this.db.get(
+      "SELECT * FROM worker_slots WHERE id = ?",
+      [slotId],
+    );
+    if (!existing) return;
+    const nextStatus = patch.status || existing.status;
+    const nextCurrent = patch.currentTaskRunId ?? existing.current_task_run_id;
+    const nextHeartbeat = patch.heartbeatAt ?? new Date().toISOString();
+    const nextMetadata =
+      patch.metadata === undefined
+        ? existing.metadata_json
+        : JSON.stringify(patch.metadata || {});
+    await this.db.run(
+      `UPDATE worker_slots
+       SET status = ?, current_task_run_id = ?, heartbeat_at = ?, metadata_json = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        nextStatus,
+        nextCurrent || null,
+        nextHeartbeat,
+        nextMetadata || null,
+        slotId,
+      ],
+    );
+  }
+
+  async upsertSkillProfile(input: SkillProfileRecord): Promise<void> {
+    if (!this.db) return;
+    await this.db.run(
+      `INSERT INTO skill_profiles
+       (id, slug, display_name, description, capabilities_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))
+       ON CONFLICT(slug) DO UPDATE SET
+         display_name = excluded.display_name,
+         description = excluded.description,
+         capabilities_json = excluded.capabilities_json,
+         updated_at = excluded.updated_at`,
+      [
+        input.id,
+        input.slug,
+        input.displayName,
+        input.description || null,
+        JSON.stringify(input.capabilities || []),
+        input.createdAt || null,
+        input.updatedAt || null,
+      ],
+    );
+  }
+
+  async createTaskRun(
+    input: Omit<
+      TaskRunRecord,
+      "createdAt" | "updatedAt" | "startedAt" | "completedAt"
+    > & {
+      createdAt?: string;
+    },
+  ): Promise<string> {
+    if (!this.db) return "";
+    await this.db.run(
+      `INSERT INTO task_runs
+       (id, project_id, title, brief, acceptance_criteria_json, status, queue_position, requested_by, assigned_worker_slot_id, parent_task_run_id, skill_profile_id, max_iterations, iteration_count, context_json, error_message, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))`,
+      [
+        input.id,
+        input.projectId,
+        input.title,
+        input.brief || "",
+        JSON.stringify(input.acceptanceCriteria || []),
+        input.status,
+        input.queuePosition ?? null,
+        input.requestedBy || "system",
+        input.assignedWorkerSlotId || null,
+        input.parentTaskRunId || null,
+        input.skillProfileId || null,
+        Math.max(1, Number(input.maxIterations || 8)),
+        Math.max(0, Number(input.iterationCount || 0)),
+        input.contextJson ? JSON.stringify(input.contextJson) : null,
+        input.errorMessage || null,
+        input.createdAt || null,
+        input.createdAt || null,
+      ],
+    );
+    return input.id;
+  }
+
+  async updateTaskRun(
+    runId: string,
+    patch: Partial<TaskRunRecord>,
+  ): Promise<void> {
+    if (!this.db) return;
+    const existing = await this.db.get("SELECT * FROM task_runs WHERE id = ?", [
+      runId,
+    ]);
+    if (!existing) return;
+    const nextStatus = patch.status || existing.status;
+    const nextIteration =
+      patch.iterationCount === undefined
+        ? Number(existing.iteration_count || 0)
+        : Math.max(0, Number(patch.iterationCount || 0));
+    const nextQueue =
+      patch.queuePosition === undefined
+        ? existing.queue_position
+        : patch.queuePosition;
+    const nextContext =
+      patch.contextJson === undefined
+        ? existing.context_json
+        : JSON.stringify(patch.contextJson || {});
+    await this.db.run(
+      `UPDATE task_runs
+       SET status = ?,
+           queue_position = ?,
+           assigned_worker_slot_id = ?,
+           iteration_count = ?,
+           context_json = ?,
+           error_message = ?,
+           started_at = COALESCE(?, started_at),
+           completed_at = COALESCE(?, completed_at),
+           updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        nextStatus,
+        nextQueue ?? null,
+        patch.assignedWorkerSlotId ?? existing.assigned_worker_slot_id ?? null,
+        nextIteration,
+        nextContext || null,
+        patch.errorMessage ?? existing.error_message ?? null,
+        patch.startedAt ?? null,
+        patch.completedAt ?? null,
+        runId,
+      ],
+    );
+  }
+
+  async listTaskRuns(filter?: {
+    projectId?: string;
+    status?: TaskRunStatus;
+    parentTaskRunId?: string;
+    limit?: number;
+  }): Promise<TaskRunRecord[]> {
+    if (!this.db) return [];
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (filter?.projectId) {
+      clauses.push("project_id = ?");
+      params.push(filter.projectId);
+    }
+    if (filter?.status) {
+      clauses.push("status = ?");
+      params.push(filter.status);
+    }
+    if (filter?.parentTaskRunId) {
+      clauses.push("parent_task_run_id = ?");
+      params.push(filter.parentTaskRunId);
+    }
+    const safeLimit = Math.min(Math.max(Number(filter?.limit || 200), 1), 1000);
+    const sql = `SELECT * FROM task_runs ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT ?`;
+    const rows = await this.db.all(sql, [...params, safeLimit]);
+    return rows.map((row: any) => this.mapTaskRunRow(row));
+  }
+
+  async getTaskRun(runId: string): Promise<TaskRunRecord | null> {
+    if (!this.db) return null;
+    const row = await this.db.get("SELECT * FROM task_runs WHERE id = ?", [
+      runId,
+    ]);
+    return row ? this.mapTaskRunRow(row) : null;
+  }
+
+  async findNextQueuedTaskRun(): Promise<TaskRunRecord | null> {
+    if (!this.db) return null;
+    const row = await this.db.get(
+      `SELECT * FROM task_runs
+       WHERE status IN ('queued', 'retrying')
+       ORDER BY COALESCE(queue_position, 999999) ASC, created_at ASC
+       LIMIT 1`,
+    );
+    if (!row) return null;
+    return this.mapTaskRunRow(row);
+  }
+
+  async createTaskStep(input: TaskStepRecord): Promise<string> {
+    if (!this.db) return "";
+    await this.db.run(
+      `INSERT INTO task_steps
+       (id, task_run_id, ordinal, title, status, instruction, output, artifact_path, delegated_task_run_id, created_at, updated_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')), ?)`,
+      [
+        input.id,
+        input.taskRunId,
+        input.ordinal,
+        input.title,
+        input.status,
+        input.instruction || "",
+        input.output || null,
+        input.artifactPath || null,
+        input.delegatedTaskRunId || null,
+        input.createdAt || null,
+        input.updatedAt || null,
+        input.completedAt || null,
+      ],
+    );
+    return input.id;
+  }
+
+  async updateTaskStep(
+    stepId: string,
+    patch: Partial<TaskStepRecord>,
+  ): Promise<void> {
+    if (!this.db) return;
+    const existing = await this.db.get(
+      "SELECT * FROM task_steps WHERE id = ?",
+      [stepId],
+    );
+    if (!existing) return;
+    await this.db.run(
+      `UPDATE task_steps
+       SET status = ?,
+           output = ?,
+           artifact_path = ?,
+           delegated_task_run_id = ?,
+           completed_at = COALESCE(?, completed_at),
+           updated_at = datetime('now')
+       WHERE id = ?`,
+      [
+        patch.status || existing.status,
+        patch.output ?? existing.output ?? null,
+        patch.artifactPath ?? existing.artifact_path ?? null,
+        patch.delegatedTaskRunId ?? existing.delegated_task_run_id ?? null,
+        patch.completedAt ?? null,
+        stepId,
+      ],
+    );
+  }
+
+  async listTaskSteps(taskRunId: string): Promise<TaskStepRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM task_steps WHERE task_run_id = ? ORDER BY ordinal ASC",
+      [taskRunId],
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      taskRunId: row.task_run_id,
+      ordinal: Number(row.ordinal),
+      title: row.title,
+      status: row.status,
+      instruction: row.instruction || "",
+      output: row.output || null,
+      artifactPath: row.artifact_path || null,
+      delegatedTaskRunId: row.delegated_task_run_id || null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at || null,
+    }));
+  }
+
+  async createStepAttempt(input: StepAttemptRecord): Promise<string> {
+    if (!this.db) return "";
+    await this.db.run(
+      `INSERT INTO step_attempts
+       (id, task_step_id, attempt_number, status, worker_slot_id, input_json, output_json, error_message, created_at, completed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), ?)`,
+      [
+        input.id,
+        input.taskStepId,
+        input.attemptNumber,
+        input.status,
+        input.workerSlotId || null,
+        input.inputJson ? JSON.stringify(input.inputJson) : null,
+        input.outputJson ? JSON.stringify(input.outputJson) : null,
+        input.errorMessage || null,
+        input.createdAt || null,
+        input.completedAt || null,
+      ],
+    );
+    return input.id;
+  }
+
+  async listStepAttempts(taskStepId: string): Promise<StepAttemptRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM step_attempts WHERE task_step_id = ? ORDER BY attempt_number ASC",
+      [taskStepId],
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      taskStepId: row.task_step_id,
+      attemptNumber: Number(row.attempt_number),
+      status: row.status,
+      workerSlotId: row.worker_slot_id || null,
+      inputJson: row.input_json ? JSON.parse(row.input_json) : null,
+      outputJson: row.output_json ? JSON.parse(row.output_json) : null,
+      errorMessage: row.error_message || null,
+      createdAt: row.created_at,
+      completedAt: row.completed_at || null,
+    }));
+  }
+
+  async createDelegationRecord(input: DelegationRecord): Promise<string> {
+    if (!this.db) return "";
+    await this.db.run(
+      `INSERT INTO delegation_records
+       (id, parent_task_run_id, parent_task_step_id, child_task_run_id, reason, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')), COALESCE(?, datetime('now')))`,
+      [
+        input.id,
+        input.parentTaskRunId,
+        input.parentTaskStepId,
+        input.childTaskRunId,
+        input.reason || "",
+        input.status,
+        input.createdAt || null,
+        input.updatedAt || null,
+      ],
+    );
+    return input.id;
+  }
+
+  async listDelegationRecords(
+    parentTaskRunId: string,
+  ): Promise<DelegationRecord[]> {
+    if (!this.db) return [];
+    const rows = await this.db.all(
+      "SELECT * FROM delegation_records WHERE parent_task_run_id = ? ORDER BY created_at ASC",
+      [parentTaskRunId],
+    );
+    return rows.map((row: any) => ({
+      id: row.id,
+      parentTaskRunId: row.parent_task_run_id,
+      parentTaskStepId: row.parent_task_step_id,
+      childTaskRunId: row.child_task_run_id,
+      reason: row.reason,
+      status: row.status,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
