@@ -7,6 +7,7 @@ import {
 } from "@tavily/core";
 import * as pathModule from "path";
 import { evaluateToolPolicy, type ToolExecutionContext } from "./policy";
+import { getActiveWorkspaceRoot, resolveScopedPath } from "../projects/workspacePaths";
 
 const MAX_READ_FILE_BYTES = 8 * 1024;
 const MAX_READ_CHUNK_BYTES = 64 * 1024;
@@ -422,24 +423,7 @@ export class ToolExecutor {
   }
 
   private getWorkspaceRoot(): string {
-    return pathModule.resolve(
-      process.env.AGENT_WORKSPACE_DIR || "data/workspace",
-    );
-  }
-
-  private resolveWorkspacePath(
-    workspaceRoot: string,
-    targetPath: string,
-  ): string {
-    if (typeof targetPath !== "string" || targetPath.trim() === "") {
-      throw new Error("Path is required.");
-    }
-    const resolvedTarget = pathModule.resolve(workspaceRoot, targetPath);
-    const relativePath = pathModule.relative(workspaceRoot, resolvedTarget);
-    if (relativePath.startsWith("..") || pathModule.isAbsolute(relativePath)) {
-      throw new Error("Path traversal not allowed.");
-    }
-    return resolvedTarget;
+    return getActiveWorkspaceRoot();
   }
 
   private async writeNote(content: string): Promise<ToolResult> {
@@ -455,7 +439,7 @@ export class ToolExecutor {
     const { readFile } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, path);
+      const safePath = resolveScopedPath(workspaceRoot, path);
       const content = await readFile(safePath, "utf-8");
       return { success: true, output: content.slice(0, MAX_READ_FILE_BYTES) };
     } catch (e: any) {
@@ -480,7 +464,7 @@ export class ToolExecutor {
     const { readdir } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const maxItems = this.normalizeLimit(limit);
       const shouldRecurse = Boolean(recursive);
       const files: Array<{
@@ -529,7 +513,7 @@ export class ToolExecutor {
     const { stat } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const details = await stat(safePath);
       return {
         success: true,
@@ -559,7 +543,7 @@ export class ToolExecutor {
     const { open } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, targetPath);
+      const safePath = resolveScopedPath(workspaceRoot, targetPath);
       const parsedOffset = Number(offset ?? 0);
       const parsedLength = Number(length ?? 4096);
       if (!Number.isFinite(parsedOffset) || parsedOffset < 0) {
@@ -617,7 +601,7 @@ export class ToolExecutor {
     const { writeFile, mkdir } = await import("fs/promises");
     try {
       const workspaceRoot = this.getWorkspaceRoot();
-      const safePath = this.resolveWorkspacePath(workspaceRoot, filePath);
+      const safePath = resolveScopedPath(workspaceRoot, filePath);
       await mkdir(pathModule.dirname(safePath), { recursive: true });
       await writeFile(safePath, content, "utf-8");
       return { success: true, output: `Written to ${safePath}` };

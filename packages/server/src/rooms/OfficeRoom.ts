@@ -7,6 +7,8 @@ import { MemoryStore, SharedFileRecord, SharedFileStatus } from '../memory/Memor
 import path from 'path';
 import { readFile, stat, mkdir, writeFile } from 'fs/promises';
 import type { InferenceConfig } from '@agent-office/core';
+import { ProjectWorkspace } from '../projects/ProjectWorkspace';
+import { getActiveProject, getActiveWorkspaceRoot, resolveScopedPath } from '../projects/workspacePaths';
 
 interface HighlightEvent {
     type: string;
@@ -139,10 +141,13 @@ export class OfficeRoom extends Room<OfficeState> {
     private meetingEndsAt = 0;
     private meetingTopic = '';
     private taskProgress: Map<string, number> = new Map();
-    private workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
     private completedTasks: CompletedTaskRecord[] = [];
     private fastTrackMode = true;
     private mailMessages: MailMessage[] = [];
+
+    private getWorkspaceRoot(): string {
+        return getActiveWorkspaceRoot();
+    }
 
     private getMimeType(filePath: string): string {
         const ext = path.extname(filePath).toLowerCase();
@@ -170,13 +175,7 @@ export class OfficeRoom extends Room<OfficeState> {
     }
 
     private resolveWorkspacePath(targetPath: string): string {
-        const safeTarget = String(targetPath || '').trim();
-        const fullPath = path.resolve(this.workspaceRoot, safeTarget);
-        const rel = path.relative(this.workspaceRoot, fullPath);
-        if (!safeTarget || rel.startsWith('..') || path.isAbsolute(rel)) {
-            throw new Error('Invalid workspace file path.');
-        }
-        return fullPath;
+        return resolveScopedPath(this.getWorkspaceRoot(), targetPath);
     }
 
     private normalizeChatAttachment(input: any, defaultSharedBy: string): ChatAttachment | null {
@@ -695,8 +694,33 @@ Paired buddy: Sales Outreach.`,
         this.onMessage('request-completed-work', (client) => {
             client.send('completed-work-sync', {
                 items: this.completedTasks,
-                reviewFolder: 'data/workspace/completed-work'
+                reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
             });
+        });
+
+        this.onMessage('start-project', async (client, message) => {
+            try {
+                const result = await ProjectWorkspace.startProject({
+                    templateId: message?.templateId ?? message?.template,
+                    projectName: message?.projectName,
+                    brief: message?.brief,
+                    acceptanceCriteria: message?.acceptanceCriteria,
+                    constraints: message?.constraints,
+                    mode: message?.mode,
+                    runMetadata: {
+                        requestedBy: client.sessionId,
+                        source: 'colyseus'
+                    }
+                });
+                this.broadcast('project-state-sync', {
+                    project: result.project,
+                    folders: result.folders,
+                    files: result.files
+                });
+                client.send('start-project:result', { ok: true, ...result });
+            } catch (error: any) {
+                client.send('start-project:result', { ok: false, error: error?.message || 'Unable to start project.' });
+            }
         });
 
         // User-triggered workspace read-only tools
@@ -1593,7 +1617,7 @@ Paired buddy: Sales Outreach.`,
         this.completedTasks = [completion, ...this.completedTasks].slice(0, 50);
         this.broadcast('completed-work-sync', {
             items: this.completedTasks,
-            reviewFolder: 'data/workspace/completed-work'
+            reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
         });
     }
 
@@ -1605,7 +1629,7 @@ Paired buddy: Sales Outreach.`,
             .replace(/[^a-z0-9]+/g, '-')
             .replace(/^-+|-+$/g, '')
             .slice(0, 48) || 'task';
-        const folder = path.join(this.workspaceRoot, 'completed-work');
+        const folder = path.join(this.getWorkspaceRoot(), 'completed-work');
         const filename = `${dateStamp}-${agentId}-${slug}.md`;
         const absolutePath = path.join(folder, filename);
         await mkdir(folder, { recursive: true });
@@ -2414,10 +2438,11 @@ Paired buddy: Sales Outreach.`,
         client.send('fast-track-state', { enabled: this.fastTrackMode });
         client.send('completed-work-sync', {
             items: this.completedTasks,
-            reviewFolder: 'data/workspace/completed-work'
+            reviewFolder: `${this.getWorkspaceRoot()}/completed-work`
         });
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
         client.send('approvals-sync', this.listApprovals());
+        client.send('project-state-sync', { project: getActiveProject() });
         client.send('meeting-state', this.meetingActive
             ? { active: true, topic: this.meetingTopic, endsAt: this.meetingEndsAt }
             : { active: false });

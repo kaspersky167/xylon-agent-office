@@ -5,6 +5,13 @@ import { readdir, stat, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { OfficeRoom } from './rooms/OfficeRoom';
 import { ExtensionRegistry } from './extensions/registry';
+import { ProjectWorkspace } from './projects/ProjectWorkspace';
+import {
+    getActiveProject,
+    getActiveWorkspaceRoot,
+    getGlobalWorkspaceRoot,
+    resolveScopedPath
+} from './projects/workspacePaths';
 
 // Setup Express
 const app = express();
@@ -56,16 +63,8 @@ const EXTENSION_TO_MIME: Record<string, string> = {
     '.yaml': 'text/yaml'
 };
 
-const workspaceRoot = path.resolve(process.env.AGENT_WORKSPACE_DIR || 'data/workspace');
-
 const resolveWorkspacePath = (targetPath: string): string => {
-    const safePath = String(targetPath || '').trim();
-    const fullPath = path.resolve(workspaceRoot, safePath);
-    const relative = path.relative(workspaceRoot, fullPath);
-    if (!safePath || relative.startsWith('..') || path.isAbsolute(relative)) {
-        throw new Error('Invalid workspace path.');
-    }
-    return fullPath;
+    return resolveScopedPath(getActiveWorkspaceRoot(), targetPath);
 };
 
 const guessMimeType = (filePath: string): string => {
@@ -102,9 +101,10 @@ const listWorkspaceFiles = async (rootDir: string, maxFiles = 200) => {
 
 app.get('/api/workspace-files', async (_req, res) => {
     try {
+        const workspaceRoot = getActiveWorkspaceRoot();
         await mkdir(workspaceRoot, { recursive: true });
         const files = await listWorkspaceFiles(workspaceRoot);
-        res.json({ ok: true, files });
+        res.json({ ok: true, root: workspaceRoot, project: getActiveProject(), files });
     } catch (error) {
         console.error('[workspace-files] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list workspace files.' });
@@ -113,16 +113,38 @@ app.get('/api/workspace-files', async (_req, res) => {
 
 app.get('/api/completed-work', async (_req, res) => {
     try {
+        const workspaceRoot = getActiveWorkspaceRoot();
         await mkdir(path.join(workspaceRoot, 'completed-work'), { recursive: true });
         const files = await listWorkspaceFiles(path.join(workspaceRoot, 'completed-work'));
         res.json({
             ok: true,
-            folder: 'data/workspace/completed-work',
+            folder: `${workspaceRoot}/completed-work`,
             files
         });
     } catch (error) {
         console.error('[completed-work] Failed to list files', error);
         res.status(500).json({ ok: false, error: 'Unable to list completed work files.' });
+    }
+});
+
+app.post('/api/projects/start', async (req, res) => {
+    try {
+        const project = await ProjectWorkspace.startProject({
+            templateId: req.body?.templateId ?? req.body?.template,
+            projectName: req.body?.projectName,
+            brief: req.body?.brief,
+            acceptanceCriteria: req.body?.acceptanceCriteria,
+            constraints: req.body?.constraints,
+            mode: req.body?.mode,
+            runMetadata: {
+                requestedBy: req.body?.requestedBy || 'api',
+                source: 'rest',
+                globalWorkspaceRoot: getGlobalWorkspaceRoot()
+            }
+        });
+        res.status(201).json({ ok: true, ...project });
+    } catch (error: any) {
+        res.status(400).json({ ok: false, error: error?.message || 'Unable to start project.' });
     }
 });
 
