@@ -252,7 +252,18 @@ Modify `furnitureTargets` in `OfficeRoom.ts` or use the in-browser Layout Editor
 npm test                                    # All tests
 npm test --workspace=@agent-office/core     # Core only
 npm test --workspace=@agent-office/adapters # Adapters only
+npm test --workspace=@agent-office/server   # Server smoke + route/module tests
+npm test --workspace=@agent-office/ui       # UI component render smoke tests
 ```
+
+### Package-level expectations
+
+- `@agent-office/core`: unit tests for task/memory/office lifecycle behavior.
+- `@agent-office/adapters`: unit tests for prompt + provider adapter behavior.
+- `@agent-office/server`: at least smoke coverage for room/module initialization and route-related code paths without binding a network port.
+- `@agent-office/ui`: at least smoke coverage for lightweight panel/component rendering.
+
+`npm test` runs all workspace test scripts so failures are surfaced clearly at the root command level.
 
 ---
 
