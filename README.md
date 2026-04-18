@@ -256,6 +256,37 @@ npm test --workspace=@agent-office/adapters # Adapters only
 
 ---
 
+## 📦 UI Bundle Analysis (Lazy Advanced Panels)
+
+Build command used:
+
+```bash
+npm run build --workspace=@agent-office/ui
+```
+
+### Before (single eager app chunk)
+
+| Asset | Size | Gzip |
+|---|---:|---:|
+| `dist/assets/index-BpTCryGb.js` | 1,504.67 kB | 421.44 kB |
+
+### After (advanced panels split with `React.lazy`)
+
+| Asset | Size | Gzip |
+|---|---:|---:|
+| `dist/assets/index-DhYA7apU.js` | 1,493.93 kB | 419.35 kB |
+| `dist/assets/DemoModePanels-Bz0mLMM4.js` | 9.14 kB | 3.19 kB |
+| `dist/assets/SystemLog-qRjHSAsO.js` | 2.04 kB | 1.04 kB |
+| `dist/assets/LayoutEditor-C3EzSsHE.js` | 1.19 kB | 0.67 kB |
+| `dist/assets/AgentInspector-D3i3jqPm.js` | 0.54 kB | 0.35 kB |
+
+### Net effect
+
+- Main entry chunk reduced by **10.74 kB** raw and **2.09 kB** gzip.
+- Advanced/demo-facing UI now loads on demand behind `Suspense`, keeping core workflow panels (chat + operations + desktop/task/artifact flow) eager.
+
+---
+
 ## 🗺️ Roadmap
 
 - [x] Multi-agent conversations

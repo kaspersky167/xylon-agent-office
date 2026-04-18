@@ -1,16 +1,21 @@
-import React from 'react';
+import React, { Suspense } from 'react';
 import { ChatPanel } from './components/ChatPanel';
-import { AgentInspector } from './components/AgentInspector';
-import { LayoutEditor } from './components/LayoutEditor';
-import { SystemLog } from './components/SystemLog';
-import { ViralControlPanel } from './components/ViralControlPanel';
-import { HighlightsFeed } from './components/HighlightsFeed';
-import { AgentPulseBoard } from './components/AgentPulseBoard';
-import { RelationshipGraph } from './components/RelationshipGraph';
-import { EpisodeRecapPanel } from './components/EpisodeRecapPanel';
 import { DesktopComputerPanel } from './components/DesktopComputerPanel';
 import { CeoOperationsPanel } from './components/CeoOperationsPanel';
 import { UIStoreProvider, useUIStore } from './store/uiStore';
+
+const AgentInspector = React.lazy(() => import('./components/AgentInspector').then((module) => ({ default: module.AgentInspector })));
+const LayoutEditor = React.lazy(() => import('./components/LayoutEditor').then((module) => ({ default: module.LayoutEditor })));
+const SystemLog = React.lazy(() => import('./components/SystemLog').then((module) => ({ default: module.SystemLog })));
+const DemoModePanels = React.lazy(() => import('./components/DemoModePanels').then((module) => ({ default: module.DemoModePanels })));
+
+function AdvancedPanelFallback() {
+    return (
+        <div style={{ position: 'absolute', top: 18, right: 18, color: 'rgba(255,255,255,0.8)', background: 'rgba(9,14,30,0.78)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: 10, padding: '8px 12px', fontSize: 12, zIndex: 30 }}>
+            Loading advanced panels…
+        </div>
+    );
+}
 
 function AppContent() {
     const { state, actions } = useUIStore();
@@ -40,14 +45,22 @@ function AppContent() {
             {panelVisibility.operations && <CeoOperationsPanel />}
             <DesktopComputerPanel isOpen={panelVisibility.desktop} onClose={() => actions.setPanelVisibility('desktop', false)} />
 
-            {panelVisibility.advanced && panelVisibility.agentPulse && <AgentPulseBoard />}
-            {panelVisibility.advanced && panelVisibility.relationship && <RelationshipGraph />}
-            {panelVisibility.advanced && panelVisibility.recap && <EpisodeRecapPanel />}
-            {panelVisibility.advanced && panelVisibility.systemLog && <SystemLog />}
-            {panelVisibility.advanced && panelVisibility.viral && <ViralControlPanel />}
-            {panelVisibility.advanced && panelVisibility.highlights && <HighlightsFeed />}
-            {panelVisibility.advanced && panelVisibility.layoutEditor && <LayoutEditor />}
-            {panelVisibility.advanced && panelVisibility.inspector && <AgentInspector />}
+            {panelVisibility.advanced && (
+                <Suspense fallback={<AdvancedPanelFallback />}>
+                    {(panelVisibility.agentPulse || panelVisibility.relationship || panelVisibility.recap || panelVisibility.viral || panelVisibility.highlights) && (
+                        <DemoModePanels
+                            showAgentPulse={panelVisibility.agentPulse}
+                            showHighlights={panelVisibility.highlights}
+                            showRecap={panelVisibility.recap}
+                            showRelationship={panelVisibility.relationship}
+                            showViral={panelVisibility.viral}
+                        />
+                    )}
+                    {panelVisibility.systemLog && <SystemLog />}
+                    {panelVisibility.layoutEditor && <LayoutEditor />}
+                    {panelVisibility.inspector && <AgentInspector />}
+                </Suspense>
+            )}
         </>
     );
 }
