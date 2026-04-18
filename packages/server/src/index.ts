@@ -79,15 +79,21 @@ const parseArtifactPath = (relativePath: string): {
     projectId: string;
     approved: boolean;
 } => {
+    const activeProject = getActiveProject();
     const normalized = relativePath.split(path.sep).join('/');
     const match = normalized.match(/^projects\/([^/]+)\/([^/]+)\//);
     if (!match) {
-        return { projectId: 'unscoped', approved: false };
+        const directSubfolderMatch = normalized.match(/^([^/]+)\//);
+        const subfolder = directSubfolderMatch?.[1] || '';
+        return {
+            projectId: activeProject?.projectSlug || 'unscoped',
+            approved: ['artifacts', 'uploads', 'generated', 'outputs', 'completed-work'].includes(subfolder)
+        };
     }
     const subfolder = match[2];
     return {
         projectId: match[1],
-        approved: ['artifacts', 'uploads', 'generated', 'outputs'].includes(subfolder)
+        approved: ['artifacts', 'uploads', 'generated', 'outputs', 'completed-work'].includes(subfolder)
     };
 };
 
@@ -243,14 +249,21 @@ app.get('/api/artifacts', async (req, res) => {
             ? req.query.exists_on_disk === 'true'
             : undefined;
         const artifacts = await memoryStore.listArtifacts({
-            projectId: typeof req.query.project_id === 'string' ? req.query.project_id : undefined,
+            projectId: typeof req.query.project_id === 'string'
+                ? req.query.project_id
+                : getActiveProject()?.projectSlug,
             taskId: typeof req.query.task_id === 'string' ? req.query.task_id : undefined,
             agentId: typeof req.query.agent_id === 'string' ? req.query.agent_id : undefined,
             status: typeof req.query.status === 'string' ? req.query.status as ArtifactStatus : undefined,
             existsOnDisk: existsFilter,
             limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
         });
-        res.json({ ok: true, artifacts, rootHint: getActiveWorkspaceRoot() });
+        res.json({
+            ok: true,
+            artifacts,
+            project: getActiveProject(),
+            rootHint: getActiveWorkspaceRoot()
+        });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to list artifacts.' });
     }
@@ -269,7 +282,11 @@ app.get('/api/projects/:projectId/artifacts', async (req, res) => {
             existsOnDisk: existsFilter,
             limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined
         });
-        res.json({ ok: true, artifacts, rootHint: path.join(getActiveWorkspaceRoot(), 'projects', req.params.projectId, 'artifacts') });
+        const activeProject = getActiveProject();
+        const projectArtifactsRoot = activeProject?.projectSlug === req.params.projectId
+            ? path.join(activeProject.projectRoot, 'artifacts')
+            : path.join(getGlobalWorkspaceRoot(), 'projects', req.params.projectId, 'artifacts');
+        res.json({ ok: true, artifacts, rootHint: projectArtifactsRoot });
     } catch (error: any) {
         res.status(400).json({ ok: false, error: error?.message || 'Unable to list project artifacts.' });
     }

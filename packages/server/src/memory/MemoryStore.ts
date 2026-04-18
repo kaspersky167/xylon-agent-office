@@ -233,6 +233,25 @@ export class MemoryStore {
             CREATE INDEX IF NOT EXISTS idx_reviews_task ON reviews(task_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_reviews_artifact ON reviews(artifact_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                task_id TEXT,
+                agent_id TEXT,
+                relative_path TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'draft',
+                checksum TEXT,
+                exists_on_disk INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_project_path ON artifacts(project_id, relative_path);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_agent ON artifacts(agent_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_status ON artifacts(status, updated_at DESC);
         `);
 
     try {
@@ -824,7 +843,7 @@ export class MemoryStore {
       `INSERT INTO artifacts
              (id, project_id, task_id, agent_id, relative_path, mime_type, size_bytes, status, checksum, exists_on_disk, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(relative_path) DO UPDATE SET
+             ON CONFLICT(project_id, relative_path) DO UPDATE SET
                id = excluded.id,
                project_id = excluded.project_id,
                task_id = excluded.task_id,

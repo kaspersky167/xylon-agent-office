@@ -135,6 +135,10 @@ interface TaskEvidenceState {
     validatorApproved: boolean;
 }
 
+export const shouldMarkTaskDone = (evidence: TaskEvidenceState): boolean => {
+    return evidence.artifactExists && evidence.toolExecutionSucceeded && evidence.validatorApproved;
+};
+
 // Tool names that always require CEO approval when invoked by a non-CEO agent
 const MAJOR_TOOLS = new Set<string>([
     'hire_agent',
@@ -240,6 +244,10 @@ export class OfficeRoom extends Room<OfficeState> {
     }
 
     private projectRoot(projectSlug: string): string {
+        const activeProject = getActiveProject();
+        if (activeProject?.projectSlug === projectSlug) {
+            return activeProject.projectRoot;
+        }
         return path.join(this.getWorkspaceRoot(), 'projects', projectSlug);
     }
 
@@ -260,11 +268,33 @@ export class OfficeRoom extends Room<OfficeState> {
     }
 
     private async buildProjectContext(agentId: string, activeTask: string): Promise<ProjectContextPayload> {
-        const projectSlug = this.currentProjectSlug || 'default';
+        const activeProject = getActiveProject();
+        const projectSlug = activeProject?.projectSlug || this.currentProjectSlug || 'default';
         const projectRoot = this.projectRoot(projectSlug);
-        const briefRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'project-brief.md'));
-        const criteriaRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'acceptance-criteria.md'));
-        const artifactIndexRaw = await this.safeReadWorkspaceText(path.posix.join('projects', projectSlug, 'artifact-index.md'));
+        const briefCandidates = [
+            path.posix.join('brief', 'brief.md'),
+            path.posix.join('projects', projectSlug, 'project-brief.md')
+        ];
+        const criteriaCandidates = [
+            path.posix.join('brief', 'acceptance-criteria.md'),
+            path.posix.join('projects', projectSlug, 'acceptance-criteria.md')
+        ];
+        const artifactIndexCandidates = [
+            path.posix.join('context', 'artifact-index.md'),
+            path.posix.join('projects', projectSlug, 'artifact-index.md')
+        ];
+
+        const readFirstNonEmpty = async (candidates: string[]) => {
+            for (const candidate of candidates) {
+                const content = await this.safeReadWorkspaceText(candidate);
+                if (content) return content;
+            }
+            return '';
+        };
+
+        const briefRaw = await readFirstNonEmpty(briefCandidates);
+        const criteriaRaw = await readFirstNonEmpty(criteriaCandidates);
+        const artifactIndexRaw = await readFirstNonEmpty(artifactIndexCandidates);
 
         const taskRows = await this.memoryStore.getTasks();
         const activeTaskRow = taskRows.find((task) =>
@@ -917,6 +947,7 @@ Paired buddy: Sales Outreach.`,
                     folders: result.folders,
                     files: result.files
                 });
+                this.currentProjectSlug = result.project.projectSlug;
                 client.send('start-project:result', { ok: true, ...result });
             } catch (error: any) {
                 client.send('start-project:result', { ok: false, error: error?.message || 'Unable to start project.' });
@@ -1984,11 +2015,11 @@ Paired buddy: Sales Outreach.`,
         const checkpointsPassed = [evidence.artifactExists, evidence.toolExecutionSucceeded, evidence.validatorApproved].filter(Boolean).length;
         const next = checkpointsPassed / 3;
         const reason = this.taskStatusReason(evidence);
-        const shouldComplete = checkpointsPassed >= 1;
+        const shouldComplete = shouldMarkTaskDone(evidence);
         this.taskProgress.set(key, next);
 
         const currentTaskStatus: TaskStatus = 'in_progress';
-        const proposedStatus: TaskStatus = next >= 1 ? 'done' : 'in_progress';
+        const proposedStatus: TaskStatus = shouldComplete ? 'done' : 'in_progress';
         const transition = this.validateAndNormalizeTaskTransition({
             from: currentTaskStatus,
             to: proposedStatus,
